@@ -2,7 +2,7 @@ Source: mosaic
 Maintainer: yesheytenzin <yesheytenzin@users.noreply.github.com>
 Section: misc
 Priority: optional
-Build-Depends: debhelper (>= 10),
+Build-Depends: debhelper (>= 13),
                cargo,
                rustc,
                pkg-config,
