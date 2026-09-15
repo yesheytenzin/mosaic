@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	dh_auto_install -- SYSD_DIR=/lib/systemd/system
+	$(MAKE) install_apparmor DESTDIR=$(CURDIR)/debian/mosaic
+	dh_apparmor --profile-name=adbd
+	dh_apparmor --profile-name=android_app
+	dh_apparmor --profile-name=lxc\\/lxc-mosaic

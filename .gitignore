@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Editor / IDE
+/.idea
+/.vscode
+*.swp
+*.swo
+
+# Packaging artifacts
+/build/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars
+/debian/mosaic/
+/mosaic-bugreport.tar.xz
+
+# OS
+.DS_Store
+
+# Logs
+*.log

@@ -1,0 +1,27 @@
+Source: mosaic
+Maintainer: yesheytenzin <yesheytenzin@users.noreply.github.com>
+Section: misc
+Priority: optional
+Build-Depends: debhelper (>= 10),
+               cargo,
+               rustc,
+               pkg-config,
+               liblzma-dev,
+               dh-apparmor
+Standards-Version: 4.5.0.3
+Vcs-Browser: https://github.com/yesheytenzin/mosaic
+Vcs-Git: https://github.com/yesheytenzin/mosaic.git
+
+Package: mosaic
+Architecture: any
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+         lxc,
+         dbus,
+         polkitd | policykit-1,
+         pipewire-pulse | pulseaudio,
+	 iptables
+Recommends: ca-certificates,
+Description: Android™ application support
+ mosaic allows running a separate Android™ environment
+ confined to a LXC container.
