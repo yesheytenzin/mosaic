@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=id.mosaic.Container
+Exec=/usr/bin/mosaic -w container start
+User=root
+SystemdService=mosaic-container.service

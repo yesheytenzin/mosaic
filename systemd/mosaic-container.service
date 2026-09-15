@@ -1,0 +1,10 @@
+[Unit]
+Description=Mosaic Container
+
+[Service]
+UMask=0022
+BusName=id.mosaic.Container
+ExecStart=/usr/bin/mosaic container start
+
+[Install]
+WantedBy=multi-user.target

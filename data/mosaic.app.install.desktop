@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install in Mosaic
+Name[ru]=Установить в Mosaic
+NoDisplay=true
+MimeType=application/vnd.android.package-archive
+Exec=mosaic app install %f
+Icon=mosaic
