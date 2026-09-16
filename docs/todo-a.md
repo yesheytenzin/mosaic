@@ -76,14 +76,8 @@ socket by `src/binder/transport.rs`.
       is the one that is verified.
 
 *The defect, with the measurements.* The framework's own services do not reach the
-registry: every Java `ServiceManager.addService` logs
-
-```
-android-binder: addService platform_compat carried no readable binder object
-```
-
-while the AIDL registrations land. It is not the request format and not the object
-table being empty. Three of them, dumped as they arrive:
+registry, so a second process cannot reach one. It is not the request format and not
+an empty object table; three Java `addService` requests, dumped as they arrive:
 
 | service | request size | name ends at | object table | first offset |
 | --- | --- | --- | --- | --- |
@@ -91,22 +85,46 @@ table being empty. Three of them, dumped as they arrive:
 | `platform_compat` | 144 | 108 | 1 entry | 108 |
 | `platform_compat_native` | 160 | 120 | 1 entry | 124 |
 
-and `Parcel::unflattenBinder`'s own code, read out of libbinder, says an object is
-`type @ 0`, `cookie @ 16`, 24 bytes -- which is what a hand parse at the name's end
-already reads correctly, `0x73622a85` every time. So the bytes are where this thinks
-they are, and the table says there is one object, and `readStrongBinder` still
-returns nothing at the name's end, at `first`, and at `first - 24`.
+and the bytes around the object, from two of them:
 
-Two things to try next, in order:
+```
+6d 00 70 00 65 00 72 00 | 00 00 00 00 | 85 2a 62 73 | 00 01 00 00 | 70 46 a5 17 b7 7a 00 00 | b0 da a0 47 b7 7a 00 00
+   "...mper"               four bytes     TYPE=BINDER   flags=0x100    binder=weakrefs             cookie=the object
 
-1. Watch what the *writer* records. `Parcel::writeObject` in libbinder appends
-   `mDataPos` to `mObjects` **after** writing the object, so the table's entry is the
-   object's *end* -- which would make the start `first - 24`, and 116 vs 120 and
-   120 vs 124 say the name's end is four bytes short of whichever it is for the
-   even-length names. That four-byte discrepancy is the thing to explain first.
-2. Failing that, take the object with the hand parse at the name's end -- which
-   reads the type correctly -- and hold its reference some other way than
-   `readStrongBinder`, since that is the only reason the hand parse was abandoned.
+70 00 61 00 74 00 00 00 |              85 2a 62 73 | 00 01 00 00 | 20 e6 a6 17 b7 7a 00 00 | 10 c0 a0 47 b7 7a 00 00
+   "...pat"                             TYPE=BINDER   flags=0x100    binder=weakrefs             cookie=the object
+```
+
+What that settles:
+
+- the object is where the format says it is -- `type @ 0`, `flags @ 4`, `binder @ 8`,
+  `cookie @ 16`, 24 bytes -- and the cookie is the IBinder, as
+  `Parcel::unflattenBinder`'s own code has it (`mov 0x10(%rbx),%r12` for the BINDER
+  case)
+- the padding after a name is **not** a function of its length alone: 20 characters
+  are followed by four bytes, 15 by none, and neither "pad to four" nor "pad to
+  eight" explains both
+- the request contains the object **twice**: searching for the type word finds a
+  match at 108 and another at 120 in the same request, reporting the *same* cookie
+
+What was tried and reverted: storing the object the search finds. It registers all
+eight services, and then the framework **crashes** -- `flattenBinder`/reader calling
+a virtual method at vtable offset 0x60 on an object whose cookie looks like a
+perfectly good heap pointer. A service that answers "not found" is worse than one
+that answers, and much better than one that takes the process down, so the search now
+reports what it finds (`a type word at N with cookie 0x...`) and hands nothing back.
+The shim is in that state, with no crash.
+
+Next, in order:
+
+1. work out why the cookie at the position where the type word sits is not callable
+   -- it is a heap address in the same mapping as everything else, and the reader's
+   own code takes that field, so either the position is still wrong or the two
+   matches are the answers
+2. the second match is worth looking at: an object written twice in one request is
+   not what `addService` should be doing, and the *second* one may be the live one
+3. failing that, take the cookie by hand and hold a reference some other way than
+   `readStrongBinder`, which is the only reason the hand parse was abandoned
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. **Met for the AIDL path only, and the box is open because of it.** The broker's
