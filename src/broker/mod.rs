@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
 /// How long the broker stays alive with nothing to do. It exits and systemd
@@ -77,6 +78,7 @@ pub async fn serve(args: &MosaicArgs) -> anyhow::Result<()> {
     log::info!("Broker listening on {}", bind_path(&args.work));
 
     let open = Arc::new(AtomicUsize::new(0));
+    let binder = Arc::new(crate::binder::Transport::new());
     monitor_idle(open.clone());
 
     loop {
@@ -84,8 +86,9 @@ pub async fn serve(args: &MosaicArgs) -> anyhow::Result<()> {
         open.fetch_add(1, Ordering::SeqCst);
         let args = args.clone();
         let open = open.clone();
+        let binder = binder.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(&args, stream).await {
+            if let Err(e) = handle(&args, binder, stream).await {
                 log::debug!("Broker request failed: {}", e);
             }
             open.fetch_sub(1, Ordering::SeqCst);
@@ -124,8 +127,27 @@ fn adopted_listener() -> anyhow::Result<Option<UnixListener>> {
     Ok(Some(UnixListener::from_std(listener)?))
 }
 
-async fn handle(args: &MosaicArgs, mut stream: UnixStream) -> anyhow::Result<()> {
-    let request: Request = read_frame(&mut stream).await?;
+async fn handle(
+    args: &MosaicArgs,
+    binder: Arc<crate::binder::Transport>,
+    mut stream: UnixStream,
+) -> anyhow::Result<()> {
+    // Four bytes say which plane this connection is. The Binder magic read as a
+    // length prefix would have been refused long before this, so the two cannot
+    // be confused.
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).await?;
+    if crate::binder::is_binder_prefix(&prefix) {
+        let stream = stream.into_std()?;
+        stream.set_nonblocking(false)?;
+        // The Binder plane is a conversation that blocks: a transaction waits
+        // for its answer. It gets a thread of its own rather than the reactor.
+        return tokio::task::spawn_blocking(move || binder.serve(&stream))
+            .await
+            .map_err(|e| anyhow::anyhow!("binder session panicked: {}", e))?;
+    }
+
+    let request: Request = crate::broker::protocol::read_frame_after(prefix, &mut stream).await?;
     let response = dispatch(args, request).await;
     write_frame(&mut stream, &response).await?;
     Ok(())
@@ -376,6 +398,48 @@ mod tests {
         assert_eq!(
             listen.trim().replace("%t", runtime),
             bind_path_in("/var/lib/mosaic", Some(runtime))
+        );
+    }
+
+    /// A6: the framework's priority calls land at `setpriority`, which
+    /// `RLIMIT_NICE` caps, and a user service can only use a limit its manager
+    /// already has. The grant therefore lives system side and the broker repeats
+    /// it; if the two disagree the service silently keeps the default and every
+    /// audio, display and binder priority call keeps failing.
+    #[test]
+    fn the_priority_limit_is_granted_system_side_and_used_by_the_broker() {
+        fn limit(text: &str) -> u32 {
+            text.lines()
+                .find_map(|line| line.trim().strip_prefix("LimitNICE="))
+                .expect("a priority limit")
+                .trim()
+                .parse()
+                .expect("a number")
+        }
+
+        let unit = std::fs::read_to_string("systemd/mosaic-broker.service").unwrap();
+        let drop_in =
+            std::fs::read_to_string("packaging/arch/user@.service.d/mosaic.conf").unwrap();
+        assert_eq!(
+            limit(&unit),
+            limit(&drop_in),
+            "the grant and the service that uses it must agree"
+        );
+        // The framework asks for niceness as low as -20, which needs 40.
+        assert!(
+            limit(&unit) >= 40,
+            "a lower limit leaves the framework's priority calls failing"
+        );
+    }
+
+    /// The one path root has to create is the one Bionic compiles in, so it
+    /// cannot be redirected away.
+    #[test]
+    fn the_provisioned_paths_are_the_ones_that_cannot_be_redirected() {
+        let tmpfiles = std::fs::read_to_string("packaging/arch/mosaic.tmpfiles").unwrap();
+        assert!(
+            tmpfiles.contains("/dev/__properties__"),
+            "libc's property area path is hardcoded and has to exist"
         );
     }
 

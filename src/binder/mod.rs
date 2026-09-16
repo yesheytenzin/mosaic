@@ -2,15 +2,31 @@
 
 //! Userspace Binder (ADR-0004) and app process launch.
 //!
-//! Phase 1 provides the runtime bundle. Phase 2 launches a process from it.
-//! Phase 3 fills in the transport below: transactions, handles, reference
-//! counts, death notification, and a service registry that every process
-//! links. The registry here is the seed of that, exercised by tests so the
-//! shape is settled before the transport lands.
+//! Three pieces, kept apart on purpose:
+//!
+//! - [`table`] is the per-process view: which number names which object.
+//! - [`broker`] is the authority: who owns what, and where a transaction goes.
+//! - [`wire`] is the transport: frames on a Unix socket, with descriptors.
+//!
+//! Parcels are not here. The shim writes and reads them, because their formats
+//! are Android's and both sides of every AIDL call already agree on them.
+
+pub mod broker;
+pub mod table;
+pub mod transport;
+pub mod wire;
+
+pub use broker::{BinderBroker, ClientId, DeathNotice, Dispatch, HOSTED_NODE_BASE};
+pub use table::{HandleTable, Released, Target};
+pub use transport::Transport;
+pub use wire::{is_binder_prefix, Conn, Frame, Message, MAX_FDS, MAX_FRAME, TF_ONE_WAY};
 
 use crate::args::MosaicArgs;
 use crate::broker::registry::Package;
 use std::collections::HashMap;
+
+/// The service manager's handle, which is 0 in every process.
+pub const SERVICE_MANAGER: ClientId = 0;
 
 /// A process-local reference to a Binder object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

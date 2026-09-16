@@ -1,0 +1,18 @@
+# Paths that have to exist at boot, and are the only things root is needed for.
+#
+# Everything else the framework asks for is redirected by the preloaded shim
+# (ADR-0012, ADR-0014): the Android system image lives inside the runtime bundle,
+# binder is a userspace library with no kernel driver, and the property area is
+# per bundle. What cannot be redirected is where Bionic looks before any of that
+# runs: the property area's directory name is compiled into libc, so a process
+# that does not preload the shim has to find it where libc expects.
+#
+# The directory is left empty on purpose. The shim redirects the area to the
+# bundle, so nothing writes here; this is for the case where the shim is not
+# loaded, where an empty directory is a better answer than a missing one.
+d /dev/__properties__ 0755 root root -
+
+# logd's write socket. Same reasoning: the shim points libc at the bundle's
+# socket, and this is here so a process without the shim can still open the path
+# its logging code names.
+d /dev/socket 0771 root root -

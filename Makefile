@@ -8,6 +8,8 @@ APPS_MENU_DIR := $(SYSCONFDIR)/xdg/menus/applications-merged
 METAINFO_DIR := $(PREFIX)/share/metainfo
 ICONS_DIR := $(PREFIX)/share/icons
 USER_UNIT_DIR := $(PREFIX)/lib/systemd/user
+SYSTEM_UNIT_DIR := $(PREFIX)/lib/systemd/system
+TMPFILES_DIR := $(PREFIX)/lib/tmpfiles.d
 POLKIT_DIR := $(PREFIX)/share/polkit-1/actions
 
 INSTALL_BIN_DIR := $(DESTDIR)$(BIN_DIR)
@@ -17,6 +19,8 @@ INSTALL_APPS_MENU_DIR := $(DESTDIR)$(APPS_MENU_DIR)
 INSTALL_METAINFO_DIR := $(DESTDIR)$(METAINFO_DIR)
 INSTALL_ICONS_DIR := $(DESTDIR)$(ICONS_DIR)
 INSTALL_USER_UNIT_DIR := $(DESTDIR)$(USER_UNIT_DIR)
+INSTALL_SYSTEM_UNIT_DIR := $(DESTDIR)$(SYSTEM_UNIT_DIR)
+INSTALL_TMPFILES_DIR := $(DESTDIR)$(TMPFILES_DIR)
 INSTALL_POLKIT_DIR := $(DESTDIR)$(POLKIT_DIR)
 
 build:
@@ -28,9 +32,11 @@ check:
 	cargo clippy -- -D warnings
 	cargo test
 
-# The broker is a systemd user service with socket activation, so nothing here
-# installs a system daemon, a D-Bus service, or a kernel module. There is no
-# host setup step at all: that is the point of ADR-0004.
+# The broker is a systemd user service with socket activation, so there is no
+# daemon, no D-Bus service and no kernel module. Two things do land system side,
+# and both are limits rather than machinery: the priority limit the framework
+# needs, which only the user manager can grant, and the tmpfiles entry for the
+# paths Bionic hardcodes.
 install:
 	@if [ ! -f target/release/mosaic ]; then \
 		echo "Rust binary not found, building..."; \
@@ -43,6 +49,8 @@ install:
 	install -d $(INSTALL_METAINFO_DIR)
 	install -d $(INSTALL_ICONS_DIR)/hicolor/512x512/apps
 	install -d $(INSTALL_USER_UNIT_DIR)
+	install -d $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d
+	install -d $(INSTALL_TMPFILES_DIR)
 	install -d $(INSTALL_POLKIT_DIR)
 
 	install -Dm755 target/release/mosaic $(INSTALL_BIN_DIR)/mosaic
@@ -57,6 +65,8 @@ install:
 	install -Dm644 systemd/mosaic-broker.socket $(INSTALL_USER_UNIT_DIR)/mosaic-broker.socket
 	install -Dm644 systemd/mosaic-broker.service $(INSTALL_USER_UNIT_DIR)/mosaic-broker.service
 	install -Dm644 polkit/id.mosaic.allocate-uid.policy $(INSTALL_POLKIT_DIR)/id.mosaic.allocate-uid.policy
+	install -Dm644 packaging/arch/user@.service.d/mosaic.conf $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
+	install -Dm644 packaging/arch/mosaic.tmpfiles $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
 uninstall:
 	rm -f $(INSTALL_BIN_DIR)/mosaic
@@ -69,5 +79,7 @@ uninstall:
 	rm -f $(INSTALL_USER_UNIT_DIR)/mosaic-broker.socket
 	rm -f $(INSTALL_USER_UNIT_DIR)/mosaic-broker.service
 	rm -f $(INSTALL_POLKIT_DIR)/id.mosaic.allocate-uid.policy
+	rm -f $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
+	rm -f $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
 .PHONY: build check install uninstall

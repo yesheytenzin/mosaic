@@ -82,6 +82,19 @@ where
 {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len).await?;
+    read_frame_after(len, reader).await
+}
+
+/// The same frame, when the four byte length prefix has already been read.
+///
+/// The broker reads those four bytes first to tell a control connection from a
+/// Binder one, so by the time it knows this is a control frame the length is
+/// already in hand.
+pub async fn read_frame_after<R, T>(len: [u8; 4], reader: &mut R) -> anyhow::Result<T>
+where
+    R: AsyncReadExt + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
     let len = u32::from_be_bytes(len) as usize;
     anyhow::ensure!(len <= MAX_FRAME, "frame too large: {} bytes", len);
     let mut body = vec![0u8; len];

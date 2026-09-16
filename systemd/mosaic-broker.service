@@ -7,6 +7,15 @@ After=mosaic-broker.socket
 [Service]
 Type=simple
 ExecStart=/usr/bin/mosaic daemon
+# The framework raises thread priorities for audio, display and binder threads
+# with setpriority, and RLIMIT_NICE caps how far that can go. The default of 0
+# forbids anything above niceness 20, which makes every such call fail, and the
+# system server treats some of them as fatal. 40 also allows niceness -20.
+#
+# This works only because the user manager was granted the same limit system
+# side (system/user@.service.d/mosaic.conf): a service cannot raise its own hard
+# limit, and the limit a user service inherits is the one its manager has.
+LimitNICE=40
 # The broker exits when idle (ADR-0005) and the socket unit starts it again on
 # the next connection, so a clean exit is expected, not a failure.
 Restart=no
