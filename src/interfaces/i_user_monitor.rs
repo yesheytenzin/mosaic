@@ -1,46 +1,48 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::args::MosaicArgs;
-use crate::interfaces::gbinder::ServiceManager;
+use crate::interfaces::gbinder::{serve, Reader, Writer};
+use std::sync::atomic::AtomicBool;
 
+const INTERFACE: &str = crate::guest::IFACE_USER_MONITOR;
 const SERVICE_NAME: &str = crate::guest::SVC_USER_MONITOR;
 
-pub const PACKAGE_ADDED: i32 = 1;
-pub const PACKAGE_REMOVED: i32 = 2;
-pub const PACKAGE_CHANGED: i32 = 3;
+const TRANSACTION_USER_UNLOCKED: u32 = 1;
+const TRANSACTION_PACKAGE_STATE_CHANGED: u32 = 2;
 
-pub fn add_service<F1, F2>(args: &MosaicArgs, _user_unlocked: F1, _package_state_changed: F2)
-where
-    F1: Fn(i32) + Send + Sync + 'static,
-    F2: Fn(i32, String, i32) + Send + Sync + 'static,
+pub const PACKAGE_ADDED: i32 = 0;
+pub const PACKAGE_REMOVED: i32 = 1;
+pub const PACKAGE_UPDATED: i32 = 2;
+
+pub fn add_service<F1, F2>(
+    args: &MosaicArgs,
+    user_unlocked: F1,
+    package_state_changed: F2,
+    stop: &AtomicBool,
+) where
+    F1: Fn(i32) + Send + 'static,
+    F2: Fn(i32, String, i32) + Send + 'static,
 {
-    let (binder, _, _) = match crate::interfaces::gbinder::load_binder_nodes(args) {
-        Ok(v) => v,
-        Err(e) => {
-            log::debug!("Failed to load binder nodes: {}", e);
-            return;
+    let handler = move |mut reader: Reader, code: u32, _flags: u32, reply: &mut Writer| -> i32 {
+        log::debug!("{}: Received transaction: {}", SERVICE_NAME, code);
+        match code {
+            TRANSACTION_USER_UNLOCKED => {
+                if let Ok((_, arg1)) = reader.read_int32() {
+                    user_unlocked(arg1);
+                }
+                reply.append_int32(0);
+                0
+            }
+            TRANSACTION_PACKAGE_STATE_CHANGED => {
+                let (_, mode) = reader.read_int32().unwrap_or((0, 0));
+                let package = reader.read_string16().unwrap_or_default();
+                let (_, uid) = reader.read_int32().unwrap_or((0, 0));
+                package_state_changed(mode, package, uid);
+                reply.append_int32(0);
+                0
+            }
+            _ => -99999,
         }
     };
-    let cfg = crate::config::load(&args.config);
-    let binder_protocol = cfg.mosaic.get("binder_protocol").cloned();
-    let service_protocol = cfg.mosaic.get("service_manager_protocol").cloned();
-    let device = format!("/dev/{}", binder);
-    let sm = match ServiceManager::new(
-        &device,
-        service_protocol.as_deref(),
-        binder_protocol.as_deref(),
-    ) {
-        Ok(sm) => sm,
-        Err(e) => {
-            log::debug!("Failed to create ServiceManager: {}", e);
-            return;
-        }
-    };
-    if sm.is_present() {
-        log::debug!(
-            "UserMonitor service would be registered as {}",
-            SERVICE_NAME
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    serve(args, INTERFACE, SERVICE_NAME, handler, stop);
 }

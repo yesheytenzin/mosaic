@@ -17,6 +17,8 @@ pub const IFACE_HARDWARE: &str = "lineageos.waydroid.IHardware";
 pub const IFACE_CLIPBOARD: &str = "lineageos.waydroid.IClipboard";
 pub const IFACE_NOTIFICATIONS: &str = "lineageos.waydroid.INotifications";
 pub const IFACE_USER_MONITOR: &str = "lineageos.waydroid.IUserMonitor";
+pub const IFACE_NOTIFICATION_CALLBACK: &str =
+    "lineageos.waydroid.INotifications.INotificationCallback";
 
 /// Binder service names the guest looks up and the host publishes.
 pub const SVC_PLATFORM: &str = "waydroidplatform";
@@ -82,6 +84,10 @@ mod tests {
         assert_eq!(IFACE_CLIPBOARD, "lineageos.waydroid.IClipboard");
         assert_eq!(IFACE_NOTIFICATIONS, "lineageos.waydroid.INotifications");
         assert_eq!(IFACE_USER_MONITOR, "lineageos.waydroid.IUserMonitor");
+        assert_eq!(
+            IFACE_NOTIFICATION_CALLBACK,
+            "lineageos.waydroid.INotifications.INotificationCallback"
+        );
 
         assert_eq!(SVC_PLATFORM, "waydroidplatform");
         assert_eq!(SVC_STATUS_BAR, "waydroidstatusbar");
