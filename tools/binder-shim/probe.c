@@ -19,12 +19,15 @@ typedef long ssize_t;
 typedef long off_t;
 
 extern long syscall(long number, ...);
+extern void *malloc(unsigned long);
+extern void free(void *);
 
 #define SYS_read 0
 #define SYS_write 1
 #define SYS_close 3
 #define SYS_poll 7
 #define SYS_mmap 9
+#define SYS_nanosleep 35
 #define SYS_ioctl 16
 #define SYS_ftruncate 77
 #define SYS_epoll_ctl 233
@@ -66,7 +69,9 @@ struct binder_write_read {
 /* The logging helpers are defined further down; the command dumpers below are
  * declared up here so they can use them. */
 static void emit(const char *s);
+static int tracing_on(void);
 static void emit_dec(long value);
+static void emit_hex(unsigned long value, int digits);
 static void flush_log(void);
 
 extern int strncmp(const char *, const char *, unsigned long);
@@ -89,6 +94,7 @@ static void report(const char *from, const char *to) {
         if (redirected[i] && strcmp(redirected[i], from) == 0) return;
     }
     redirected[redirected_count++] = from;
+    if (!tracing_on()) return;
     emit("android-paths: ");
     emit(from);
     emit(" -> ");
@@ -100,129 +106,282 @@ static void flush_log(void);
 static char log_buffer[16384];
 static long log_length = 0;
 
-/* Binder command numbers, from binder.h. Only the ones worth naming. */
-#define BC_TRANSACTION 0
-#define BC_REPLY 1
-#define BC_FREE_BUFFER 3
-#define BC_INCREFS 4
-#define BC_ACQUIRE 5
-#define BC_RELEASE 6
-#define BC_DECREFS 7
-#define BC_ENTER_LOOPER 12
-#define BC_REGISTER_LOOPER 13
-#define BR_NOOP 0x200C
-#define BR_TRANSACTION 0x2002
-#define BR_REPLY 0x2003
+/* Binder command words.
+ *
+ * The BC_/BR_ constants in binder.h are _IOW/_IOR encodings, not small numbers:
+ * bits 0..7 are the number, 8..15 the type ('c' for a command, 'r' for a reply),
+ * 16..29 the argument length, 30..31 the direction. So each command word in the
+ * stream carries its own operand length, and the stream is self-describing --
+ * read a word, skip that many bytes, repeat.
+ *
+ * Four earlier attempts read the word as a command number and gave up on the
+ * bytes. The two streams that looked inconsistent are BC_TRANSACTION
+ * (_IOW('c',0,64) = 0x40406300, and 68 = 4 + 64) and a handle command
+ * (_IOW('c',5,4) = 0x40046305, and 8 = 4 + 4). The text that looked like garbage
+ * was the last four bytes of the 64-byte struct the constant itself declares.
+ */
+#define IOC_WRITE 1
+#define IOC_READ 2
+#define IOC(dir, type, nr, size) \
+    ((((unsigned)(dir)) << 30) | (((unsigned)(size)) << 16) | \
+     (((unsigned)(type)) << 8) | ((unsigned)(nr)))
+#define BC(nr, size) IOC(IOC_WRITE, 'c', nr, size)
+#define BR(nr, size) IOC(IOC_READ, 'r', nr, size)
 
-/* Commands carry a fixed operand after the command word, with no padding:
- * a transaction is command + struct binder_transaction_data, a handle command is
- * command + u32, and a free is command + pointer. */
+#define BC_TRANSACTION BC(0, 64)
+#define BC_REPLY BC(1, 64)
+#define BC_FREE_BUFFER BC(3, 8)
+#define BR_TRANSACTION_COMPLETE BR(4, 4)
+#define BR_NOOP IOC(0, 'r', 12, 0)
+#define BR_REPLY BR(3, 64)
+
+/* struct binder_transaction_data, 64 bytes, as libbinder writes it: the code is
+ * at 16, the data pointers at 48 and 56, and the sizes are 64-bit. */
+struct binder_transaction_data {
+    unsigned int target_handle;
+    unsigned int target_padding;
+    unsigned long cookie;
+    unsigned int code;
+    unsigned int flags;
+    int sender_pid;
+    unsigned int sender_euid;
+    unsigned long data_size;
+    unsigned long offsets_size;
+    unsigned long data_buffer;
+    unsigned long data_offsets;
+};
+
 #define TRANSACTION_DATA_SIZE 64
+#define TF_ONE_WAY 1
 
-static const char *command_name(unsigned int command) {
-    switch (command) {
-        case BC_TRANSACTION: return "BC_TRANSACTION";
-        case BC_REPLY: return "BC_REPLY";
-        case BC_FREE_BUFFER: return "BC_FREE_BUFFER";
-        case BC_INCREFS: return "BC_INCREFS";
-        case BC_ACQUIRE: return "BC_ACQUIRE";
-        case BC_RELEASE: return "BC_RELEASE";
-        case BC_DECREFS: return "BC_DECREFS";
-        case BC_ENTER_LOOPER: return "BC_ENTER_LOOPER";
-        case BC_REGISTER_LOOPER: return "BC_REGISTER_LOOPER";
-        default: return 0;
+/* The service-manager dispatch, in android-binder.so. Both doors must share one
+ * registry, and the Android linker puts every LD_PRELOAD library in the global
+ * group, so the symbol resolves there. */
+extern int mosaic_binder_reply(unsigned int code, const unsigned char *request,
+                               unsigned long request_size, unsigned char **out_data,
+                               unsigned long *out_size, unsigned long **out_objects,
+                               unsigned long *out_objects_count);
+
+/* One reply, per thread. A transaction is answered on the thread that made it. */
+typedef struct {
+    int have;
+    unsigned int code;
+    unsigned int flags;
+    unsigned char *data;
+    unsigned long size;
+    unsigned long *objects;
+    unsigned long objects_count;
+} pending_reply_t;
+
+static __thread pending_reply_t pending;
+
+/* A reply's buffers belong to the framework once it has them, and it returns
+ * them with BC_FREE_BUFFER. Until then they must stay alive, and the pointer it
+ * returns names the data, which is how the object array is found. */
+#define MAX_OUTSTANDING 64
+static unsigned char *outstanding_data[MAX_OUTSTANDING];
+static unsigned long *outstanding_objects[MAX_OUTSTANDING];
+static int outstanding_lock = 0;
+
+static void hold(unsigned char *data, unsigned long *objects) {
+    while (__sync_lock_test_and_set(&outstanding_lock, 1)) {
     }
+    for (int i = 0; i < MAX_OUTSTANDING; i++) {
+        if (!outstanding_data[i]) {
+            outstanding_data[i] = data;
+            outstanding_objects[i] = objects;
+            break;
+        }
+    }
+    __sync_lock_release(&outstanding_lock);
 }
 
-/* A Parcel starts with the interface token as a string16: a character count and
- * then UTF-16 characters. Printing it names the interface being called, which is
- * the quickest way to see what the framework is asking for. */
-static void dump_parcel_string(unsigned char *data, long size) {
-    if (size < 4) return;
-    unsigned int chars;
-    __builtin_memcpy(&chars, data, 4);
-    if (chars == 0 || chars > 128) return;
-    long needed = 4 + (long)chars * 2;
-    if (needed > size) return;
-    emit(" \"");
-    for (unsigned int i = 0; i < chars; i++) {
-        unsigned short c;
-        __builtin_memcpy(&c, data + 4 + i * 2, 2);
-        if (c < 32 || c > 126) {
-            emit("?");
-            continue;
-        }
-        char out[1];
-        out[0] = (char)c;
-        if (log_length + 1 < (long)sizeof(log_buffer)) {
-            log_buffer[log_length++] = out[0];
+static void release(unsigned char *data) {
+    if (!data) return;
+    while (__sync_lock_test_and_set(&outstanding_lock, 1)) {
+    }
+    for (int i = 0; i < MAX_OUTSTANDING; i++) {
+        if (outstanding_data[i] == data) {
+            outstanding_data[i] = 0;
+            free(outstanding_objects[i]);
+            outstanding_objects[i] = 0;
+            break;
         }
     }
-    emit("\"");
+    __sync_lock_release(&outstanding_lock);
+    free(data);
 }
 
-static int saw_unknown_command = 0;
+/* Answer one transaction.
+ *
+ * target.handle 0 is the service manager, which is what every Java binder call
+ * to a missing service reaches. Any other handle would name an object in another
+ * process: this shim hands back *local* objects, so a Java caller never holds a
+ * handle of ours, and one arriving here is a service the broker has to carry. */
+static void answer(struct binder_transaction_data *tr) {
+    pending.have = 0;
+    pending.code = tr->code;
+    pending.flags = tr->flags;
 
-static int dump_commands(unsigned char *buffer, long size) {
-    long offset = 0;
-    int wants_reply = 0;
-    saw_unknown_command = 0;
+    if (tr->target_handle != 0) {
+        unsigned char *data = (unsigned char *)malloc(4);
+        int code = -8; /* EX_SERVICE_SPECIFIC: this side cannot reach it */
+        if (data) {
+            __builtin_memcpy(data, &code, 4);
+            hold(data, 0);
+        }
+        pending.have = 1;
+        pending.data = data;
+        pending.size = data ? 4 : 0;
+        pending.objects = 0;
+        pending.objects_count = 0;
+        emit("binder-shim: transaction to handle ");
+        emit_dec((long)tr->target_handle);
+        emit(" code ");
+        emit_dec((long)tr->code);
+        emit(" has no local object\n");
+        flush_log();
+        return;
+    }
+
+    unsigned char *data = 0;
+    unsigned long data_size = 0;
+    unsigned long *objects = 0;
+    unsigned long objects_count = 0;
+    int produced = mosaic_binder_reply(tr->code, (const unsigned char *)tr->data_buffer,
+                                       tr->data_size, &data, &data_size, &objects,
+                                       &objects_count);
+    emit("binder-shim: transaction code ");
+    emit_dec((long)tr->code);
+    emit(" -> ");
+    emit_dec((long)data_size);
+    emit(" bytes, ");
+    emit_dec((long)objects_count);
+    emit(" object(s)\n");
+    flush_log();
+    if (!produced) return;
+
+    hold(data, objects);
+    pending.have = 1;
+    pending.data = data;
+    pending.size = data_size;
+    pending.objects = objects;
+    pending.objects_count = objects_count;
+}
+
+/* Walk the command stream. It is self-describing -- each command word carries
+ * its operand length -- so a command this shim does not act on is not an error
+ * and not a reason to stop: the length says how far to skip. Reference and
+ * looper commands are consumed and forgotten, which is what a driver does with
+ * them for a process that has no remote objects yet. */
+static int dumps = 0;
+
+static void dump_stream(const char *what, unsigned char *bytes, unsigned long size) {
+    if (dumps >= 4) return;
+    dumps++;
+    emit("binder-shim: ");
+    emit(what);
+    emit(" [");
+    for (unsigned long i = 0; i < size && i < 96; i++) {
+        emit_hex(bytes[i], 2);
+        emit(" ");
+    }
+    emit("]\n");
+    flush_log();
+}
+
+static void run_commands(unsigned char *buffer, unsigned long size) {
+    unsigned long offset = 0;
     while (offset + 4 <= size) {
         unsigned int command;
         __builtin_memcpy(&command, buffer + offset, 4);
+        unsigned int operand = (command >> 16) & 0x3fff;
         offset += 4;
-
-        const char *name = command_name(command);
-        emit(" ");
-        if (!name) {
-            emit("cmd:");
-            emit_dec((long)command);
-            saw_unknown_command = 1;
-            continue;
+        if (offset + operand > size) {
+            emit("binder-shim: truncated command stream\n");
+            flush_log();
+            break;
         }
-        emit(name);
-
-        if (command == BC_TRANSACTION || command == BC_REPLY) {
-            if (offset + TRANSACTION_DATA_SIZE > size) break;
-            unsigned char *tr = buffer + offset;
-            unsigned int handle, code, flags;
-            __builtin_memcpy(&handle, tr, 4);        /* target.handle */
-            __builtin_memcpy(&code, tr + 16, 4);
-            __builtin_memcpy(&flags, tr + 20, 4);
-            unsigned long data_ptr;
-            long data_size;
-            __builtin_memcpy(&data_ptr, tr + 40, 8);
-            __builtin_memcpy(&data_size, tr + 24, 8);
-            emit("(handle=");
-            emit_dec((long)handle);
+        if (command == BC_TRANSACTION) {
+            struct binder_transaction_data *tr =
+                (struct binder_transaction_data *)(buffer + offset);
+            emit("binder-shim: tr handle=");
+            emit_dec((long)tr->target_handle);
             emit(" code=");
-            emit_dec((long)code);
-            emit(" flags=");
-            emit_dec((long)flags);
-            if (data_ptr && data_size > 0) {
-                dump_parcel_string((unsigned char *)data_ptr, data_size);
-            }
-            emit(")");
-            if (command == BC_TRANSACTION && !(flags & 1)) {
-                /* TF_ONE_WAY is bit 0; anything else expects an answer. */
-                wants_reply = 1;
-            }
-            offset += TRANSACTION_DATA_SIZE;
+            emit_dec((long)tr->code);
+            emit(" buffer=0x");
+            emit_hex(tr->data_buffer, 16);
+            emit(" size=");
+            emit_dec((long)tr->data_size);
+            emit(" offsets=");
+            emit_dec((long)tr->offsets_size);
+            emit("\n");
+            flush_log();
+            if (dumps < 2) dump_stream("stream", buffer, size);
+            answer(tr);
         } else if (command == BC_FREE_BUFFER) {
-            offset += 8;
-        } else if (command == BC_INCREFS || command == BC_ACQUIRE ||
-                   command == BC_RELEASE || command == BC_DECREFS) {
-            unsigned int handle;
-            if (offset + 4 <= size) {
-                __builtin_memcpy(&handle, buffer + offset, 4);
-                emit("(handle=");
-                emit_dec((long)handle);
-                emit(")");
-            }
-            offset += 4;
+            unsigned long data;
+            __builtin_memcpy(&data, buffer + offset, 8);
+            release((unsigned char *)data);
         }
+        offset += operand;
     }
-    return wants_reply;
+}
+
+/* Write the commands the framework is waiting for. A synchronous transaction
+ * gets BR_TRANSACTION_COMPLETE and then BR_REPLY; a oneway one gets only the
+ * first, because nothing is owed and libbinder finishes on it. */
+static long write_reply(unsigned char *out, long capacity) {
+    unsigned int complete = BR_TRANSACTION_COMPLETE;
+    if (capacity < 4) return 0;
+
+    if (pending.flags & TF_ONE_WAY) {
+        __builtin_memcpy(out, &complete, 4);
+        return 4;
+    }
+    if (capacity < 4 + 4 + TRANSACTION_DATA_SIZE) return 0;
+
+    long offset = 0;
+    __builtin_memcpy(out + offset, &complete, 4);
+    offset += 4;
+    unsigned int reply = BR_REPLY;
+    __builtin_memcpy(out + offset, &reply, 4);
+    offset += 4;
+
+    struct binder_transaction_data tr;
+    unsigned char *raw = (unsigned char *)&tr;
+    for (unsigned long i = 0; i < sizeof(tr); i++) raw[i] = 0;
+    tr.code = pending.code;
+    tr.data_size = pending.size;
+    tr.offsets_size = pending.objects_count * 8;
+    tr.data_buffer = (unsigned long)pending.data;
+    tr.data_offsets = (unsigned long)pending.objects;
+    __builtin_memcpy(out + offset, &tr, TRANSACTION_DATA_SIZE);
+    offset += TRANSACTION_DATA_SIZE;
+    return offset;
+}
+
+struct timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+
+/* A thread with nothing to do and no work to give it.
+ *
+ * A driver blocks here. Returning nothing instead is worse than it sounds:
+ * libbinder reads the next command out of the buffer it was given, an empty
+ * buffer reads as command 0, and it logs "*** BAD COMMAND 0 received from Binder
+ * driver" and carries on with a broken idea of where it is. So a waiting thread
+ * is given BR_NOOP, which libbinder's command loop treats as exactly what it is
+ * -- do nothing, ask again -- after a short wait so the asking is not a spin.
+ *
+ * Blocking for good is what a driver does and would work too, but it would wedge
+ * a thread that some other path expects to come back. */
+#define WAIT_STEP_NANOSECONDS 100000000
+
+static void wait_for_work(void) {
+    struct timespec step = {0, WAIT_STEP_NANOSECONDS};
+    syscall(SYS_nanosleep, &step, 0);
 }
 
 static int binder_fd = -1;
@@ -240,10 +399,32 @@ static size_t str_len(const char *s) {
 /* Diagnostics are accumulated and written once. Writing each piece separately
  * interleaves with the process's own stderr, which produces output that looks
  * like a corrupted buffer and sends you chasing a bug that is not there. */
+/* The interesting events are always reported, up to a bound; the per-syscall
+ * tracing is not, because this library sits on the busiest path in the process
+ * and a run that traces everything buries its own results. MOSAIC_BINDER_DEBUG=1
+ * turns the tracing on, which is how the answers below were found. */
+#define MAX_LINES 400
+static long lines = 0;
+
+static int tracing = -1;
+
+static int tracing_on(void) {
+    if (tracing < 0) {
+        const char *v = getenv("MOSAIC_BINDER_DEBUG");
+        tracing = (v && v[0] == '1') ? 1 : 0;
+    }
+    return tracing;
+}
+
 static void flush_log(void) {
+    if (lines >= MAX_LINES) {
+        log_length = 0;
+        return;
+    }
     if (log_length > 0) {
         syscall(SYS_write, 2, log_buffer, log_length);
         log_length = 0;
+        lines++;
     }
 }
 
@@ -536,63 +717,39 @@ int ioctl(int fd, unsigned long request, ...) {
     }
     if (request == BINDER_WRITE_READ) {
         struct binder_write_read *bwr = (struct binder_write_read *)arg;
-        emit("bwr=0x");
-        emit_hex((unsigned long)bwr, 12);
-        emit(" fields: ");
-        unsigned long *fields = (unsigned long *)bwr;
-        for (int fi = 0; fi < 6; fi++) {
-            emit_hex(fields[fi], 16);
-            emit(" ");
-        }
-        emit("| BINDER_WRITE_READ write_size=");
-        emit_dec(bwr->write_size);
-        emit(" read_size=");
-        emit_dec(bwr->read_size);
-        emit(" commands:");
-        {
-            /* The first bytes of the stream are the quickest way to see whether
-             * a command starts at offset 0 or after a header. */
-            emit(" [");
-            unsigned char *raw = (unsigned char *)bwr->write_buffer;
-            for (long i = 0; i < 96 && i < bwr->write_size; i++) {
-                emit_hex(raw[i], 2);
-                emit(" ");
-            }
-            emit("]");
-        }
-        int replied = dump_commands((unsigned char *)bwr->write_buffer, bwr->write_size);
-        emit("\n");
-        bwr->write_consumed = bwr->write_size;
-        if (replied) {
-            /* The reply is an empty Parcel: the generated AIDL proxy reads an
-             * exception code (0 from an empty buffer) and then a strong binder,
-             * which an empty buffer returns as null. That is the honest answer
-             * while no service exists, and it keeps the failure in Java where
-             * the framework can report it, instead of in the driver. */
-            long written = 0;
-            unsigned char *out = (unsigned char *)bwr->read_buffer;
-            if (bwr->read_size >= 4 + TRANSACTION_DATA_SIZE) {
-                unsigned int br_reply = BR_REPLY;
-                __builtin_memcpy(out, &br_reply, 4);
-                unsigned char *tr = out + 4;
-                long zero = 0;
-                for (int i = 0; i < TRANSACTION_DATA_SIZE; i++) tr[i] = 0;
-                /* target.handle, code, flags, sender ids, sizes and pointers stay
-                 * zero: an empty reply with no objects. */
-                __builtin_memcpy(tr + 24, &zero, 8);  /* data_size */
-                __builtin_memcpy(tr + 32, &zero, 8);  /* offsets_size */
-                written = 4 + TRANSACTION_DATA_SIZE;
-            }
-            bwr->read_consumed = written;
-            emit("binder-shim: replied with an empty parcel (");
-            emit_dec(written);
-            emit(" bytes)\n");
+
+        if (bwr->write_size > 0 && bwr->write_buffer) {
+            emit("binder-shim: write=");
+            emit_dec(bwr->write_size);
+            emit(" read=");
+            emit_dec(bwr->read_size);
+            emit("\n");
+            run_commands((unsigned char *)bwr->write_buffer, (unsigned long)bwr->write_size);
+            bwr->write_consumed = bwr->write_size;
         } else {
-            bwr->read_consumed = 0;
-            if (saw_unknown_command) {
-                emit("binder-shim: unparsed command stream; failing fast\n");
-                flush_log();
-                return -1;
+            bwr->write_consumed = 0;
+        }
+
+        /* A read-only call with nothing to hand over is a thread waiting for
+         * work. Pause before answering it with a no-op, so the re-asking is not
+         * a spin. */
+        if (!pending.have && bwr->write_size == 0 && bwr->read_size > 0) {
+            wait_for_work();
+        }
+
+        bwr->read_consumed = 0;
+        if (bwr->read_size > 0 && bwr->read_buffer) {
+            if (pending.have) {
+                bwr->read_consumed =
+                    write_reply((unsigned char *)bwr->read_buffer, bwr->read_size);
+                pending.have = 0;
+            } else if (bwr->write_size == 0) {
+                /* Nothing to answer: a no-op keeps the reader where it is. */
+                if (bwr->read_size >= 4) {
+                    unsigned int noop = BR_NOOP;
+                    __builtin_memcpy((void *)bwr->read_buffer, &noop, 4);
+                    bwr->read_consumed = 4;
+                }
             }
         }
         flush_log();
@@ -639,9 +796,11 @@ extern void *dlsym(void *handle, const char *symbol);
 #define RTLD_NEXT ((void *)-1L)
 
 const void *__system_property_find(const char *name) {
-    emit("binder-shim: property_find ");
-    emit(name ? name : "(null)");
-    emit("\n");
+    if (tracing_on()) {
+        emit("binder-shim: property_find ");
+        emit(name ? name : "(null)");
+        emit("\n");
+    }
 
     typedef const void *(*next_fn)(const char *);
     static next_fn next;

@@ -276,13 +276,59 @@ whether the outgoing parcel for this call has been through `remove()` or
 (`platform/frameworks/native`, `libs/binder/{IPCThreadState,Parcel}.cpp`) and were
 read once already without settling it.
 
+## The Java path, now answered
+
+The wall above was real but the conclusion drawn from it was wrong. The constant
+values were read out of libbinder's own machine code rather than recalled:
+
+```
+BC_TRANSACTION  _IOW('c', 0, 64)  = 0x40406300   the observed 68-byte stream
+BC_FREE_BUFFER  _IOW('c', 3,  8)  = 0x40086303
+BR_REPLY        _IOR('r', 3, 64)  = 0x80407203
+BR_TRANSACTION_COMPLETE _IOR('r',4,4) = 0x80047204
+BR_NOOP         _IO('r', 12)      = 0x0000720c
+```
+
+`IPCThreadState::writeTransactionData` was disassembled too, which settles
+`binder_transaction_data` at 64 bytes with the code at 16, the sizes at 32 and 40,
+and the two pointers at 48 and 56 -- and the command word's own size field agrees,
+which is what makes the stream self-describing.
+
+Two more things the running framework taught, both now implemented:
+
+- **The interface token is not at the start of the request.** This build prefixes
+  it with twelve bytes and puts an int32 between it and the service name, so
+  skipping one string16 from the front reads the prefix, and taking the next one
+  reads an empty string. Searching for the descriptor and then for the first
+  printable string16 after it is what finds the name -- and checking the
+  descriptor is also what stops one interface's transaction code 2 from being
+  answered as `checkService`.
+- **A waiting thread must not be given nothing.** Returning with an empty read
+  buffer makes libbinder read command 0 out of it and log `*** BAD COMMAND 0
+  received from Binder driver`. `BR_NOOP` is the answer: its command loop treats
+  it as "nothing happened, ask again".
+
+With that, the framework's Java calls reach the registry: names are read
+correctly, registrations are remembered, and lookups find them --
+
+```
+android-binder: AIDL register memtrack.proxy
+android-binder: checkService memtrack.proxy found
+```
+
+-- which is the first time any service lookup in this project has returned
+anything. `BpBinder::transact` *is* reachable for these calls after all, so the
+driver door turns out to be needed for the HIDL half (`/dev/hwbinder`, where
+`defaultServiceManager() is null`) rather than for the Java service manager.
+
 ## What is left for Phase 3
 
-1. Settle the write-stream framing, then reply to `BINDER_WRITE_READ`: for a
-   transaction to handle 0, dispatch it to the service registry and write a
-   `BR_REPLY` carrying the resulting handle.
-2. Reference counting: `BC_ACQUIRE`/`BC_RELEASE`/`BC_INCREFS`/`BC_DECREFS`, which
-   are what keep a remote object alive.
-3. Route transactions to handles the registry handed out. For now those services
-   do not exist, so the honest answer is an error reply rather than a hang, and
-   the framework reports the service as unavailable instead of aborting.
+The shim answers the service manager and hands back local objects, so a caller in
+the same process needs no further routing. Two things follow from that:
+
+1. A transaction for a handle -- an object in *another* process -- is the
+   broker's to carry. `src/binder/transport.rs` does that between two
+   connections; what is missing is the shim as a client of it, and a service that
+   exists to be reached.
+2. `/dev/hwbinder` needs its own service manager, the way `/dev/binder` has one,
+   for the HIDL calls that today find `defaultServiceManager() is null`.
