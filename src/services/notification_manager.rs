@@ -107,86 +107,89 @@ fn build_hints(
 }
 
 pub fn start(args: &MosaicArgs, _session: &SessionDefaults) -> anyhow::Result<()> {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => Arc::new(rt),
-        Err(e) => {
-            log::debug!("No notification runtime: {}", e);
-            return Ok(());
-        }
-    };
-
-    // Verify the host notification daemon exists before starting the service.
-    let connected = runtime.block_on(async {
-        let connection = zbus::Connection::session().await.ok()?;
-        NotificationsProxy::new(&connection).await.ok()
-    });
-    let Some(proxy) = connected else {
-        log::info!(
-            "Skipping notification manager service because we could not connect to the notifications server"
-        );
-        return Ok(());
-    };
-
-    let listeners: Arc<Mutex<Vec<INotificationCallback>>> = Arc::new(Mutex::new(Vec::new()));
-    let pending_tokens: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    // Dispatch host signals to the registered guest listeners.
-    {
-        let runtime = runtime.clone();
-        let listeners = listeners.clone();
-        let pending_tokens = pending_tokens.clone();
-        let proxy = proxy.clone();
-        runtime.spawn(async move {
-            let mut actions = match NotificationsProxy::receive_action_invoked(&proxy).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    log::debug!("Failed to subscribe to ActionInvoked: {}", e);
-                    return;
-                }
-            };
-            while let Some(signal) = futures_util::StreamExt::next(&mut actions).await {
-                if let Ok(args) = signal.args() {
-                    let token = pending_tokens
-                        .lock()
-                        .unwrap()
-                        .remove(&args.id)
-                        .unwrap_or_default();
-                    for listener in listeners.lock().unwrap().iter() {
-                        listener.on_action_invoked(args.id as i32, &args.action_id, &token);
-                    }
-                }
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let pending_tokens = pending_tokens.clone();
-        let proxy = proxy.clone();
-        runtime.spawn(async move {
-            let mut tokens = match NotificationsProxy::receive_activation_token(&proxy).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    log::debug!("Failed to subscribe to ActivationToken: {}", e);
-                    return;
-                }
-            };
-            while let Some(signal) = futures_util::StreamExt::next(&mut tokens).await {
-                if let Ok(args) = signal.args() {
-                    pending_tokens
-                        .lock()
-                        .unwrap()
-                        .insert(args.id, args.token.clone());
-                }
-            }
-        });
-    }
-
+    // Everything runs on the service thread. Building the runtime and calling
+    // block_on in the caller would run inside the async entry point's runtime
+    // and panic with "Cannot start a runtime from within a runtime".
     STOPPING.store(false, Ordering::SeqCst);
     let args = args.clone();
     std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                log::debug!("No notification runtime: {}", e);
+                return;
+            }
+        };
+
+        // Verify the host notification daemon exists before starting the service.
+        let connected = runtime.block_on(async {
+            let connection = zbus::Connection::session().await.ok()?;
+            NotificationsProxy::new(&connection).await.ok()
+        });
+        let Some(proxy) = connected else {
+            log::info!(
+                "Skipping notification manager service because we could not connect to the notifications server"
+            );
+            return;
+        };
+
+        let listeners: Arc<Mutex<Vec<INotificationCallback>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_tokens: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // Dispatch host signals to the registered guest listeners.
+        {
+            let runtime = runtime.clone();
+            let listeners = listeners.clone();
+            let pending_tokens = pending_tokens.clone();
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                let mut actions = match NotificationsProxy::receive_action_invoked(&proxy).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        log::debug!("Failed to subscribe to ActionInvoked: {}", e);
+                        return;
+                    }
+                };
+                while let Some(signal) = futures_util::StreamExt::next(&mut actions).await {
+                    if let Ok(args) = signal.args() {
+                        let token = pending_tokens
+                            .lock()
+                            .unwrap()
+                            .remove(&args.id)
+                            .unwrap_or_default();
+                        for listener in listeners.lock().unwrap().iter() {
+                            listener.on_action_invoked(args.id as i32, &args.action_id, &token);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let runtime = runtime.clone();
+            let pending_tokens = pending_tokens.clone();
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                let mut tokens = match NotificationsProxy::receive_activation_token(&proxy).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        log::debug!("Failed to subscribe to ActivationToken: {}", e);
+                        return;
+                    }
+                };
+                while let Some(signal) = futures_util::StreamExt::next(&mut tokens).await {
+                    if let Ok(args) = signal.args() {
+                        pending_tokens
+                            .lock()
+                            .unwrap()
+                            .insert(args.id, args.token.clone());
+                    }
+                }
+            });
+        }
+
         while !STOPPING.load(Ordering::SeqCst) {
             let notify_runtime = runtime.clone();
             let notify_proxy = proxy.clone();
