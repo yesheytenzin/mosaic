@@ -773,8 +773,5 @@ pub async fn run_container_service(args: MosaicArgs) -> anyhow::Result<()> {
 // Legacy sync functions for CLI
 
 pub fn start_service_blocking(args: MosaicArgs) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(run_container_service(args))
+    crate::helpers::runtime::block_on(run_container_service(args))
 }

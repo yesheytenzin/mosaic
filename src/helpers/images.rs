@@ -131,28 +131,24 @@ pub async fn get(args: &MosaicArgs) -> anyhow::Result<()> {
 pub fn validate(args: &MosaicArgs, channel: &str, path: &str) -> bool {
     let cfg = crate::config::load(&args.config);
     let channel_url = cfg.mosaic.get(channel).cloned().unwrap_or_default();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
-    if let Ok(rt) = rt {
-        let (status, body) = rt.block_on(crate::helpers::http::retrieve(&channel_url, None));
-        if status != 200 {
-            return false;
-        }
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(arr) = json["response"].as_array() {
-                if let Ok(sum) = sha256sum(path) {
-                    for build in arr {
-                        if build["id"].as_str() == Some(&sum) {
-                            return true;
-                        }
+    let (status, body) =
+        crate::helpers::runtime::block_on(crate::helpers::http::retrieve(&channel_url, None));
+    if status != 200 {
+        return false;
+    }
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+        if let Some(arr) = json["response"].as_array() {
+            if let Ok(sum) = sha256sum(path) {
+                for build in arr {
+                    if build["id"].as_str() == Some(&sum) {
+                        return true;
                     }
-                    log::warn!(
-                        "Could not verify the image {} against {}",
-                        path,
-                        channel_url
-                    );
                 }
+                log::warn!(
+                    "Could not verify the image {} against {}",
+                    path,
+                    channel_url
+                );
             }
         }
     }

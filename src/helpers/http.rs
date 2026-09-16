@@ -38,13 +38,7 @@ pub async fn retrieve(url: &str, headers: Option<HashMap<String, String>>) -> (i
 }
 
 pub fn retrieve_blocking(url: &str, headers: Option<HashMap<String, String>>) -> (i32, Vec<u8>) {
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt.block_on(retrieve(url, headers)),
-        Err(_) => (-2, Vec::new()),
-    }
+    crate::helpers::runtime::block_on(retrieve(url, headers))
 }
 
 fn cache_path(work: &str, prefix: &str, url: &str) -> String {
@@ -133,10 +127,7 @@ pub fn download_blocking(
     cache: bool,
     allow_404: bool,
 ) -> anyhow::Result<Option<String>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(download(args, url, prefix, cache, allow_404))
+    crate::helpers::runtime::block_on(download(args, url, prefix, cache, allow_404))
 }
 
 #[cfg(test)]

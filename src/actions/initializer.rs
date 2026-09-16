@@ -320,16 +320,15 @@ pub fn init(
             report("Stopping container");
             log::info!("Stopping container");
             // Try D-Bus stop, fallback to lxc
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let res = rt.block_on(crate::helpers::ipc::container_stop(false));
+            let res = crate::helpers::runtime::block_on(crate::helpers::ipc::container_stop(false));
             if res.is_err() {
                 log::debug!("D-Bus Stop failed, falling back to lxc stop: {:?}", res);
                 let _ = crate::actions::container_manager::stop(args, false, None);
             } else {
                 // Try to get session via D-Bus
-                if let Ok(s) = rt.block_on(crate::helpers::ipc::container_get_session()) {
+                if let Ok(s) =
+                    crate::helpers::runtime::block_on(crate::helpers::ipc::container_get_session())
+                {
                     session = Some(s);
                 }
             }
@@ -346,10 +345,7 @@ pub fn init(
     report("Downloading images");
     if !preinstalled.contains(&images_path) {
         // Download images (blocking)
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(crate::helpers::images::get(args))?;
+        crate::helpers::runtime::block_on(crate::helpers::images::get(args))?;
     } else {
         crate::helpers::images::remove_overlay(args)?;
     }
@@ -391,11 +387,9 @@ pub fn init(
         } else {
             report("Starting container");
             log::info!("Starting container");
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
             if let Some(sess) = session {
-                let _ = rt.block_on(crate::helpers::ipc::container_start(sess));
+                let _ =
+                    crate::helpers::runtime::block_on(crate::helpers::ipc::container_start(sess));
             } else {
                 log::debug!("No session to restart container with");
             }
