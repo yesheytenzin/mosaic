@@ -67,6 +67,8 @@ struct JavaVMInitArgs {
 
 /* JNI function table indices. */
 #define JNI_FIND_CLASS 6
+#define JNI_EXCEPTION_OCCURRED 15
+#define JNI_EXCEPTION_DESCRIBE 16
 #define JNI_GET_STATIC_METHOD_ID 113
 #define JNI_NEW_STRING_UTF 167
 #define JNI_NEW_OBJECT_ARRAY 172
@@ -281,5 +283,19 @@ static int run_class(JNIEnvP env, const char *class_name, const char *args_spec)
     say(class_name);
     say("\n");
     call_static_void(env, target, main_method, argument);
+
+    /* If main threw, the exception is pending on this native frame. Exiting
+     * without looking at it hides the only description of what went wrong --
+     * an uncaught exception reaches no Java frame to print it. */
+    jobject (*exception_occurred)(JNIEnvP) =
+        (jobject(*)(JNIEnvP))table[JNI_EXCEPTION_OCCURRED];
+    void (*exception_describe)(JNIEnvP) = (void(*)(JNIEnvP))table[JNI_EXCEPTION_DESCRIBE];
+    if (exception_occurred(env)) {
+        say("launcher: ");
+        say(class_name);
+        say(" threw, and the exception was pending on the native frame:\n");
+        exception_describe(env);
+        return 1;
+    }
     return 0;
 }
