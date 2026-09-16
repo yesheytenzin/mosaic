@@ -127,14 +127,17 @@ fi
 
 bundle=${1:-}
 if [ -n "$bundle" ]; then
-  say "5. the framework, without the priority stand-ins"
+  say "5. the framework, without pretend-nice.so (limit raised for this run)"
   if [ ! -x "$bundle/run.sh" ]; then
     bad "$bundle does not look like a runtime bundle (no run.sh)"
   else
-    # The stand-ins are the one thing being removed here. Everything else is what
-    # the harness normally preloads.
+    # pretend-nice.so is the one thing left out, and pretend-cgroups.so is
+    # deliberately kept: the cgroup calls it answers are not about the limit, and a
+    # desktop has no cgroups however high the limit is. A run of this that left
+    # both out stopped at Process.setThreadGroup with "No permission to modify
+    # given thread", which says nothing about the limit either way.
     preload="$root/tools/launcher/out/launcher.so"
-    for library in probe android-binder android-properties; do
+    for library in probe pretend-cgroups android-binder android-properties; do
       preload="$preload $root/tools/binder-shim/out/$library.so"
     done
     # If a preload is missing the harness builds it, which is why this does not

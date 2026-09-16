@@ -1,20 +1,31 @@
-/* Pretend the thread-priority calls succeed.
+/* Accept the thread-priority calls a desktop is not allowed to make.
  *
  * The Android framework raises its own thread priorities during startup --
- * android.os.Process.setThreadPriority with a negative value -- and an
- * unprivileged process may only lower its nice value within RLIMIT_NICE. On a
+ * android.os.Process.setThreadPriority with a negative value, which is a negative
+ * nice -- and an unprivileged process may only do that within RLIMIT_NICE. On a
  * desktop RLIMIT_NICE is 0, and raising the hard limit needs privilege in the
- * initial user namespace, so not even root in a user namespace can do it here.
- * The framework therefore throws:
+ * *initial* user namespace, so not even root inside a user namespace can do it:
+ *
+ *   $ unshare -r -- sh -c 'ulimit -e 40'
+ *   sh: ulimit: scheduling priority: cannot modify limit: Operation not permitted
+ *
+ * So the framework throws:
  *
  *   java.lang.SecurityException: No permission to set the priority of <tid>
  *     at android.os.Process.setThreadPriority(Native Method)
  *     at com.android.server.SystemServer.run(SystemServer.java:858)
  *
- * This preload accepts those calls and logs them, so a harness run can get past
- * a capability the harness cannot have. It is not a fix: the product needs the
- * broker's unit to carry LimitNICE (systemd) or an equivalent privileged step,
- * which is the shape of ADR-0008.
+ * This preload accepts those calls and logs them, so a harness run on a machine
+ * with no limit can get past a capability the harness cannot have.
+ *
+ * It is a crutch, and it is meant to be deleted. The product's answer is the
+ * systemd unit's LimitNICE=40, granted system side to the user manager (see
+ * systemd/mosaic-broker.service and packaging/arch/user@.service.d/mosaic.conf).
+ * A6's gate is exactly this: with the limit in place, the framework reaches
+ * StartActivityManager with *this file* left out of the preload list. When that
+ * passes, delete this file rather than keep it -- the cgroup half of what this
+ * used to do together with has moved to pretend-cgroups.c, which a non-Android
+ * host needs regardless.
  *
  * Built by tools/build-native.sh alongside the other Bionic artifacts.
  */
@@ -89,19 +100,12 @@ int setpriority_always(int which, int who, int priority) {
     return 0;
 }
 
-/* The framework also sets scheduling parameters and affinity for its own
- * threads, which a desktop process is not permitted to do either. */
+/* The framework also sets scheduling parameters for its own threads, which a
+ * desktop process is not permitted to do either. */
 int pthread_setschedparam(void *thread, int policy, const void *param) {
     (void)thread;
     (void)policy;
     (void)param;
-    return 0;
-}
-
-int sched_setaffinity(int pid, unsigned long cpusetsize, const void *mask) {
-    (void)pid;
-    (void)cpusetsize;
-    (void)mask;
     return 0;
 }
 
@@ -112,22 +116,6 @@ int androidSetThreadPriority(int tid, int priority) {
     (void)tid;
     (void)priority;
     return 0;
-}
-
-int set_sched_policy(int tid, int policy) {
-    (void)tid;
-    (void)policy;
-    return 0;
-}
-
-/* Process.setThreadGroup ends up here, in libprocessgroup, with a vector of
- * profile names that needs a cgroup the desktop does not have. The arguments are
- * not touched, only the answer. */
-int _ZN12TaskProfiles15SetTaskProfilesEiRKNSt3__16vectorINS0_12basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEENS5_IS7_EEEEb(int tid, const void *profiles, int use_fd_cache) {
-    (void)tid;
-    (void)profiles;
-    (void)use_fd_cache;
-    return 1 /* true */;
 }
 
 /* The framework also uses scheduler policies for its own threads. */

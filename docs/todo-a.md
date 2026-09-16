@@ -152,11 +152,28 @@ own process serving a call from a second one.
       stand-ins are load-bearing exactly because the limit is missing, and the
       limit is what systemd sets.
 
-      `make verify-priority` (or `sudo tools/verify-priority-limit.sh`) is the
-      check: it reads the drop-in, asks the user manager what this session's limit
-      is, and has a child of the broker lower its niceness, which is what every
-      `androidSetThreadPriority` call amounts to. When it passes, `pretend-nice.c`
-      can be deleted.
+      `make verify-priority` (or `sudo tools/verify-priority-limit.sh <bundle>`)
+      is the check: it reads the drop-in, asks the user manager what this session's
+      limit is, has a child of the broker lower its niceness -- which is what every
+      `androidSetThreadPriority` call amounts to -- and, given a bundle, runs the
+      framework with `pretend-nice.so` left out and checks that SystemServer still
+      reaches `StartActivityManager`. When it passes, `pretend-nice.c` can be
+      deleted.
+
+      One thing that check had to learn: the stand-ins were doing two unrelated
+      jobs. The first run with the whole file removed stopped at
+
+      ```
+      java.lang.SecurityException: No permission to modify given thread 27270
+        at android.os.Process.setThreadGroup(Native Method)
+        at com.android.server.UiThread.run(UiThread.java:44)
+      ```
+
+      which is the *cgroup* path, not the priority one -- `TaskProfiles::SetTaskProfiles`
+      and `set_sched_policy` want cgroups a desktop has not got, however high the
+      limit is. Those have moved to `pretend-cgroups.c`, which stays, because that
+      is not a crutch for the limit but the cgroup model's absence. `pretend-nice.c`
+      is the crutch, and it is what the gate is about.
 
 *Gate:* `Process.setThreadPriority` works without the harness stand-ins.
 

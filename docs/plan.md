@@ -264,7 +264,7 @@ thanks to the launcher's exception reporting:
   that limit is 0 and cannot be raised (the hard limit needs privilege in the
   initial user namespace), so the broker's unit needs `LimitNICE` or an equivalent
   privileged step, in the shape of ADR-0008. The harness carries a small stand-in
-  (`tools/binder-shim/pretend-nice.c`) so a run can get past a capability the
+  (`tools/binder-shim/pretend-nice.c (nice) and pretend-cgroups.c (cgroups)`) so a run can get past a capability the
   harness cannot have.
 
 Past that, it asks for another class the boot class loader does not have, which is
@@ -289,7 +289,7 @@ lookups, and the gaps that followed were each named by a stack trace:
   Staging *every* `*-res.apk` rather than one at a time is what finally got past
   it, since a LineageOS image adds its own.
 - `Process.setThreadPriority` — `RLIMIT_NICE`, a capability the harness cannot
-  have (see `pretend-nice.c`).
+  have (see `pretend-nice.c (nice) and pretend-cgroups.c (cgroups)`).
 
 And then:
 
