@@ -1,0 +1,14 @@
+[Unit]
+Description=Mosaic broker socket
+Documentation=man:mosaic(1)
+
+[Socket]
+# %t is XDG_RUNTIME_DIR. The broker is unprivileged, so the socket has to live
+# somewhere the user can reach, not under /var/lib/mosaic.
+RuntimeDirectory=mosaic
+ListenStream=%t/mosaic/broker.sock
+SocketMode=0600
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

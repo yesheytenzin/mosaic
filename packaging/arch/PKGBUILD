@@ -12,12 +12,15 @@
 pkgname=mosaic
 pkgver=0.0.1
 pkgrel=1
-pkgdesc="Android container tool (Rust rewrite of Waydroid)"
+pkgdesc="Run Android apps as native Linux processes"
 arch=('x86_64' 'aarch64')
 url="https://github.com/yesheytenzin/mosaic"
 license=('GPL-3.0-or-later')
-depends=('lxc' 'dbus' 'polkit' 'iptables' 'xz' 'libgbinder-git')
-makedepends=('cargo' 'rust' 'pkgconf')
+# polkit is for the one privileged operation: giving an app its own system user.
+# xz provides liblzma, which unpacks the runtime bundle. There is no lxc, no
+# dbus service and no kernel module any more (ADR-0004, ADR-0008).
+depends=('polkit' 'xz')
+makedepends=('cargo' 'rust')
 source=()
 sha256sums=()
 

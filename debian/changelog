@@ -1,8 +1,17 @@
 mosaic (0.0.1) unstable; urgency=medium
 
   * Rust rewrite of the Waydroid tools, renamed from waydroid to mosaic.
+  * Stop booting an Android system in a container and run apps as native Linux
+    processes instead. The container port is retired before its first release,
+    so this is folded into the same unreleased version.
+  * Reuse AOSP's ART and Bionic as host-native libraries, distributed as a
+    pinned, hash-verified runtime bundle.
+  * Replace the kernel Binder driver with a userspace implementation, and the
+    D-Bus container services with one lazily started, idle-exiting broker.
+  * Replace the session and container commands with install, uninstall, launch,
+    query, runtime, daemon and uid-helper.
 
- -- yesheytenzin <yesheytenzin@users.noreply.github.com>  Tue, 15 Sep 2026 21:33:59 +0600
+ -- yesheytenzin <yesheytenzin@users.noreply.github.com>  Wed, 16 Sep 2026 10:00:00 +0600
 
 mosaic (1.6.3) bullseye; urgency=medium
 

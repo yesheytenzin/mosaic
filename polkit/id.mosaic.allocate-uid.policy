@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Mosaic</vendor>
+  <vendor_url>https://github.com/yesheytenzin/mosaic</vendor_url>
+
+  <!-- The only privileged operation Mosaic has: giving an installed app its
+       own system user and data directory (ADR-0007, ADR-0008). The broker
+       never runs as root; the install command asks for this. -->
+  <action id="id.mosaic.allocate-uid">
+    <description>Give an Android app its own system user</description>
+    <message>Authentication is required to give this app its own system user and data directory</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/mosaic</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">uid-helper</annotate>
+  </action>
+</policyconfig>
