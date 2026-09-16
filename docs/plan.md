@@ -195,8 +195,32 @@ comes from libc's property *write* path, and Mosaic implements property *reads*
 `persist.sys.timezone` — and then does `RuntimeInit.setDefaultApplicationWtfHandler`
 before `StartServices`. That is where it stops.
 
-So the order of remaining work is now: the property service socket first, then
-the binder framing below, which gates `StartServices` and everything after it.
+The property service is now implemented (`tools/bundle/android-property-service.py`),
+from bionic's own protocol: a 128-byte `prop_msg` on a SOCK_STREAM connection at
+`/dev/socket/property_service`, acknowledged by closing. Writes to properties the
+area defines are applied in place — the generator records where each value lives
+so the writer needs no trie walk — and a write to an undefined property is
+reported and dropped, because adding one means changing an area that running
+processes have mapped.
+
+With it, `SystemServer` gets further:
+
+```
+SystemServerTiming: InitBeforeStartServices
+SystemServer: persist.sys.timezone is not valid (UTC); setting to GMT.
+SystemServer: Entered the Android system server!
+SystemServerTiming: InitBeforeStartServices took to complete: 24ms
+```
+
+That middle line is the property service working: the server read the property,
+decided it was invalid, wrote a new one, and the write landed
+(`property-service: set persist.sys.timezone='GMT' -> applied`). It then stops
+before `StartServices` begins, without a Binder call and without an abort.
+
+So the next question is what it does between `InitBeforeStartServices` and
+`StartServices` — `RuntimeInit.setDefaultApplicationWtfHandler` is the only call
+there — and why it ends quietly rather than failing. Then the binder framing,
+which gates the services themselves.
 
 A measurement was taken with a missing launcher and looked like a stall for a
 reason that did not exist; `tools/build-native.sh` now builds every Bionic
