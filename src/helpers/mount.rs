@@ -286,7 +286,10 @@ pub fn mount_overlay(
         "overlay",
         destination,
         create_folders,
-        true,
+        // Do not umount the destination. The overlay's lowest lowerdir is the
+        // destination path itself, so unmounting first would point it at an
+        // empty directory. force=true stacks the overlay over the live mount.
+        false,
         readonly,
         Some("overlay"),
         Some(options),
