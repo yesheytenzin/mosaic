@@ -816,15 +816,19 @@ pub fn make_base_props(args: &MosaicArgs) -> anyhow::Result<()> {
     let preinstalled = crate::config::Defaults::new().preinstalled_images_paths;
     if !preinstalled.contains(&images_path) {
         if let Some(v) = cfg.mosaic.get("system_ota") {
-            props.push(format!("mosaic.system_ota={}", v));
+            props.push(format!("{}={}", crate::guest::PROP_SYSTEM_OTA, v));
         }
         if let Some(v) = cfg.mosaic.get("vendor_ota") {
-            props.push(format!("mosaic.vendor_ota={}", v));
+            props.push(format!("{}={}", crate::guest::PROP_VENDOR_OTA, v));
         }
     } else {
-        props.push("mosaic.updater.disabled=true".to_string());
+        props.push(format!("{}=true", crate::guest::PROP_UPDATER_DISABLED));
     }
-    props.push(format!("mosaic.tools_version={}", crate::config::VERSION));
+    props.push(format!(
+        "{}={}",
+        crate::guest::PROP_TOOLS_VERSION,
+        crate::config::VERSION
+    ));
 
     let vendor_type = cfg
         .mosaic
@@ -842,7 +846,7 @@ pub fn make_base_props(args: &MosaicArgs) -> anyhow::Result<()> {
     }
 
     std::fs::write(
-        format!("{}/mosaic_base.prop", args.work),
+        format!("{}/{}", args.work, crate::guest::BASE_PROP_FILE),
         props.join("\n") + "\n",
     )?;
     Ok(())

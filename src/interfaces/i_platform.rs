@@ -4,8 +4,8 @@ use crate::args::MosaicArgs;
 use crate::interfaces::gbinder::{Client, RemoteObject, ServiceManager};
 use std::time::Duration;
 
-const INTERFACE: &str = "mosaic.IPlatform";
-const SERVICE_NAME: &str = "mosaicplatform";
+const INTERFACE: &str = crate::guest::IFACE_PLATFORM;
+const SERVICE_NAME: &str = crate::guest::SVC_PLATFORM;
 
 const TRANSACTION_GETPROP: u32 = 1;
 const TRANSACTION_SETPROP: u32 = 2;

@@ -149,7 +149,7 @@ pub fn do_start(args: &MosaicArgs, session: &HashMap<String, String>) -> anyhow:
         Some(true),
     )?;
 
-    if which::which("mosaic-sensord").is_ok() {
+    if which::which(crate::guest::SENSORD_BIN).is_ok() {
         let binder = crate::config::load(&args.config)
             .mosaic
             .get("binder")
@@ -157,7 +157,10 @@ pub fn do_start(args: &MosaicArgs, session: &HashMap<String, String>) -> anyhow:
             .unwrap_or_else(|| "binder".to_string());
         crate::helpers::run::user(
             args,
-            &["mosaic-sensord".to_string(), format!("/dev/{}", binder)],
+            &[
+                crate::guest::SENSORD_BIN.to_string(),
+                format!("/dev/{}", binder),
+            ],
             "background",
             false,
             Some(false),
@@ -352,10 +355,10 @@ pub fn stop(
         }
     }
 
-    if which::which("mosaic-sensord").is_ok() {
+    if which::which(crate::guest::SENSORD_BIN).is_ok() {
         if let Ok(pid) = crate::helpers::run::user(
             args,
-            &["pidof".to_string(), "mosaic-sensord".to_string()],
+            &["pidof".to_string(), crate::guest::SENSORD_BIN.to_string()],
             "log",
             true,
             Some(false),

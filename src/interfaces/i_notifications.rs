@@ -3,7 +3,7 @@
 use crate::args::MosaicArgs;
 use crate::interfaces::gbinder::ServiceManager;
 
-const SERVICE_NAME: &str = "mosaicnotifications";
+const SERVICE_NAME: &str = crate::guest::SVC_NOTIFICATIONS;
 
 pub const ID_NONE: i32 = 0;
 

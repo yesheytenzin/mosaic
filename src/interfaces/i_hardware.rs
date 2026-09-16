@@ -3,7 +3,7 @@
 use crate::args::MosaicArgs;
 use crate::interfaces::gbinder::ServiceManager;
 
-const SERVICE_NAME: &str = "mosaichardware";
+const SERVICE_NAME: &str = crate::guest::SVC_HARDWARE;
 
 pub fn add_service<F1, F2, F3, F4, F5, F6>(
     args: &MosaicArgs,

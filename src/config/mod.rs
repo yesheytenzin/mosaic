@@ -65,10 +65,10 @@ impl Defaults {
             container_xdg_runtime_dir: "/run/xdg".to_string(),
             container_wayland_display: "wayland-0".to_string(),
             container_pulse_runtime_path: "/run/xdg/pulse".to_string(),
-            preinstalled_images_paths: vec![
-                "/etc/mosaic-extra/images".to_string(),
-                "/usr/share/mosaic-extra/images".to_string(),
-            ],
+            preinstalled_images_paths: crate::guest::EXTRA_IMAGES_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             work,
             arch: "arm64".to_string(),
             vendor_type: "MAINLINE".to_string(),
@@ -179,7 +179,7 @@ pub fn channels_defaults() -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     m.insert(
         "config_path".to_string(),
-        "/usr/share/mosaic-extra/channels.cfg".to_string(),
+        crate::guest::EXTRA_CHANNELS_CFG.to_string(),
     );
     m.insert(
         "system_channel".to_string(),

@@ -25,8 +25,8 @@ fn get_config(args: &mut MosaicArgs) {
 
 fn migration(args: &MosaicArgs) {
     let old_ver = crate::helpers::props::file_get(
-        &format!("{}/mosaic_base.prop", args.work),
-        "mosaic.tools_version",
+        &format!("{}/{}", args.work, crate::guest::BASE_PROP_FILE),
+        crate::guest::PROP_TOOLS_VERSION,
     )
     .unwrap_or_default();
     if crate::helpers::version::versiontuple(&old_ver)
@@ -39,8 +39,8 @@ fn migration(args: &MosaicArgs) {
             "images",
             "rootfs",
             "data",
-            "mosaic_base.prop",
-            "mosaic.prop",
+            crate::guest::BASE_PROP_FILE,
+            crate::guest::PROP_FILE,
             "mosaic.cfg",
         ];
         let mut cmd = vec!["chmod".to_string(), "-R".to_string(), "g-w,o-w".to_string()];

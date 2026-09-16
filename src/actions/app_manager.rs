@@ -26,14 +26,14 @@ pub async fn install(args: &MosaicArgs, package: &str) -> anyhow::Result<()> {
 
     let mosaic_data = SessionDefaults::new().mosaic_data;
     let mosaic_data = session.get("mosaic_data").cloned().unwrap_or(mosaic_data);
-    let tmp_dir = format!("{}/mosaic_tmp", mosaic_data);
+    let tmp_dir = format!("{}/{}", mosaic_data, crate::guest::TMP_DIR);
     std::fs::create_dir_all(&tmp_dir)?;
 
     let dest = format!("{}/base.apk", tmp_dir);
     std::fs::copy(package, &dest)?;
 
     if let Some(platform) = crate::interfaces::i_platform::get_service(args) {
-        platform.install_app("/data/mosaic_tmp/base.apk");
+        platform.install_app(crate::guest::GUEST_TMP_APK);
     } else {
         log::error!("Failed to access IPlatform service");
     }
@@ -91,10 +91,10 @@ pub async fn launch(args: &MosaicArgs, package: &str) -> anyhow::Result<()> {
     let args_clone = args.clone();
     maybe_launch_later(args, move || {
         if let Some(platform) = crate::interfaces::i_platform::get_service(&args_clone) {
-            platform.setprop("mosaic.active_apps", &package);
+            platform.setprop(crate::guest::PROP_ACTIVE_APPS, &package);
             platform.launch_app(&package);
             let multiwin = platform
-                .getprop("persist.mosaic.multi_windows", "false")
+                .getprop(crate::guest::PROP_MULTI_WINDOWS, "false")
                 .unwrap_or_else(|| "false".to_string());
             if multiwin == "false" {
                 platform.settings_put_string(2, "policy_control", "immersive.status=*");
@@ -143,7 +143,7 @@ pub async fn show_full_ui(args: &MosaicArgs) -> anyhow::Result<()> {
     let args_clone = args.clone();
     maybe_launch_later(args, move || {
         if let Some(platform) = crate::interfaces::i_platform::get_service(&args_clone) {
-            platform.setprop("mosaic.active_apps", "Mosaic");
+            platform.setprop(crate::guest::PROP_ACTIVE_APPS, "Mosaic");
             platform.settings_put_string(2, "policy_control", "null*");
             if let Some(status_bar) = crate::interfaces::i_status_bar::get_service(&args_clone) {
                 status_bar.expand();
@@ -173,9 +173,9 @@ pub async fn intent(args: &MosaicArgs, action: &str, uri: &str) -> anyhow::Resul
                 } else {
                     ret
                 };
-                platform.setprop("mosaic.active_apps", &pkg);
+                platform.setprop(crate::guest::PROP_ACTIVE_APPS, &pkg);
                 let multiwin = platform
-                    .getprop("persist.mosaic.multi_windows", "false")
+                    .getprop(crate::guest::PROP_MULTI_WINDOWS, "false")
                     .unwrap_or_else(|| "false".to_string());
                 if multiwin == "false" {
                     platform.settings_put_string(2, "policy_control", "immersive.status=*");

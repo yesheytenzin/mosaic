@@ -3,7 +3,7 @@
 use crate::args::MosaicArgs;
 use crate::interfaces::gbinder::ServiceManager;
 
-const SERVICE_NAME: &str = "mosaicusermonitor";
+const SERVICE_NAME: &str = crate::guest::SVC_USER_MONITOR;
 
 pub const PACKAGE_ADDED: i32 = 1;
 pub const PACKAGE_REMOVED: i32 = 2;
