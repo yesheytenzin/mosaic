@@ -43,6 +43,8 @@ extern long write(int, const void *, unsigned long);
 #define TRANSACTION_GET_SERVICE 1
 #define TRANSACTION_CHECK_SERVICE 2
 #define TRANSACTION_ADD_SERVICE 3
+#define TRANSACTION_LIST_SERVICES 4
+#define TRANSACTION_IS_DECLARED 5
 
 /* From binder.h. */
 #define BINDER_TYPE_BINDER 0x73 /* 's' */
@@ -268,10 +270,24 @@ int _ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j(
         return 0;
     }
 
-    /* Anything else fails in Java rather than waiting for a reply that will not
-     * come. */
-    say("android-binder: unanswered code ");
+    /* Every other IServiceManager call gets a valid, empty answer instead of an
+     * error. The framework asks whether hardware it does not have is declared
+     * (isDeclared), lists services it will not find, and asks about modules it
+     * does not have; none of those is a failure, and answering with an error made
+     * PowerStatsService throw a SecurityException out of onStart. An absent thing
+     * should look absent.
+     *
+     * The replies are per the AIDL: a String[] is a count followed by the
+     * strings, a boolean is an int32, and a void call needs only the exception
+     * code. */
+    if (parcel_write_int32) parcel_write_int32(reply, 0);
+    if (code == TRANSACTION_LIST_SERVICES && parcel_write_int32) {
+        parcel_write_int32(reply, 0); /* an empty array */
+    } else if (code == TRANSACTION_IS_DECLARED && parcel_write_int32) {
+        parcel_write_int32(reply, 0); /* false: nothing is declared */
+    }
+    say("android-binder: answered code ");
     say_dec((long)code);
-    say("\n");
-    return -1;
+    say(" with an empty reply\n");
+    return 0;
 }

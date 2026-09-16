@@ -35,13 +35,25 @@ registrars resolve; the shim presents Android's absolute paths.
 7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
    `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
    (empty, and says so) because `SystemConfig` treats its absence as fatal.
-8. **Property service growth** — mostly done. The trie has a catch-all prefix, so
-   a name created at runtime resolves without rewriting a file that running
-   processes have mapped, and the service appends to the area and records it in
-   the index. Writes to new properties are accepted. One `native_set` still
-   fails, and the service never sees the write, so libc is rejecting it before
-   the socket: the next step is to log the name and value at the failure and find
-   which check it fails.
+8. **Property service growth** ✅ — the trie has a catch-all prefix, and the write
+   path is implemented in the shim, which both logs every write and carries the
+   ones the wire format can hold. The property that failed was
+   `cache_key.is_compat_change_enabled`, 34 characters against a 32-character
+   limit in libc's old-protocol check: it is accepted and not stored, which is
+   what unblocked service startup.
+
+### Where the system server is now
+
+`startBootstrapServices` starts `StartFileIntegrityService`, `StartInstaller`,
+`StartIStatsService`, `StartPowerStatsService`, `DeviceIdentifiersPolicyService`
+and `UriGrantsManagerService`. The next wall is HAL registration: the framework
+registers its HAL implementations with `hwservicemanager` (HIDL, over
+`/dev/hwbinder`) and with `servicemanager` (AIDL), and neither answers --
+`defaultServiceManager() is null` for HIDL, and the registrations fail with -38
+and -129, after which statsd aborts the process.
+
+So the next work is a second device: `/dev/hwbinder` needs its own service
+manager in the shim, the way `/dev/binder` already has one.
 
 ## B. `system_server` to completion
 
