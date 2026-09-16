@@ -137,45 +137,43 @@ own process serving a call from a second one.
       redirected
 - [x] A test that the two limits agree, so a drift cannot silently reintroduce the
       failure
-- [ ] Verify without the harness stand-ins. **Root only, and it cannot be worked
-      around**: the hard `RLIMIT_NICE` is 0 on a desktop session, a process cannot
-      raise its own hard limit, and a user namespace does not help --
+- [x] Verify without the harness stand-ins. **Verified.** With `LimitNICE=40`
+      granted for one run -- `sudo tools/verify-priority-limit.sh <bundle>`, which
+      raises it and hands the process to the invoking user with `setpriv` -- and
+      `pretend-nice.so` left out of the preload list:
 
       ```
-      $ unshare -r -- sh -c 'ulimit -e 40'
-      sh: ulimit: scheduling priority: cannot modify limit: Operation not permitted
+      5. the framework, without pretend-nice.so (limit raised for this run)
+        ok    reached StartActivityManager with no priority stand-ins
       ```
 
-      What *is* established, by running it: without the stand-ins the framework
-      stops at `InitBeforeStartServices` with a `SecurityException` from
-      `setThreadPriority`, and with them it reaches `StartActivityManager`. So the
-      stand-ins are load-bearing exactly because the limit is missing, and the
-      limit is what systemd sets.
+      The same run without the limit, and without the stand-ins, stops at
+      `InitBeforeStartServices` with `SecurityException` from `setThreadPriority`.
+      So the limit is what the stand-ins were standing in for.
 
-      `make verify-priority` (or `sudo tools/verify-priority-limit.sh <bundle>`)
-      is the check: it reads the drop-in, asks the user manager what this session's
-      limit is, has a child of the broker lower its niceness -- which is what every
-      `androidSetThreadPriority` call amounts to -- and, given a bundle, runs the
-      framework with `pretend-nice.so` left out and checks that SystemServer still
-      reaches `StartActivityManager`. When it passes, `pretend-nice.c` can be
-      deleted.
+      Two things learned on the way, both worth keeping:
 
-      One thing that check had to learn: the stand-ins were doing two unrelated
-      jobs. The first run with the whole file removed stopped at
+      - The stand-ins were doing **two unrelated jobs**, and the first run with the
+        whole file removed failed for the *other* one:
 
-      ```
-      java.lang.SecurityException: No permission to modify given thread 27270
-        at android.os.Process.setThreadGroup(Native Method)
-        at com.android.server.UiThread.run(UiThread.java:44)
-      ```
+        ```
+        java.lang.SecurityException: No permission to modify given thread 27270
+          at android.os.Process.setThreadGroup(Native Method)
+          at com.android.server.UiThread.run(UiThread.java:44)
+        ```
 
-      which is the *cgroup* path, not the priority one -- `TaskProfiles::SetTaskProfiles`
-      and `set_sched_policy` want cgroups a desktop has not got, however high the
-      limit is. Those have moved to `pretend-cgroups.c`, which stays, because that
-      is not a crutch for the limit but the cgroup model's absence. `pretend-nice.c`
-      is the crutch, and it is what the gate is about.
+        That is `set_sched_policy` and `TaskProfiles::SetTaskProfiles` wanting
+        cgroups a desktop has not got, however high the limit is. They moved to
+        `pretend-cgroups.c`, which stays: a host without cgroups needs it whatever
+        the limit is, and mapping Android's scheduling groups onto one is work the
+        product still owes.
+      - `RLIMIT_NICE` cannot be raised from a user namespace, so the session-wide
+        half of this needs the package installed and a new session -- which is what
+        checks 1-4 of the same script are for.
 
-*Gate:* `Process.setThreadPriority` works without the harness stand-ins.
+      `pretend-nice.c` stays in the tree for harness runs on a machine whose
+      session has no limit. The product does not need it, which is the point.
+
 
 ## A7. Path breadth ✅
 
