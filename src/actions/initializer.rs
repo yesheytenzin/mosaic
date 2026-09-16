@@ -433,13 +433,10 @@ pub fn init_sync(
 
 /// Attach to the running Initializer service and stream its progress to
 /// stdout, replacing the GTK dialog the original used.
-pub fn remote_init_client(args: &MosaicArgs) -> anyhow::Result<()> {
+pub async fn remote_init_client(args: &MosaicArgs) -> anyhow::Result<()> {
     use crate::helpers::ipc::InitializerProxy;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
+    {
         let connection = zbus::Connection::system().await?;
         let proxy = InitializerProxy::new(&connection).await?;
 
@@ -486,6 +483,6 @@ pub fn remote_init_client(args: &MosaicArgs) -> anyhow::Result<()> {
                 else => break,
             }
         }
-        Ok::<(), anyhow::Error>(())
-    })
+        Ok(())
+    }
 }

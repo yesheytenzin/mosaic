@@ -87,7 +87,7 @@ async fn run() -> i32 {
         }
         Action::Init(init_args) => {
             if init_args.client {
-                mosaic_lib::actions::initializer::remote_init_client(&args)
+                mosaic_lib::actions::initializer::remote_init_client(&args).await
             } else {
                 if nix::unistd::getuid().as_raw() != 0 {
                     eprintln!("ERROR: Action \"init\" needs root access");
@@ -207,7 +207,7 @@ async fn run() -> i32 {
         Action::ShowFullUi => mosaic_lib::actions::app_manager::show_full_ui(&args).await,
         Action::FirstLaunch => {
             if !mosaic_lib::actions::initializer::is_initialized(&args) {
-                let _ = mosaic_lib::actions::initializer::remote_init_client(&args);
+                let _ = mosaic_lib::actions::initializer::remote_init_client(&args).await;
             }
             if mosaic_lib::actions::initializer::is_initialized(&args) {
                 mosaic_lib::actions::app_manager::show_full_ui(&args).await
