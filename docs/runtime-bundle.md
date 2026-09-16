@@ -192,9 +192,11 @@ aborts the framework's static initialisation, and that is only visible in a log.
 ## A real app's bytecode
 
 The strongest test the runtime alone can pass is compiling a real app. Termux
-0.118.3 from F-Droid, a 3.1 MB `classes.dex`:
+0.118.3 from F-Droid (`https://f-droid.org/repo/com.termux_1002.apk`, 113 MB with
+a 3.1 MB `classes.dex` and per-ABI native libraries):
 
 ```
+tools/bundle/bundle.sh stage  <image> <bundle> <dex2oat64-inode> dex2oat64
 tools/bundle/bundle.sh compile <bundle> termux.apk speed
 compiling 1 dex file(s) from termux.apk with filter speed
 produced 9006688 bytes of compiled output at .../termux.oat
@@ -213,12 +215,17 @@ OAT FILE STATS:
   0x6e98: ArtMethod: void com.termux.app.TermuxActivity.reloadActivityStyling()
 ```
 
-14,225 compiled methods, 12,029 of them under `com.termux`. This runs without
-root, without a namespace, and without the property area: `dex2oat` takes explicit
-paths and needs none of them. One caveat worth knowing, learned the hard way: ART
-commits what `-Xmx` asks for, so a 1 GB heap fails the compiler's arena mapping on
-a busy host with `Failed anonymous mmap(...): Out of memory` while 8 GB is free.
-256 MB is plenty.
+14,225 compiled methods, 12,029 of them under `com.termux`. `dexlist` from the
+same image lists 17,644 methods from the same DEX, which is what loading an app
+looks like before anything runs. This needs no root, no namespace, and no
+property area: `dex2oat` takes explicit paths and needs none of them. One caveat
+worth knowing, learned the hard way: ART commits what `-Xmx` asks for, so a 1 GB
+heap fails the compiler's arena mapping on a busy host with
+`Failed anonymous mmap(...): Out of memory` while 8 GB is free. 256 MB is plenty.
+
+Termux has no `main` entry point, so there is no way to drive one of its classes
+without a launcher DEX of our own, and the classes that would show something are
+framework classes anyway.
 
 **Running Termux itself is a different matter**, and it is not close. `TermuxActivity`
 needs `ActivityManager`, an activity lifecycle, input, and a surface; Termux then
