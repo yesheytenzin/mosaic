@@ -98,6 +98,16 @@ hand, rather than reading more bytes at the receiving end.
 A segfault was caused along the way by following a pointer without checking it was
 mapped, so the safety check is worth keeping in whatever diagnostic comes next.
 
+A third attempt tried the reply itself, guessing that the stream begins four bytes
+in (the word there parses as a transaction to handle 0 with a plausible code). It
+does not: after skipping four bytes only 64 remain, and a transaction needs 68, so
+the loop broke before finding one, no reply was written, and libbinder retried
+until the run was killed -- having written a 5.5 GB log first. Two things follow.
+The offset theory is dead: a 68-byte stream cannot both start at 4 and contain a
+command plus a transaction. And the harness now caps output as well as time
+(`MOSAIC_MAX_OUTPUT`), because that was the second five-gigabyte log this project
+has produced and the first fix only bounded the clock.
+
 ## Where it stands
 
 The shim answers the version, threads, spam-detection and mapping calls, so

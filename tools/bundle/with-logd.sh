@@ -87,10 +87,13 @@ exec unshare -rm --propagation private bash -c '
   done
 
   shift 2
-  # A process that spins on a malformed driver reply fills a disk with log
-  # output, so runs are bounded and their output is capped.
-  timeout "${MOSAIC_TIMEOUT:-120}" "$@"
-  status=$?
+  # A process that spins on a malformed driver reply fills a disk with log output.
+  # That has happened twice, at five gigabytes each time, on a tmpfs. Both the
+  # runtime and the output are bounded; the first byte preserving the exit status
+  # is the command, not the cap.
+  timeout "${MOSAIC_TIMEOUT:-120}" "$@" 2>&1 | head -c "${MOSAIC_MAX_OUTPUT:-2000000}"
+  status=${PIPESTATUS[0]}
+  if [ "$status" -eq 124 ]; then :; fi
   if [ $status -eq 124 ]; then
     echo "with-logd: timed out after ${MOSAIC_TIMEOUT:-120}s" >&2
   fi
