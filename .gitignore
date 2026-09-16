@@ -36,3 +36,7 @@ __pycache__/
 
 # Built binder shim objects
 tools/binder-shim/out/
+
+# Generated launcher artifacts
+tools/launcher/out/
+tools/launcher/registrars.inc
