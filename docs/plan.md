@@ -217,10 +217,26 @@ decided it was invalid, wrote a new one, and the write landed
 (`property-service: set persist.sys.timezone='GMT' -> applied`). It then stops
 before `StartServices` begins, without a Binder call and without an abort.
 
-So the next question is what it does between `InitBeforeStartServices` and
-`StartServices` — `RuntimeInit.setDefaultApplicationWtfHandler` is the only call
-there — and why it ends quietly rather than failing. Then the binder framing,
-which gates the services themselves.
+It then ended quietly, which turned out to be the launcher's fault: if `main`
+throws, the exception is pending on the native frame the launcher created, and
+the launcher exited without looking at it — so the only description of the
+failure was thrown away. It now checks and describes, and the real error is:
+
+```
+java.lang.NoClassDefFoundError: Class not found using the boot class loader; no
+stack trace available
+```
+
+That is the same wall `app_process` hit, now with a name. `-verbose:class` shows
+SystemServer loading **187 `com/android/server/*` classes** — `BatteryService`,
+`BinderCallsStatsService`, and so on — so it is well into service startup, and the
+last classes loaded are `libcore.util.ArrayUtils` and `java.nio.NIOAccess`. The
+missing class is resolved by the boot class loader, which means something on the
+boot classpath wants a class that is not on it.
+
+So the order is: find that class (and the jar it lives in, most likely
+`services.jar`, which is on the class path and not the boot class path), then the
+binder framing, which gates the services themselves.
 
 A measurement was taken with a missing launcher and looked like a stall for a
 reason that did not exist; `tools/build-native.sh` now builds every Bionic
