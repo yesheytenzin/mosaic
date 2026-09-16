@@ -55,6 +55,21 @@ and -129, after which statsd aborts the process.
 So the next work is a second device: `/dev/hwbinder` needs its own service
 manager in the shim, the way `/dev/binder` already has one.
 
+Two things were learned trying to get there, both worth keeping:
+
+- `name_is_binder` in the shim compared the last path segment to `binder`
+  exactly, so `/dev/hwbinder` and `/dev/vndbinder` were not recognised and their
+  `ProcessState` never opened. It matches the family now.
+- The service manager's handle is **12**, not 0, in this build: every
+  IServiceManager call arrives with handle 12. That is why the shim answers by
+  code rather than by handle, and it is what the handle will mean once there is a
+  second binder to tell apart.
+
+Interposing `IPCThreadState::transact` was added for the AIDL path, which
+`BpBinder::transact` does not cover, and it is the better hook anyway because the
+handle is an argument. The AIDL HAL registration nonetheless reaches neither:
+`libbinder_ndk` has an entry point of its own, and finding it is the next step.
+
 ## B. `system_server` to completion
 
 9. Every service after `PackageManagerService`: AMS, WMS, ATMS, `StorageManager`,
