@@ -65,10 +65,30 @@ Two things were learned trying to get there, both worth keeping:
   code rather than by handle, and it is what the handle will mean once there is a
   second binder to tell apart.
 
-Interposing `IPCThreadState::transact` was added for the AIDL path, which
-`BpBinder::transact` does not cover, and it is the better hook anyway because the
-handle is an argument. The AIDL HAL registration nonetheless reaches neither:
-`libbinder_ndk` has an entry point of its own, and finding it is the next step.
+### What can and cannot be interposed
+
+The AIDL path resolved this, and the rule is worth stating once:
+
+**Android builds with `-fno-semantic-interposition`.** A C++ method that libbinder
+calls *inside itself* binds locally and a preload never sees it -- which is why the
+AIDL proxy's `transact` never reached the interposed method, while the framework's
+Java binder calls did, those coming from `libandroid_runtime`, a different library.
+A plain C function that libbinder_ndk exports *for other libraries* is reachable,
+which is what `AServiceManager_addService` is.
+
+Interposing that pair -- registration acknowledged, lookup answering null -- let the
+framework past the HAL registration abort, and `startBootstrapServices` now starts
+`StartActivityManager`, `StartPowerManager`, `StartThermalManager`,
+`StartIncrementalService` and the rest.
+
+### The wall after it, which is A5
+
+`KernelWakelockReader.waitForSuspendControlService` gets a null service and
+dereferences it. The suspend control HAL is a *native daemon* on a device, and
+there is no way to answer for it in-process: the framework now needs genuinely
+remote services, which is exactly what the broker and its transport provide. A3,
+A4 and A5 stop being deferred at this point -- they are the next thing, not a
+later one.
 
 ## B. `system_server` to completion
 

@@ -219,6 +219,40 @@ int _ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j(
     return handle_transaction(bp_handle(self), code, data, reply, flags);
 }
 
+/* The NDK's registration entry points.
+ *
+ * libbinder_ndk defines these as plain C functions and other libraries call them,
+ * which matters: a preload cannot interpose a C++ method that libbinder calls
+ * inside itself, because Android builds with -fno-semantic-interposition and those
+ * calls bind locally. That is why the AIDL proxy's transact never reached the
+ * interposed method while the framework's Java binder calls did -- those come from
+ * libandroid_runtime, a different library.
+ *
+ * Registering is acknowledged; looking up answers nothing, which is the truth
+ * while the only registered things are in this process. */
+static int logged_registrations = 0;
+
+int AServiceManager_addService(void *binder, const char *instance) {
+    (void)binder;
+    if (logged_registrations < 40) {
+        logged_registrations++;
+        say("android-binder: AIDL register ");
+        say(instance ? instance : "(null)");
+        say("\n");
+    }
+    return 0; /* STATUS_OK */
+}
+
+void *AServiceManager_getService(const char *instance) {
+    if (logged_registrations < 40) {
+        logged_registrations++;
+        say("android-binder: AIDL lookup ");
+        say(instance ? instance : "(null)");
+        say("\n");
+    }
+    return 0; /* not found, as an absent service should be */
+}
+
 static int handle_transaction(int handle, uint32 code, const void *data, void *reply, uint32 flags) {
     resolve();
 
