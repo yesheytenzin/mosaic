@@ -116,8 +116,26 @@ own process serving a call from a second one.
       redirected
 - [x] A test that the two limits agree, so a drift cannot silently reintroduce the
       failure
-- [ ] Verify without the harness stand-ins. Needs root: `RLIMIT_NICE` cannot be
-      raised from a user namespace, so this host cannot check it.
+- [ ] Verify without the harness stand-ins. **Root only, and it cannot be worked
+      around**: the hard `RLIMIT_NICE` is 0 on a desktop session, a process cannot
+      raise its own hard limit, and a user namespace does not help --
+
+      ```
+      $ unshare -r -- sh -c 'ulimit -e 40'
+      sh: ulimit: scheduling priority: cannot modify limit: Operation not permitted
+      ```
+
+      What *is* established, by running it: without the stand-ins the framework
+      stops at `InitBeforeStartServices` with a `SecurityException` from
+      `setThreadPriority`, and with them it reaches `StartActivityManager`. So the
+      stand-ins are load-bearing exactly because the limit is missing, and the
+      limit is what systemd sets.
+
+      `make verify-priority` (or `sudo tools/verify-priority-limit.sh`) is the
+      check: it reads the drop-in, asks the user manager what this session's limit
+      is, and has a child of the broker lower its niceness, which is what every
+      `androidSetThreadPriority` call amounts to. When it passes, `pretend-nice.c`
+      can be deleted.
 
 *Gate:* `Process.setThreadPriority` works without the harness stand-ins.
 

@@ -68,6 +68,11 @@ install:
 	install -Dm644 packaging/arch/user@.service.d/mosaic.conf $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	install -Dm644 packaging/arch/mosaic.tmpfiles $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
+# A6's gate is a system setting, so checking it needs root. This is the one
+# command that does it, and it says exactly what is missing when it is not.
+verify-priority:
+	sudo tools/verify-priority-limit.sh
+
 uninstall:
 	rm -f $(INSTALL_BIN_DIR)/mosaic
 	rm -f $(INSTALL_ICONS_DIR)/hicolor/512x512/apps/mosaic.png
@@ -82,4 +87,4 @@ uninstall:
 	rm -f $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	rm -f $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
-.PHONY: build check install uninstall
+.PHONY: build check install uninstall verify-priority
