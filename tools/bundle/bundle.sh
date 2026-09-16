@@ -7,6 +7,7 @@
 #   bundle.sh closure <image> <bundle>     # fill in every missing dependency
 #   bundle.sh stage   <image> <bundle> <inode> <name> [args...]
 #   bundle.sh run     <bundle> <binary> [args...]
+#   bundle.sh compile <bundle> <apk> [filter]   # dex2oat an app's bytecode
 #
 # `build` is the one that matters: it produces the artifact ADR-0010 describes,
 # and it is the input to every later phase. The other subcommands are the
@@ -478,6 +479,70 @@ do_properties() { # <image> <bundle>
   echo "  + properties/ ($(ls "$out/properties" | tr '\n' ' '))"
 }
 
+# Compile an installed app's bytecode with the bundle's ART. This is the closest
+# thing to running a real app that the runtime alone can do: dex2oat loads the
+# app's DEX, verifies it against the boot classpath, and with the optimizing
+# compiler emits machine code for it. Running the app itself needs the framework
+# services, which is a later phase.
+do_compile() { # <bundle> <apk> [compiler-filter]
+  local out="$1" apk="$2" filter="${3:-speed}"
+  if [ ! -f "$apk" ]; then
+    echo "no such apk: $apk" >&2
+    return 1
+  fi
+  if [ ! -x "$out/bin/dex2oat64" ]; then
+    echo "the bundle has no bin/dex2oat64; stage it first (bundle.sh stage ... dex2oat64)" >&2
+    return 1
+  fi
+  [ -f "$out/env.sh" ] || do_env "$out"
+
+  local work
+  work=$(mktemp -d "${TMPDIR:-/tmp}/mosaic-compile.XXXXXX")
+  if ! unzip -o -q "$apk" 'classes*.dex' -d "$work"; then
+    echo "could not extract dex from $apk" >&2
+    return 1
+  fi
+  local dex_count
+  dex_count=$(ls "$work"/classes*.dex 2>/dev/null | wc -l)
+  if [ "$dex_count" -eq 0 ]; then
+    echo "no classes.dex in $apk" >&2
+    return 1
+  fi
+
+  local name oat
+  name=$(basename "${apk%.apk}")
+  oat="$work/$name.oat"
+
+  local bootclasspath
+  bootclasspath=$(cat "$out/bootclasspath.txt")
+
+  echo "compiling $dex_count dex file(s) from $(basename "$apk") with filter $filter"
+  # shellcheck disable=SC1091
+  (
+    . "$out/env.sh"
+    mkdir -p "$out/data/dalvik-cache" "$out/tmp"
+    # One -Xmx that fits: ART commits what this asks for, so a large heap fails
+    # the compiler's arena mapping on a busy host.
+    "$out/bin/dex2oat64" \
+      --dex-file="$work/classes.dex" \
+      --dex-location="/data/app/$name/base.apk" \
+      --oat-file="$oat" \
+      --instruction-set=x86_64 \
+      --compiler-filter="$filter" \
+      --runtime-arg "-Xbootclasspath:$bootclasspath" \
+      --runtime-arg -Xms16m --runtime-arg -Xmx256m
+  )
+  local status=$?
+
+  if [ $status -ne 0 ] || [ ! -s "$oat" ]; then
+    echo "dex2oat failed (status $status)" >&2
+    return 1
+  fi
+  echo "produced $(stat -c %s "$oat") bytes of compiled output at $oat"
+  echo "  vdex: $(ls "$work"/*.vdex 2>/dev/null | head -1)"
+  return 0
+}
+
 do_run() { # <bundle> <binary> [args...]
   local out="$1" name="$2"
   shift 2
@@ -503,6 +568,7 @@ case "$cmd" in
   stage)   do_stage "${2:?image}" "${3:?bundle}" "${4:?inode}" "${5:?name}" "${@:6}" ;;
   jars)    do_jars "${2:?image}" "${3:?bundle}" ;;
   build)   do_build "${2:?image}" "${3:?bundle}" ;;
+  compile) do_compile "${2:?bundle}" "${3:?apk}" "${4:-speed}" ;;
   env)     write_linker_config "${2:?bundle}"; do_env "${2:?bundle}" ;;
   run)     do_run "${2:?bundle}" "${3:?binary}" "${@:4}" ;;
   *)       sed -n '2,8p' "$0"; exit 2 ;;
