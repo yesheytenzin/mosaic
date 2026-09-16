@@ -44,10 +44,12 @@ registrars resolve; the shim presents Android's absolute paths.
 6. **One privileged step (ADR-0013)** ✅ except the gate — `LimitNICE` on the
    broker's unit *and* the system-side grant to the user manager, without which
    the unit's line is silently a no-op, plus a `tmpfiles.d` entry for the one path
-   Bionic compiles in. A test keeps the two limits from drifting. *Gate:* not
-   verifiable here -- `RLIMIT_NICE` is 0, a process cannot raise its own hard
-   limit, and a user namespace does not help. `make verify-priority` is the check
-   for whoever has root, and what it establishes is in `docs/todo-a.md`.
+   Bionic compiles in. A test keeps the two limits from drifting. *Gate:* **verified** -- with the limit raised for one run and the priority
+   stand-ins left out, SystemServer still reaches `StartActivityManager`; without
+   the limit and without them it stops at `InitBeforeStartServices` with a
+   `SecurityException`. What remains is installing the package and starting a new
+   session, which `make verify-priority` checks; the reasoning is in
+   `docs/todo-a.md`.
 7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
    `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
    (empty, and says so) because `SystemConfig` treats its absence as fatal.

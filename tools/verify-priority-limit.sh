@@ -57,6 +57,7 @@ if [ -z "$user" ]; then
 fi
 
 fail=0
+mechanism_ok=0
 
 say() { printf '%s\n' "$*"; }
 ok() { printf '  ok    %s\n' "$*"; }
@@ -174,6 +175,7 @@ if [ -n "$bundle" ]; then
     reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1 || true)
     refused=$(grep -ac 'SecurityException' "$log" || true)
     if [ -n "$reached" ]; then
+      mechanism_ok=1
       ok "reached StartActivityManager with no priority stand-ins"
       say "        pretend-nice.c can be deleted; remove it from MOSAIC_PRELOAD"
       say "        (log: $log)"
@@ -193,17 +195,29 @@ if [ -n "$bundle" ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-  say "the limit is in place. The priority stand-ins in tools/binder-shim/pretend-nice.c"
-  say "can go: rerun the framework with pretend-nice.so removed from MOSAIC_PRELOAD and"
-  say "check that SystemServer still reaches StartActivityManager."
+  say "everything is in place: the session's limit, and the framework running"
+  say "without the priority stand-ins."
   exit 0
 fi
 
-say "something above is not in place."
 say ""
-say "With a bundle as an argument, checks 1-3 are about the session's own limit and"
-say "need the package installed and a new session; check 4 and 5 are about the"
-say "mechanism and are what root can prove right now. The stand-ins are load-bearing"
-say "exactly as long as the limit is missing: without them the run stops at"
-say "InitBeforeStartServices with a SecurityException from setThreadPriority."
+if [ "$mechanism_ok" -eq 1 ]; then
+  say "The mechanism is verified: with the limit granted for one run, the framework"
+  say "reaches StartActivityManager with pretend-nice.so left out. That is what A6's"
+  say "gate asks, and what is left above are the *session-wide* settings -- the"
+  say "package is not installed on this machine, so a session still starts with"
+  say "LimitNICE=0."
+  say ""
+  say "  1. sudo make install"
+  say "  2. log out and back in   (the drop-in must exist when the manager starts)"
+  say "  3. make verify-priority"
+  say ""
+  say "pretend-nice.c stays in the tree meanwhile: a harness run on a machine whose"
+  say "session has no limit still wants it. The product does not, which is the point."
+else
+  say "The mechanism is not verified yet, and checks 1-3 need the package and a new"
+  say "session. The stand-ins are load-bearing exactly as long as the limit is"
+  say "missing: without them the run stops at InitBeforeStartServices with a"
+  say "SecurityException from setThreadPriority."
+fi
 exit 1
