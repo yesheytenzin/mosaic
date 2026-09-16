@@ -629,43 +629,120 @@ static int service_name_of(const unsigned char *data, ulong size, char *out, int
  * destructor, so the Itanium ABI returns it through a hidden first pointer:
  * calling it as though it returned a pointer in rax is what made the first
  * attempt at this crash. */
-static void *object_at(void *parcel, const unsigned char *data, const unsigned char *after_name) {
-    if (!parcel || !parcel_set_position || !parcel_read_strong) return 0;
+static int parcel_read_strong_works = 0;
 
-    /* Where the object sits depends on which side wrote the request, and the
-     * object table's entries may be its start or its end. Rather than decide,
-     * try each position the formats allow and take the first that reads as an
-     * object -- a wrong one yields nothing rather than something wrong, because
-     * readStrongBinder validates against the table before it trusts the bytes.
+/* Where the object is, found rather than computed.
+ *
+ * Three attempts to work the position out from the name's length were wrong for
+ * the even-length names -- the padding between a string16 and the object that
+ * follows it is not the same in every request, and the object table's offsets do
+ * not agree with any single prefix length either. So the object is found by its
+ * own type word instead: a binder object starts with BINDER_TYPE_BINDER or
+ * BINDER_TYPE_HANDLE over 24 bytes, which is a thing to search for.
+ *
+ * The bytes are a request from this process's own service manager call, and the
+ * first object in it is the service being registered, so the first match is the
+ * one. A match that is not an object would need the type word to appear by
+ * accident in the arguments, which is what the type check in the parse below is
+ * for: get it wrong and nothing is registered, rather than something wrong.
+ */
+static const unsigned char *find_object(const unsigned char *data, ulong size, const unsigned char *from) {
+    if (!data) return 0;
+    const unsigned char *end = data + size;
+    const unsigned char *p = from ? from : data;
+    for (; p + 24 <= end; p += 4) {
+        uint32 type = u32_at(p);
+        if (type != BINDER_TYPE_BINDER && type != BINDER_TYPE_HANDLE) continue;
+        /* A type word alone is not enough: the arguments can contain it by
+         * accident, and one that did was handed back as a service and took the
+         * framework down inside flatten_binder. The rest of an object has to look
+         * like one too -- flags that are binder flags, a cookie, and for a local
+         * object the weak reference table alongside it. */
+        if (u32_at(p + 4) > 0x1ff) continue;      /* FLAT_BINDER_FLAG_* fit here */
+        ulong cookie = 0;
+        for (int i = 0; i < 8; i++) cookie |= ((ulong)p[16 + i]) << (8 * i);
+        if (!cookie) continue;
+        if (type == BINDER_TYPE_BINDER) {
+            ulong weakrefs = 0;
+            for (int i = 0; i < 8; i++) weakrefs |= ((ulong)p[8 + i]) << (8 * i);
+            if (!weakrefs) continue;
+        }
+        return p;
+    }
+    return 0;
+}
+
+/* Take the object argument, by libbinder's reader where that works and by the
+ * type word where it does not.
+ *
+ * readStrongBinder is preferred because it takes a reference, and the registry
+ * then owns the service from registration on. It returns nothing for the Java
+ * requests this exists for, so the fallback reads the object directly: type at 0,
+ * cookie at 16, the layout Parcel::unflattenBinder's own code uses. The fallback
+ * holds no reference, which is a thing to fix here; the framework's own services
+ * live as long as the process, so it is the AIDL half that matters for it.
+ */
+static void *object_at(void *parcel, const unsigned char *data, ulong size, const unsigned char *after_name) {
+    /* The reader first, at the positions the two formats allow. */
+    if (parcel && parcel_set_position && parcel_read_strong && parcel_read_strong_works) {
+        ulong candidates[3];
+        int count = 0;
+        if (after_name) candidates[count++] = (ulong)(after_name - data);
+        if (parcel_ipc_objects && parcel_ipc_objects_count) {
+            const unsigned long *offsets = parcel_ipc_objects(parcel);
+            ulong objects_count = parcel_ipc_objects_count(parcel);
+            if (offsets && objects_count > 0) {
+                if (offsets[0] >= 24) candidates[count++] = offsets[0] - 24;
+                candidates[count++] = offsets[0];
+            }
+        }
+        ulong saved = parcel_data_position ? parcel_data_position(parcel) : 0;
+        for (int i = 0; i < count; i++) {
+            if (parcel_set_position(parcel, candidates[i]) != 0) continue;
+            /* The sp lands here and is deliberately not destroyed: its reference
+             * is the registry's. */
+            unsigned long held[2] = {0, 0};
+            parcel_read_strong(held, parcel);
+            if (held[0]) {
+                parcel_set_position(parcel, saved);
+                return (void *)held[0];
+            }
+        }
+        parcel_set_position(parcel, saved);
+    }
+
+    /* Then the type word -- but only to report what is there, not to register it.
      *
-     * The Java side is the one that matters here: every service the framework
-     * registers goes through ServiceManager.addService, and all of those were
-     * coming out empty before this tried more than one position. */
-    ulong candidates[3];
-    int count = 0;
-    if (after_name) candidates[count++] = (ulong)(after_name - data);
-    if (parcel_ipc_objects && parcel_ipc_objects_count) {
-        const unsigned long *offsets = parcel_ipc_objects(parcel);
-        ulong objects_count = parcel_ipc_objects_count(parcel);
-        if (offsets && objects_count > 0) {
-            candidates[count++] = offsets[0] >= 24 ? offsets[0] - 24 : 0;
-            candidates[count++] = offsets[0];
+     * Storing what the search finds makes the framework *crash* rather than
+     * simply not find the service: the object at the position the name's length
+     * implies has a cookie that looks like a heap pointer and that libbinder's
+     * reader still cannot call, at vtable offset 0x60. A service that answers
+     * "not found" is worse than one that answers, and much better than one that
+     * takes the process down. So the search reports and returns nothing. */
+    const unsigned char *object = find_object(data, size, after_name);
+    if (object) {
+        static int reported = 0;
+        if (reported < 3) {
+            reported++;
+            unsigned long cookie = 0;
+            for (int i = 0; i < 8; i++) cookie |= ((unsigned long)object[16 + i]) << (8 * i);
+            say("android-binder:   a type word at ");
+            say_dec((long)(object - data));
+            say(" with cookie 0x");
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                static const char hex[] = "0123456789abcdef";
+                char digit[2];
+                digit[0] = hex[(cookie >> shift) & 0xf];
+                digit[1] = 0;
+                say(digit);
+            }
+            say("; not handing it back\n");
+            say_once();
         }
     }
-
-    ulong saved = parcel_data_position ? parcel_data_position(parcel) : 0;
-    void *object = 0;
-    for (int i = 0; i < count && !object; i++) {
-        if (parcel_set_position(parcel, candidates[i]) != 0) continue;
-        /* The sp lands here and is deliberately not destroyed: its reference is
-         * the registry's. */
-        unsigned long held[2] = {0, 0};
-        parcel_read_strong(held, parcel);
-        object = (void *)held[0];
-    }
-    parcel_set_position(parcel, saved);
-    return object;
+    return 0;
 }
+
 
 static void broker_export(const char *name, ulong node);
 
@@ -1049,13 +1126,34 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
     if (code == TRANSACTION_ADD_SERVICE) {
         if (have_name) {
             const unsigned char *after_name = name_after_token(data, size, name, NAME_MAX);
-            void *object = object_at(request_parcel, data, after_name);
+            void *object = object_at(request_parcel, data, size, after_name);
             if (object) {
                 remember(name, object, 0);
                 say("android-binder: registered ");
                 say(name);
                 say("\n");
                 say_once();
+                /* The 48 bytes around the object, so its layout can be read
+                 * rather than assumed: three guesses at where it starts have been
+                 * wrong, and the one that matched the type word still hands back
+                 * something the reader cannot call. */
+                static int shown = 0;
+                if (shown < 2 && after_name) {
+                    shown++;
+                    const unsigned char *from = after_name - 8 < data ? data : after_name - 8;
+                    const unsigned char *end = data + size;
+                    say("android-binder:   around the object:");
+                    for (const unsigned char *q = from; q < end && q < after_name + 40; q++) {
+                        static const char hex[] = "0123456789abcdef";
+                        char pair[3];
+                        pair[0] = hex[(*q >> 4) & 0xf];
+                        pair[1] = hex[*q & 0xf];
+                        pair[2] = ' ';
+                        write(2, pair, 3);
+                    }
+                    say("\n");
+                    say_once();
+                }
             } else {
                 say("android-binder: addService ");
                 say(name);
@@ -1134,6 +1232,18 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
          * framework's getService. A remembered object is never null -- the
          * registry holds a reference to it -- so this is only the absent case. */
         if (object && parcel_write_binder) {
+            say("android-binder: handing back ");
+            say(have_name ? name : "(unnamed)");
+            say(" as 0x");
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                static const char hex[] = "0123456789abcdef";
+                char digit[2];
+                digit[0] = hex[((unsigned long)object >> shift) & 0xf];
+                digit[1] = 0;
+                say(digit);
+            }
+            say("\n");
+            say_once();
             unsigned long value[2] = {(unsigned long)object, 0};
             parcel_write_binder(reply, value);
         }
