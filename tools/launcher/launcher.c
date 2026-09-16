@@ -226,7 +226,12 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
 
     int registered = 0;
     for (unsigned long i = 0; i < sizeof(kRegistrars) / sizeof(kRegistrars[0]); i++) {
+        /* libandroid_runtime's handle first, which is where most of them live,
+         * then the global scope, which is where the rest do: some registrars are
+         * defined in libraries libandroid_runtime merely needs, such as libhwui,
+         * which registers android.graphics.Typeface's natives. */
         registrar_fn fn = (registrar_fn)dlsym(runtime, kRegistrars[i]);
+        if (!fn) fn = (registrar_fn)dlsym((void *)0 /* RTLD_DEFAULT */, kRegistrars[i]);
         if (!fn) continue;
         int result = fn(*env);
         if (result != 0) {
