@@ -103,28 +103,37 @@ fi
 say "4. can a child of the broker lower its niceness?"
 # setpriority wants root or CAP_SYS_NICE for a *negative* nice, so the check runs
 # as the user the broker runs as, and asks for what the framework asks for.
-if runuser -u "$user" -- python3 - "$reported" <<'PY'
+# Exit codes: 0 the call works, 2 the session still has the old hard limit (a new
+# session fixes that), 1 the call was refused for another reason.
+runuser -u "$user" -- python3 - "$reported" <<'PY'
+import os
 import resource
 import sys
 
-limit = int(sys.argv[1] or 0)
+wanted = int(sys.argv[1] or 0)
 soft, hard = resource.getrlimit(resource.RLIMIT_NICE)
-if soft != limit and limit:
-    resource.setrlimit(resource.RLIMIT_NICE, (limit, hard))
+if hard < wanted:
+    print(f"this session's hard limit is {hard}, not {wanted}")
+    sys.exit(2)
+if soft < wanted:
+    resource.setrlimit(resource.RLIMIT_NICE, (wanted, hard))
 try:
-    import os
     os.setpriority(os.PRIO_PROCESS, 0, -10)
-except PermissionError:
-    sys.exit(1)
 except OSError:
     sys.exit(1)
 sys.exit(0)
 PY
-then
-  ok "a child of the broker can set nice -10"
-else
-  bad "nice -10 was refused; androidSetThreadPriority would fail the same way"
-fi
+case $? in
+  0) ok "a child of the broker can set nice -10" ;;
+  2)
+    bad "the session still has the old hard limit; the drop-in needs a new session"
+    say "        the unit says $reported, which is what a *new* session will get"
+    say "        log out and back in, then run this again"
+    ;;
+  *)
+    bad "nice -10 was refused; androidSetThreadPriority would fail the same way"
+    ;;
+esac
 
 bundle=${1:-}
 if [ -n "$bundle" ]; then
@@ -215,9 +224,13 @@ if [ "$mechanism_ok" -eq 1 ]; then
   say "pretend-nice.c stays in the tree meanwhile: a harness run on a machine whose"
   say "session has no limit still wants it. The product does not, which is the point."
 else
-  say "The mechanism is not verified yet, and checks 1-3 need the package and a new"
-  say "session. The stand-ins are load-bearing exactly as long as the limit is"
-  say "missing: without them the run stops at InitBeforeStartServices with a"
-  say "SecurityException from setThreadPriority."
+  say "The package is in place; what step 4 is waiting for is a session that started"
+  say "after it. Log out and back in and run this again -- a user service cannot"
+  say "raise its own hard limit, so the grant only reaches processes the user"
+  say "manager starts *after* it is installed."
+  say ""
+  say "The framework itself does not wait for that: with the limit granted for one"
+  say "run it already reaches StartActivityManager without the priority stand-ins,"
+  say "which is A6's gate."
 fi
 exit 1
