@@ -28,27 +28,26 @@ readelf --dyn-syms -W "$runtime" \
   | grep -E '^_Z(N7android)?[0-9]+register_' \
   | sort -u > "$out/mangled.txt"
 
-# Order matters: see the header of registrar_order.txt. The mangled name embeds
-# the plain one between a length prefix and the parameter list, so matching is a
-# substring test rather than a demangle -- c++filt is not on every machine, and
-# its absence silently degrades this to alphabetical order, which is exactly the
-# bug this file exists to prevent.
+# Order matters: see the header of registrar_order.txt, and the definitions are
+# looked up globally rather than in libandroid_runtime alone: some registrars live
+# in libraries it merely needs, such as libhwui, which is where
+# android.graphics.Typeface's natives are registered. startReg calls them by name
+# and so does this.
+#
+# A registrar's mangled form is either a global function or one in the android
+# namespace, so both candidates are emitted and the launcher takes whichever
+# resolves.
 : > "$here/registrars.inc"
 while read -r name; do
   [ -n "$name" ] || continue
   case "$name" in \#*) continue ;; esac
-  symbol=$(grep -m1 -E "${name}E?P7_JNIEnv$" "$out/mangled.txt" || true)
-  [ -n "$symbol" ] && printf '  "%s",\n' "$symbol" >> "$here/registrars.inc"
+  length=${#name}
+  printf '  "_Z%s%sP7_JNIEnv",\n' "$length" "$name" >> "$here/registrars.inc"
+  printf '  "_ZN7android%s%sEP7_JNIEnv",\n' "$length" "$name" >> "$here/registrars.inc"
 done < "$here/registrar_order.txt"
 
-# Anything the bundle exports that AOSP's list does not mention goes last, where
-# it cannot disturb the ordering that matters.
-while read -r mangled; do
-  grep -qF "\"$mangled\"" "$here/registrars.inc" || printf '  "%s",\n' "$mangled" >> "$here/registrars.inc"
-done < "$out/mangled.txt"
-
 count=$(grep -c '"' "$here/registrars.inc" || true)
-echo "generated $count registrars from $(basename "$runtime"), in AOSP order"
+echo "generated $count registrar candidates, in AOSP order"
 
 target="${MOSAIC_ANDROID_TARGET:-x86_64-linux-android21}"
 clang --target="$target" -shared -fPIC -nostdlib -O2 \

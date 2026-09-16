@@ -155,6 +155,40 @@ than at the driver's, which is stable in practice but is a foreign C++ ABI: the
 calls have to be made through `dlsym`ed symbols with hand-written signatures, as
 the launcher already does for `JNI_CreateJavaVM`.
 
+## Binder at the API level works
+
+`tools/binder-shim/android-binder.c` interposes
+`BpBinder::transact` -- defined under its mangled name, so a preload wins for
+callers outside libbinder, which is how the framework reaches binder -- and
+answers the service manager in userspace using `Parcel`'s exported writers. It
+takes the first three IServiceManager calls:
+
+- `checkService`/`getService`: a zero exception code and a null binder, which is a
+  valid reply for an absent service. The framework moves past
+  `DisplayManagerGlobal`, where it had been failing.
+- `addService`: success. The framework then **starts registering its own
+  services**, which is `startBootstrapServices` running.
+
+```
+android-binder: transact handle=12 code=2 flags=2
+android-binder: answered "no such service"
+android-binder: transact handle=12 code=3 flags=2
+android-binder: accepted a service registration
+```
+
+Two things learned from the kernel and from running it. A reply must carry the
+answered transaction's `code` and `flags` and address the read buffer with its
+data pointers (`drivers/android/binder.c`, `binder_thread_read`); and `BpBinder`'s
+handle is not at a fixed offset because `IBinder` derives virtually from
+`RefBase` -- it does not matter yet, since with no services the only reachable
+target is handle 0, but it will when a second binder exists.
+
+The next step is the registry this stops short of: store the binder that
+`addService` carries, hand one back on `getService`, and route a transaction to a
+handle by calling the stored `BBinder::transact`, which is exported too. That is a
+complete minimal userspace binder, and it is what makes the framework's own
+services reachable.
+
 ## Where it stands
 
 The shim answers the version, threads, spam-detection and mapping calls, so

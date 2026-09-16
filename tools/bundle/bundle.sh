@@ -423,6 +423,7 @@ libsigchain.so
 libstats_jni.so
 libandroid_servers.so
 libjavacrypto.so
+libhwui.so
 SEED
 
   # ART preloads every entry in the device's public library list, so the bundle
