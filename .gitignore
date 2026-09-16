@@ -9,7 +9,7 @@
 *.swp
 *.swo
 
-# Packaging artifacts
+# Packaging artifacts (Debian)
 /build/
 /debian/.debhelper/
 /debian/debhelper-build-stamp
@@ -17,6 +17,13 @@
 /debian/*.substvars
 /debian/mosaic/
 /mosaic-bugreport.tar.xz
+
+# Packaging artifacts (Arch)
+/packaging/arch/pkg/
+/packaging/arch/src/
+/packaging/arch/*.pkg.tar.*
+/packaging/arch/*.tar.gz
+/packaging/arch/*.tar.zst
 
 # OS
 .DS_Store

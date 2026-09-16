@@ -1,0 +1,52 @@
+# Maintainer: yesheytenzin <yesheytenzin09@mail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Builds the package from this source tree, so it works without a published
+# release tarball. Run from this directory:
+#
+#   cd packaging/arch && makepkg -f
+#
+# Once a public release tag exists, switch `source` to the tag tarball for AUR
+# distribution.
+
+pkgname=mosaic
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Android container tool (Rust rewrite of Waydroid)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/yesheytenzin/mosaic"
+license=('GPL-3.0-or-later')
+depends=('lxc' 'dbus' 'polkit' 'iptables' 'xz')
+makedepends=('cargo' 'rust' 'pkgconf')
+source=()
+sha256sums=()
+
+# The binary is already stripped by the Cargo release profile, so a separate
+# debug package would be empty.
+options=('!debug')
+
+_pkgroot="$startdir/../.."
+
+pkgver() {
+  sed -n 's/^version = "\(.*\)"/\1/p' "$_pkgroot/Cargo.toml" | head -n1
+}
+
+build() {
+  cd "$_pkgroot"
+  # Rust manages its own codegen. makepkg's distro C flags, notably the
+  # -flto=auto in LTOFLAGS, break the pregenerated assembly in ring, which
+  # surfaces as undefined ring_core_* symbols at link time.
+  unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LTOFLAGS
+  cargo build --release --locked
+}
+
+check() {
+  cd "$_pkgroot"
+  unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS LTOFLAGS
+  cargo test --release --locked
+}
+
+package() {
+  cd "$_pkgroot"
+  make install DESTDIR="$pkgdir"
+}

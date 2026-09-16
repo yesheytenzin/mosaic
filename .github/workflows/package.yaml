@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-name: Build Debian package
+name: Build packages
 
 on:
   push:
@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   deb:
+    name: Debian package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -65,14 +66,54 @@ jobs:
           ls -la dist
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-package
           path: dist/*
           if-no-files-found: error
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
+  arch:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git rust pkgconf
+
+      # makepkg refuses to run as root; the image default user is root, so
+      # build as an unprivileged user that owns the checkout.
+      - name: Build package
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash -c \
+            "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg -f --nodeps --noconfirm"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-package
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs:
+      - deb
+      - arch
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" $(find dist -type f) --generate-notes

@@ -1,0 +1,19 @@
+pkgbase = mosaic
+	pkgdesc = Android container tool (Rust rewrite of Waydroid)
+	pkgver = 0.0.1
+	pkgrel = 1
+	url = https://github.com/yesheytenzin/mosaic
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = rust
+	makedepends = pkgconf
+	depends = lxc
+	depends = dbus
+	depends = polkit
+	depends = iptables
+	depends = xz
+	options = !debug
+
+pkgname = mosaic
