@@ -608,14 +608,28 @@ do_properties() { # <image> <bundle>
   # The image's build.prop is the authority on product identity and SDK level,
   # so the generator seeds from it and adds the dalvik.vm.* values Mosaic picks.
   mkdir -p "$out/etc"
+
+  # Clear the previous area first. Its files are written read-only, the way a
+  # device has them, so a second build cannot overwrite them: it fails with
+  # "Permission denied" and leaves the *old* area in place, which is worse than
+  # failing, because the bundle then says it is ready with properties that no
+  # longer match the image. Removing first is allowed even so, because unlinking
+  # needs permission on the directory, not on the file.
+  rm -f "$out"/properties/* 2>/dev/null || {
+    echo "cannot clear $out/properties; remove it and build again" >&2
+    return 1
+  }
+
   build_prop=""
   if dump_path "$img" /system/build.prop "$out/etc/build.prop" >/dev/null 2>&1; then
     build_prop="$out/etc/build.prop"
   fi
+  # And the status is checked: a bundle whose property area is missing or stale
+  # is not a bundle, and everything downstream reads identity out of it.
   if [ -n "$build_prop" ]; then
-    python3 "$gen" "$out/properties" --build-prop "$build_prop" >/dev/null
+    python3 "$gen" "$out/properties" --build-prop "$build_prop" >/dev/null || return 1
   else
-    python3 "$gen" "$out/properties" >/dev/null
+    python3 "$gen" "$out/properties" >/dev/null || return 1
   fi
   echo "  + properties/ ($(ls "$out/properties" | tr '\n' ' '))"
 }
