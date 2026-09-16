@@ -32,11 +32,16 @@ registrars resolve; the shim presents Android's absolute paths.
 6. **One privileged step (ADR-0013).** `LimitNICE` on the broker's unit, the
    property area, and the paths a product presents instead of redirecting.
    *Gate:* `Process.setThreadPriority` works without the harness stand-ins.
-7. **Path redirection breadth.** `/vendor`, `/product`, `/system_ext` and `/odm`
-   are not covered yet, and `SystemConfig` reads several of them.
-8. **Property service growth.** It drops properties it does not already define,
-   and the framework throws "failed to set system property". The trie is ours, so
-   the fix is to pre-allocate room in it for names added at runtime.
+7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
+   `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
+   (empty, and says so) because `SystemConfig` treats its absence as fatal.
+8. **Property service growth** — mostly done. The trie has a catch-all prefix, so
+   a name created at runtime resolves without rewriting a file that running
+   processes have mapped, and the service appends to the area and records it in
+   the index. Writes to new properties are accepted. One `native_set` still
+   fails, and the service never sees the write, so libc is rejecting it before
+   the socket: the next step is to log the name and value at the failure and find
+   which check it fails.
 
 ## B. `system_server` to completion
 

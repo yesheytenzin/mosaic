@@ -170,7 +170,17 @@ class PropArea:
     starts after the 128 byte header.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, existing: bytes = None) -> None:
+        if existing is not None:
+            # Continue an area that is already mapped by running processes. The
+            # allocation cursor comes from the file, so appends land after what
+            # is there and nothing already written moves.
+            if len(existing) != PROP_AREA_SIZE:
+                raise ValueError("an existing area must be its full size")
+            self.buf = bytearray(existing)
+            self.used = struct.unpack_from("<I", self.buf, 0)[0]
+            self.index = {}
+            return
         self.buf = bytearray(PROP_AREA_SIZE)
         # name -> offset of its prop_info, for the writer.
         self.index = {}
@@ -357,6 +367,16 @@ class PropertyInfo:
             else b""
         )
 
+        # A zero-length prefix matches every name (CheckPrefixMatch compares
+        # prefix_len bytes, and zero bytes always match), so a property the
+        # framework creates at runtime resolves to this context without the trie
+        # being rewritten -- which matters, because running processes have it
+        # mapped.
+        prefix_offset = self._append(
+            struct.pack("<IIII", 0, 0, 0, 0)  # name "", no context of its own
+        )
+        prefix_array_offset = self._append(struct.pack("<I", prefix_offset))
+
         contexts_offset = self._string_table(self.contexts)
         types_offset = self._string_table(self.types)
 
@@ -378,8 +398,8 @@ class PropertyInfo:
             root_entry_offset,
             0,  # num_child_nodes: none, so the reader stops at the root
             0,  # child_nodes
-            0,  # num_prefixes
-            0,  # prefix_entries
+            1,  # num_prefixes
+            prefix_array_offset,  # prefix_entries
             len(entry_offsets),
             array_offset,
         )

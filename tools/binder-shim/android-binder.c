@@ -9,22 +9,22 @@
  *                               Parcel* reply, unsigned int flags)
  *
  * A preloaded definition wins for callers outside libbinder, and the framework
- * reaches binder through libandroid_runtime, so this is the first call that
- * matters and it can be interposed.
+ * reaches binder through libandroid_runtime, so this is the call that matters and
+ * it can be interposed.
  *
- * What it answers: handle 0 is the service manager, and a call to it asking for a
- * service this system does not have is answered the way the service manager would
- * answer for an absent service -- a zero exception code and a null binder, which
- * is a valid reply that the generated AIDL proxy turns into a null return rather
- * than a failure.
+ * What it implements is the service registry, which is what the framework needs
+ * first: `addService` remembers the local binder it is handed, and
+ * `getService`/`checkService` hand the same one back. While the framework and its
+ * services are one process, a transaction to such a binder is an ordinary C++
+ * call and never comes through here at all, so there is nothing to route yet -- a
+ * second process is what makes routing, reference counting and descriptor passing
+ * necessary (ADR-0005's broker over its socket).
  *
- * What it does not answer yet: anything else. Those return an error so callers
- * fail in Java where the framework reports them, rather than waiting forever for
- * a reply that will not come.
- *
- * This is the shape a real implementation grows into: the service registry and
- * the routes to real services belong behind this function, and the driver
- * protocol stays out of it.
+ * Reading the arguments means reading the caller's parcel: `Parcel::data()` and
+ * `dataSize()` are exported, and an AIDL parcel is [interface token][name] as
+ * string16s followed by the arguments, so the name and the flat_binder_object are
+ * parseable without libbinder's own readers, whose C++ return types (sp<IBinder>
+ * by value) are awkward to call from C.
  */
 
 typedef unsigned int uint32;
@@ -34,16 +34,30 @@ extern void *dlopen(const char *, int);
 extern long write(int, const void *, unsigned long);
 
 #define RTLD_NOW 2
-#define RTLD_NEXT ((void *)-1L)
 
-#define SYM_BP_TRANSACT "_ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j"
 #define SYM_WRITE_INT32 "_ZN7android6Parcel10writeInt32Ei"
 #define SYM_WRITE_BINDER "_ZN7android6Parcel17writeStrongBinderERKNS_2spINS_7IBinderEEE"
+#define SYM_DATA "_ZNK7android6Parcel4dataEv"
+#define SYM_DATA_SIZE "_ZNK7android6Parcel8dataSizeEv"
 
-/* The binder transaction codes the service manager understands. */
 #define TRANSACTION_GET_SERVICE 1
 #define TRANSACTION_CHECK_SERVICE 2
 #define TRANSACTION_ADD_SERVICE 3
+
+/* From binder.h. */
+#define BINDER_TYPE_BINDER 0x73 /* 's' */
+
+#define MAX_SERVICES 64
+#define NAME_MAX 64
+
+typedef struct {
+    char name[NAME_MAX];
+    void *binder;
+    unsigned long cookie;
+} service_t;
+
+static service_t services[MAX_SERVICES];
+static int service_count = 0;
 
 static unsigned long length(const char *s) {
     unsigned long n = 0;
@@ -78,9 +92,13 @@ static void say_dec(long value) {
 
 typedef int (*write_int32_fn)(void *, int);
 typedef int (*write_binder_fn)(void *, const void *);
+typedef const unsigned char *(*parcel_data_fn)(const void *);
+typedef unsigned long (*parcel_size_fn)(const void *);
 
 static write_int32_fn parcel_write_int32;
 static write_binder_fn parcel_write_binder;
+static parcel_data_fn parcel_data;
+static parcel_size_fn parcel_data_size;
 
 static void resolve(void) {
     if (parcel_write_int32) return;
@@ -91,80 +109,169 @@ static void resolve(void) {
     }
     parcel_write_int32 = (write_int32_fn)dlsym(binder, SYM_WRITE_INT32);
     parcel_write_binder = (write_binder_fn)dlsym(binder, SYM_WRITE_BINDER);
-    if (!parcel_write_int32 || !parcel_write_binder) {
-        say("android-binder: Parcel writers not found\n");
-    }
+    parcel_data = (parcel_data_fn)dlsym(binder, SYM_DATA);
+    parcel_data_size = (parcel_size_fn)dlsym(binder, SYM_DATA_SIZE);
 }
 
-/* BpBinder keeps the handle as a member; the object starts with the vtables. */
+static unsigned int u32_at(const unsigned char *p) {
+    unsigned int v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+
+/* A Parcel string16 is a character count, the UTF-16 data, and -- when the count
+ * is odd -- four bytes of padding, because writeString16 pads with an int32. */
+static const unsigned char *skip_string16(const unsigned char *p, const unsigned char *end) {
+    if (!p || p + 4 > end) return 0;
+    unsigned int chars = u32_at(p);
+    const unsigned char *q = p + 4 + (unsigned long)chars * 2;
+    if (q > end) return 0;
+    if (chars & 1) q += 4;
+    return q <= end ? q : 0;
+}
+
+static int read_string16(const unsigned char *p, const unsigned char *end, char *out, int cap) {
+    if (!p || p + 4 > end) return 0;
+    unsigned int chars = u32_at(p);
+    if (p + 4 + (unsigned long)chars * 2 > end) return 0;
+    int n = 0;
+    for (unsigned int i = 0; i < chars && n < cap - 1; i++) {
+        unsigned short c;
+        __builtin_memcpy(&c, p + 4 + (unsigned long)i * 2, 2);
+        out[n++] = (c < 128) ? (char)c : '?';
+    }
+    out[n] = 0;
+    return 1;
+}
+
+/* The name is the second string16 an IServiceManager call carries, after the
+ * interface token. */
+static int service_name_of(const void *data, char *out, int cap) {
+    if (!parcel_data || !parcel_data_size) return 0;
+    const unsigned char *p = parcel_data(data);
+    const unsigned char *end = p + parcel_data_size(data);
+    p = skip_string16(p, end);
+    return read_string16(p, end, out, cap);
+}
+
+static void remember(const char *name, void *binder, unsigned long cookie) {
+    for (int i = 0; i < service_count; i++) {
+        if (services[i].name[0] && length(services[i].name) == length(name)) {
+            int same = 1;
+            for (unsigned long k = 0; k < length(name); k++) {
+                if (services[i].name[k] != name[k]) { same = 0; break; }
+            }
+            if (same) {
+                services[i].binder = binder;
+                services[i].cookie = cookie;
+                return;
+            }
+        }
+    }
+    if (service_count >= MAX_SERVICES) return;
+    int n = 0;
+    while (name[n] && n < NAME_MAX - 1) {
+        services[service_count].name[n] = name[n];
+        n++;
+    }
+    services[service_count].name[n] = 0;
+    services[service_count].binder = binder;
+    services[service_count].cookie = cookie;
+    service_count++;
+}
+
+static void *lookup(const char *name) {
+    for (int i = 0; i < service_count; i++) {
+        if (length(services[i].name) != length(name)) continue;
+        int same = 1;
+        for (unsigned long k = 0; k < length(name); k++) {
+            if (services[i].name[k] != name[k]) { same = 0; break; }
+        }
+        if (same) return services[i].binder;
+    }
+    return 0;
+}
+
+/* BpBinder keeps the handle as a member, but through IBinder's virtual inheritance
+ * from RefBase its offset is not simply after the first vtable pointer. Nothing
+ * here depends on it yet: while the framework and its services share a process,
+ * the only binder anyone can reach is the service manager. */
 static int bp_handle(const void *self) {
     return *(const int *)((const char *)self + 8);
 }
 
-/* The mangled name is the symbol libbinder exports, so this definition is what a
- * caller outside libbinder binds to. */
 int _ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j(
     void *self, uint32 code, const void *data, void *reply, uint32 flags) {
     resolve();
 
-    /* BpBinder derives from IBinder which derives virtually from RefBase, so the
-     * handle is not simply after the first vtable pointer. Show the candidates
-     * for the first few calls, since the service manager's call is checkService
-     * and its handle must be zero. */
-    static int shown = 0;
-    if (shown < 4) {
-        shown++;
-        const unsigned char *raw = (const unsigned char *)self;
-        say("android-binder: candidates:");
-        for (int off = 8; off <= 40; off += 4) {
-            unsigned int v;
-            __builtin_memcpy(&v, raw + off, 4);
-            say(" ");
-            say_dec(off);
-            say("=");
-            say_dec((long)v);
-        }
-        say("\n");
-    }
-
     int handle = bp_handle(self);
-    say("android-binder: transact handle=");
-    say_dec(handle);
-    say(" code=");
-    say_dec((long)code);
-    say(" flags=");
-    say_dec((long)flags);
-    say("\n");
-
-    /* No service exists yet, so every target here is the service manager: the
-     * only binder the framework can reach is handle 0. That avoids needing the
-     * handle field, whose offset is not obvious through BpBinder's virtual
-     * inheritance, until there is a second binder to tell it apart from. */
     (void)handle;
 
-    /* Registering a service succeeds. The registry itself is the next step: the
-     * framework is starting its own services and will look them up again, and
-     * then the name-to-binder table has to exist. Answering addService is what
-     * lets it get that far. */
-    if (reply && code == TRANSACTION_ADD_SERVICE) {
-        if (parcel_write_int32) parcel_write_int32(reply, 0);
-        say("android-binder: accepted a service registration\n");
+    if (!reply) {
+        /* A oneway transaction: accept it and let the caller continue. */
+        if (code == TRANSACTION_ADD_SERVICE && data) {
+            char name[NAME_MAX];
+            if (service_name_of(data, name, NAME_MAX)) {
+                say("android-binder: oneway addService ");
+                say(name);
+                say("\n");
+            }
+        }
         return 0;
     }
 
-    if (reply && (code == TRANSACTION_GET_SERVICE || code == TRANSACTION_CHECK_SERVICE)) {
-        /* An absent service, as the service manager would report it. */
-        if (parcel_write_int32) parcel_write_int32(reply, 0 /* no exception */);
-        if (parcel_write_binder) {
-            /* sp<IBinder> with a null pointer; the extra words are slack in case
-             * this build's sp is wider than one pointer. */
-            void *null_binder[2] = {0, 0};
-            parcel_write_binder(reply, null_binder);
+    if (code == TRANSACTION_ADD_SERVICE) {
+        char name[NAME_MAX];
+        if (data && service_name_of(data, name, NAME_MAX)) {
+            const unsigned char *p = parcel_data(data);
+            const unsigned char *end = p + parcel_data_size(data);
+            p = skip_string16(p, end);          /* interface token */
+            p = skip_string16(p, end);          /* the name */
+            if (p && p + 24 <= end) {
+                unsigned int type = u32_at(p);
+                unsigned long binder = 0, cookie = 0;
+                __builtin_memcpy(&binder, p + 8, 8);
+                __builtin_memcpy(&cookie, p + 16, 8);
+                if (type == BINDER_TYPE_BINDER) {
+                    remember(name, (void *)binder, cookie);
+                    say("android-binder: registered ");
+                    say(name);
+                    say("\n");
+                } else {
+                    say("android-binder: ");
+                    say(name);
+                    say(" is not a local binder (type ");
+                    say_dec((long)type);
+                    say(")\n");
+                }
+            }
         }
-        say("android-binder: answered \"no such service\"\n");
-        return 0; /* NO_ERROR */
+        if (parcel_write_int32) parcel_write_int32(reply, 0);
+        return 0;
     }
 
-    /* Everything else fails in Java rather than waiting for a reply. */
+    if (code == TRANSACTION_GET_SERVICE || code == TRANSACTION_CHECK_SERVICE) {
+        char name[NAME_MAX];
+        void *binder = 0;
+        if (data && service_name_of(data, name, NAME_MAX)) {
+            binder = lookup(name);
+            say("android-binder: ");
+            say(code == TRANSACTION_GET_SERVICE ? "getService " : "checkService ");
+            say(name);
+            say(binder ? " found\n" : " not found\n");
+        }
+        if (parcel_write_int32) parcel_write_int32(reply, 0);
+        if (parcel_write_binder) {
+            unsigned long value[2] = {(unsigned long)binder, 0};
+            parcel_write_binder(reply, value);
+        }
+        return 0;
+    }
+
+    /* Anything else fails in Java rather than waiting for a reply that will not
+     * come. */
+    say("android-binder: unanswered code ");
+    say_dec((long)code);
+    say("\n");
     return -1;
 }
