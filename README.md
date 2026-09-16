@@ -38,6 +38,9 @@ make build
 
 Start with [`CONTEXT.md`](CONTEXT.md) for the vocabulary and
 [`docs/adr/`](docs/adr/) for the decisions and their reasoning.
+[`docs/runtime-bundle.md`](docs/runtime-bundle.md) records what the runtime
+bundle actually contains and what is proven so far, with the tooling in
+[`tools/bundle/`](tools/bundle/).
 
 ## License
 
