@@ -106,27 +106,6 @@ pub fn load(config_path: &str) -> MosaicConfig {
     MosaicConfig { mosaic }
 }
 
-/// Kept as an alias so callers can read the bundle channel without a second
-/// config file. The bundle replaces the old image channels.
-#[derive(Debug, Clone)]
-pub struct ChannelsConfig {
-    pub channels: HashMap<String, String>,
-}
-
-impl ChannelsConfig {
-    pub fn new() -> Self {
-        let mut channels = HashMap::new();
-        channels.insert("bundle_channel".to_string(), Defaults::new().bundle_channel);
-        Self { channels }
-    }
-}
-
-impl Default for ChannelsConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

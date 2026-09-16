@@ -8,10 +8,8 @@
 //! contract any more.
 
 pub mod load;
-pub mod save;
 
-pub use load::{load, ChannelsConfig};
-pub use save::save;
+pub use load::load;
 
 /// Single source of truth for the version, taken from the package metadata so
 /// it cannot drift from `Cargo.toml`.
@@ -25,7 +23,6 @@ pub struct Defaults {
     pub work: String,
     pub apps_dir: String,
     pub runtime_dir: String,
-    pub socket_path: String,
     /// Where the runtime bundle is fetched from, minus the version segment.
     pub bundle_channel: String,
     pub bundle_version: String,
@@ -67,7 +64,6 @@ impl Defaults {
         Self {
             apps_dir: format!("{}/apps", work),
             runtime_dir: format!("{}/runtime", work),
-            socket_path: format!("{}/broker.sock", work),
             bundle_channel: "https://ota.waydro.id/mosaic".to_string(),
             bundle_version: "0".to_string(),
             uid_range_start: 5000,

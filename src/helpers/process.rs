@@ -71,6 +71,7 @@ pub fn core(
     log_message: &str,
     cmd: &[String],
     working_dir: Option<&str>,
+    env: &[(String, String)],
     output: &str,
     output_return: bool,
     check: bool,
@@ -96,6 +97,7 @@ pub fn core(
         OutputMode::Background => {
             let mut command = std::process::Command::new(&cmd[0]);
             command.args(&cmd[1..]);
+            command.envs(env.iter().map(|(k, v)| (k, v)));
             if let Some(wd) = working_dir {
                 command.current_dir(wd);
             }
@@ -129,6 +131,7 @@ pub fn core(
         OutputMode::Pipe => {
             let mut command = std::process::Command::new(&cmd[0]);
             command.args(&cmd[1..]);
+            command.envs(env.iter().map(|(k, v)| (k, v)));
             if let Some(wd) = working_dir {
                 command.current_dir(wd);
             }
@@ -148,6 +151,7 @@ pub fn core(
     if mode == OutputMode::Tui {
         let mut command = std::process::Command::new(&cmd[0]);
         command.args(&cmd[1..]);
+        command.envs(env.iter().map(|(k, v)| (k, v)));
         if let Some(wd) = working_dir {
             command.current_dir(wd);
         }
@@ -161,6 +165,7 @@ pub fn core(
     // Foreground with pipe, implement timeout
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
+    command.envs(env.iter().map(|(k, v)| (k, v)));
     if let Some(wd) = working_dir {
         command.current_dir(wd);
     }
@@ -299,6 +304,7 @@ mod tests {
             "% echo hello",
             &["echo".to_string(), "hello".to_string()],
             None,
+            &[],
             "log",
             true,
             true,
@@ -317,6 +323,7 @@ mod tests {
             "% false",
             &["false".to_string()],
             None,
+            &[],
             "log",
             false,
             true,
@@ -335,6 +342,7 @@ mod tests {
             "% sleep 60",
             &["sleep".to_string(), "60".to_string()],
             None,
+            &[],
             "log",
             false,
             true,
@@ -356,6 +364,7 @@ mod tests {
             "% ticker",
             &["sh".to_string(), "-c".to_string(), script.to_string()],
             None,
+            &[],
             "log",
             true,
             true,

@@ -62,6 +62,69 @@ pub fn bundle_url(channel: &str, version: &str) -> String {
     )
 }
 
+/// The environment a Bionic process in this bundle expects.
+///
+/// init sets these on a device. Without `ANDROID_ROOT` ART cannot find its
+/// configuration; without `ANDROID_DATA` it has nowhere to write
+/// `dalvik-cache`. The bundle's own `env.sh` holds the same set, which is what
+/// the build tool writes for interactive use.
+pub fn bundle_env(dir: &str) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            "LD_CONFIG_FILE".to_string(),
+            format!("{}/ld.config.txt", dir),
+        ),
+        ("ANDROID_ROOT".to_string(), dir.to_string()),
+        ("ANDROID_DATA".to_string(), format!("{}/data", dir)),
+        ("ANDROID_ART_ROOT".to_string(), dir.to_string()),
+        ("ANDROID_I18N_ROOT".to_string(), format!("{}/i18n", dir)),
+        ("ANDROID_TZDATA_ROOT".to_string(), dir.to_string()),
+        ("ANDROID_TMP".to_string(), format!("{}/tmp", dir)),
+    ];
+    // app_process reads the boot classpath from the environment, unlike
+    // dalvikvm which takes it as an argument.
+    if let Ok(bootclasspath) = std::fs::read_to_string(format!("{}/bootclasspath.txt", dir)) {
+        let bootclasspath = bootclasspath.trim();
+        if !bootclasspath.is_empty() {
+            env.push(("BOOTCLASSPATH".to_string(), bootclasspath.to_string()));
+        }
+    }
+    env
+}
+
+/// Start a program out of the bundle. This is the one place a Bionic process is
+/// spawned, so the broker, `runtime verify`, and any later caller agree on the
+/// environment and the working directory (ADR-0012).
+pub fn run_in_bundle(
+    args: &MosaicArgs,
+    dir: &str,
+    program: &str,
+    program_args: &[String],
+) -> anyhow::Result<String> {
+    for sub in ["data/dalvik-cache", "tmp"] {
+        std::fs::create_dir_all(format!("{}/{}", dir, sub))?;
+    }
+
+    let cmd = std::iter::once(program.to_string())
+        .chain(program_args.iter().cloned())
+        .collect::<Vec<String>>();
+    let message = format!("$ {}", cmd.join(" "));
+    let env = bundle_env(dir);
+
+    // ART writes to stderr and exits non-zero on failure, so the runner is told
+    // not to treat a non-zero exit as fatal: the caller decides, having seen
+    // what ART printed. Output is captured rather than echoed, so a caller can
+    // report it once and in its own words.
+    let output =
+        crate::helpers::process::core(args, &message, &cmd, None, &env, "log", true, false, false)?;
+    Ok(output.unwrap_or_default())
+}
+
+/// The path to ART inside a bundle.
+pub fn dalvikvm_path(dir: &str) -> String {
+    format!("{}/bin/dalvikvm64", dir)
+}
+
 /// Download, verify and extract the bundle for `version`.
 pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::Result<String> {
     let defaults = Defaults::new();
