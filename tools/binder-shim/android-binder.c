@@ -134,6 +134,7 @@ static void say(const char *s) {
     if (!s) return;
     for (const char *p = s; *p; p++) {
         if (*p == '\n') {
+            if (line_length + 1 < sizeof(line)) line[line_length++] = '\n';
             flush_line();
             continue;
         }
@@ -426,7 +427,12 @@ static int broker_enabled(void) {
 }
 
 static void lock_broker(void) {
+    int spins = 0;
     while (__sync_lock_test_and_set(&broker_lock, 1)) {
+        if (spins++ == 0) {
+            say("android-binder: waiting for the broker lock\n");
+            say_once();
+        }
     }
 }
 
@@ -565,10 +571,11 @@ static int broker_send(uint32 kind, uint32 a, uint32 b, uint32 c, ulong node,
     put_u32(header + 24, (uint32)size);
     put_u32(header + 28, 0);
 
-    lock_broker();
+    /* The caller holds the lock across the whole request and its answer, so
+     * that nothing else can interleave a frame. Taking it here as well is a
+     * deadlock, not a belt and braces: every caller had already taken it. */
     int result = write_all(fd, header, 32);
     if (result == 0 && size > 0) result = write_all(fd, data, size);
-    unlock_broker();
     if (result != 0) {
         say("android-binder: sending to the broker failed (kind ");
         say_dec((long)kind);
@@ -727,6 +734,8 @@ void *mosaic_binder_lookup(const char *name) {
 
 /* ---- using the socket ----------------------------------------------------- */
 
+
+
 #define SYS_GETPID 39
 
 struct timespec {
@@ -808,11 +817,13 @@ static uint32 broker_lookup(const char *name, ulong *node, uint32 *owner) {
         unlock_broker();
         return NO_HANDLE;
     }
+    say("broker-self-check: asked\n");
     unsigned char *data = 0;
     ulong size = 0;
     uint32 a = 0, b = 0, c = 0;
     int waited = await_response(KIND_FOUND, &data, &size, &a, &b, &c);
     unlock_broker();
+    say("broker-self-check: the wait ended\n");
     if (waited != 0) return NO_HANDLE;
     if (node) *node = response_node;
     if (owner) *owner = b;
@@ -834,12 +845,16 @@ static void *broker_reader(void *arg) {
         response_data = (unsigned char *)malloc(response_capacity);
     }
     if (!response_data) return 0;
+    say("android-binder: reader thread running\n");
+    say_once();
     for (;;) {
         uint32 kind = 0, a = 0, b = 0, c = 0;
         ulong node = 0;
         ulong size = response_capacity;
         if (broker_recv(&kind, &a, &b, &c, &node, response_data, &size) != 0) break;
         if (kind == KIND_INCOMING) {
+            say("android-binder: the broker sent a transaction\n");
+            say_once();
             broker_serve(a, node, b, c, response_data, size);
             continue;
         }

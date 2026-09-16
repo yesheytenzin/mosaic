@@ -79,12 +79,22 @@ in order:
    taken with `Parcel::readStrongBinder`, whose reference is left in place, so the
    registry owns the service from registration on. Verified -- no SIGSEGV and no
    staleness guard, with lookups still finding what is registered.
-2. The broker client is written but not verified, and is off by default:
-   publishing to the broker, asking it about a name this process does not have,
-   forwarding a transaction for a handle, and serving an `Incoming` by entering
-   `BBinder::transact` are all in `tools/binder-shim/android-binder.c`, with
-   `tools/two-process-call.py` as the second process to test them from. The first
-   run published nothing and the reason is not found yet.
+2. The broker client works up to the last layer, and is off by default. Verified
+   against a running broker, with the framework in one process and
+   `tools/two-process-call.py` in another:
+
+   - the shim publishes what it registers (a frame per registration, `published
+     memtrack.proxy`)
+   - the second process resolves a name published by the first
+     (`handle=1 node=0x8e3600000002 owner=1`)
+   - the broker forwards the call to the owner (`the broker sent a transaction`)
+
+   What does not happen is the owner *serving* it: `broker_serve` never reaches
+   its own log line, so the call is received and not answered, and the broker
+   eventually gives up on the connection. The two candidates are the Parcel built
+   over the bytes the sender wrote, and running a Java-side binder's `transact`
+   on a thread ART does not know about -- `memtrack.proxy` is registered from
+   native code, but the same path serves Java objects later.
 3. Then `installd`, which does not exist and which the framework waits for:
 
 ```
