@@ -75,6 +75,24 @@ socket by `src/binder/transport.rs`.
       window, and it then reports that nothing was published. The manual sequence
       is the one that is verified.
 
+*Known defect, found while running the framework end to end:* the framework's own
+services do not reach the registry. Every `ServiceManager.addService` from Java
+logs
+
+```
+android-binder: addService platform_compat carried no readable binder object
+```
+
+and only the AIDL registrations land -- `memtrack.proxy` and
+`android.frameworks.stats.IStats/default`, both of which go through
+`AServiceManager_addService` rather than through a Parcel. The name parses in both
+cases; it is the object that cannot be read, with `Parcel::readStrongBinder` at
+each of the three positions the two formats allow, so the Java side's request does
+not carry its object where this looks for it. It does not block the boot -- a
+lookup for one of those names answers "not found", and the framework holds its own
+services locally -- but it is a real gap: a second process cannot reach a service
+the framework registered.
+
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
 daemon, and now by the framework itself: `AServiceManager_addService` and
