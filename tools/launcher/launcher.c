@@ -82,7 +82,7 @@ extern void *dlsym(void *, const char *);
 extern void *dlopen(const char *, int);
 extern void exit(int);
 extern char *getenv(const char *);
-extern long syscall(long, ...);
+extern long write(int, const void *, unsigned long);
 extern void *malloc(unsigned long);
 extern int strcmp(const char *, const char *);
 extern char *strstr(const char *, const char *);
@@ -99,10 +99,14 @@ static long slen(const char *s) {
     return s ? (long)strlen(s) : 0;
 }
 
-#define SYS_write 1
-
+/* Both streams, because which of them survives into this call context is not
+ * obvious and one of them is enough. Plain write(), which is what the first
+ * design used and what demonstrably reached the terminal. */
 static void say(const char *s) {
-    if (s) syscall(SYS_write, 2, s, (unsigned long)slen(s));
+    if (!s) return;
+    unsigned long n = (unsigned long)slen(s);
+    write(1, s, n);
+    write(2, s, n);
 }
 
 static void say_dec(long value) {
@@ -122,7 +126,8 @@ static void say_dec(long value) {
         magnitude /= 10;
     } while (magnitude);
     while (n) out[i++] = tmp[--n];
-    syscall(SYS_write, 2, out, (unsigned long)i);
+    write(1, out, (unsigned long)i);
+    write(2, out, (unsigned long)i);
 }
 
 static void fail(const char *what, const char *detail) {
@@ -186,6 +191,7 @@ static int run_class(JNIEnvP env, const char *class_name, const char *args_spec)
  * body runs. The host is therefore any Bionic binary that creates a VM; its
  * arguments supply the class path and boot class path. */
 jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
+    say("launcher: interposed JNI_CreateJavaVM\n");
     static create_vm_fn real_create_vm;
     if (!real_create_vm) {
         real_create_vm = (create_vm_fn)dlsym((void *)-1L, "JNI_CreateJavaVM");
@@ -239,6 +245,15 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
 }
 
 static int run_class(JNIEnvP env, const char *class_name, const char *args_spec) {
+    /* FindClass takes a slash separated name. A dotted one works because ART
+     * tolerates it and warns, which is not something to rely on. */
+    static char slashed[512];
+    long i = 0;
+    for (; class_name[i] && i < (long)sizeof(slashed) - 1; i++) {
+        slashed[i] = class_name[i] == '.' ? '/' : class_name[i];
+    }
+    slashed[i] = 0;
+
     void **table = *(void ***)env;
 
     jclass (*find_class)(JNIEnvP, const char *) =
@@ -248,7 +263,7 @@ static int run_class(JNIEnvP env, const char *class_name, const char *args_spec)
     void (*call_static_void)(JNIEnvP, jclass, jmethodID, jvalue *) =
         (void(*)(JNIEnvP, jclass, jmethodID, jvalue *))table[JNI_CALL_STATIC_VOID_METHOD_A];
 
-    jclass target = find_class(env, class_name);
+    jclass target = find_class(env, slashed);
     if (!target) {
         fail("class not found", class_name);
         return 2;

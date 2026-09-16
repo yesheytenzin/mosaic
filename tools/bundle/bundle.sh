@@ -268,6 +268,7 @@ JARS=(
   "/system/apex/com.android.art/javalib/bouncycastle.jar:javalib"
   "/system/apex/com.android.art/javalib/apache-xml.jar:javalib"
   "/system/framework/framework.jar:framework"
+  "/system/framework/services.jar:framework"
   "/system/framework/framework-graphics.jar:framework"
   "/system/framework/ext.jar:framework"
   "/system/framework/ims-common.jar:framework"

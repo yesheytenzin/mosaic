@@ -164,23 +164,34 @@ Run through `app_process` instead and the flow proceeds past that point to
 So the gap is a list of natives plus the device layer, not a wall — the assumption
 this phase rests on now has evidence rather than optimism. Two consequences:
 
-- **The launcher matters, and now exists.** `dalvikvm` cannot register the
-  framework's natives, and `app_process` cannot be told to run an arbitrary class
-  on an arbitrary class path. `tools/launcher/` is a Bionic shared object that
-  interposes `JNI_CreateJavaVM`, calls the 150 exported `register_*` functions
-  that `AndroidRuntime::startReg` calls internally, and then runs a class. With it,
-  `SystemServer` gets **further than before**: the first failure moves from
-  `Binder.getNativeBBinderHolder` to `android.util.Log.isLoggable`, and the stack
-  shows the launcher executing SystemServer.
-- **`services.jar` belongs in the bundle**, next to the other boot classpath jars.
-  It is not there yet.
+- **The launcher matters, and now exists.** `tools/launcher/` is a Bionic shared
+  object that interposes `JNI_CreateJavaVM`, calls the 150 exported `register_*`
+  functions that `AndroidRuntime::startReg` calls internally, and then runs a
+  class. Order matters and cost a round: calling them alphabetically runs
+  `os_Binder` before `util_Log`, and Binder's class initialisation touches
+  `StrictMode`, which calls `android.util.Log.isLoggable` — registration then
+  aborts on a native that would have been registered a few lines later. The order
+  is now AOSP's own, extracted from `AndroidRuntime.cpp` into
+  `tools/launcher/registrar_order.txt`.
 
-The next gap is the interesting one: `register_android_util_Log` is in the list
-that gets called, so either it returned an error or its `RegisterNatives` landed
-on a different class than the one `StrictMode` initialises. The launcher currently
-cannot say which, because its own progress output does not reach stderr from
-inside the interposed call — that is the first thing to fix, since the ratchet
-depends on seeing it.
+With the launcher, **SystemServer boots**:
+
+```
+launcher: registered 150 native registrars
+launcher: running com.android.server.SystemServer
+SystemServerTiming: InitBeforeStartServices
+SystemServerTiming: InitBeforeStartServices took to complete: 1ms
+```
+
+That is the real system server running its own boot sequence, with the
+framework's natives registered and no crash. It then stops at the next step,
+`StartServices`, which creates `ActivityManagerService` and friends — and that
+needs Binder transactions. With the binder shim also loaded it does not get
+further, because the shim refuses the command stream it cannot parse.
+
+**So P4 now waits on P3's framing question, exactly as this plan predicted.** The
+measured state is: `SystemServer` reaches `InitBeforeStartServices` and stops at
+the first binder transaction.
 
 ### P5 — Windowing and graphics
 
@@ -336,8 +347,10 @@ cheap test:
 3. ~~Run the P4 spike.~~ **Done** — `SystemServer` runs and stops on one native.
    ~~Build the launcher.~~ **Done** — `tools/launcher/` registers the framework's
    natives and runs a class; `SystemServer` now stops one gap further on. Next:
-   make the launcher report which registrars fail, then close the
-   `register_android_util_Log` gap.
+   ~~Make the launcher report which registrars fail~~ **Done**, and with the
+   right registration order `SystemServer` boots to `InitBeforeStartServices`.
+   It now waits on item 1, the binder framing, which is where it was always
+   going to wait.
 4. Build the hello-world fixture APK (via `d8` on our own ART) and add it to the
    verification set.
 5. Add the compatibility matrix skeleton and run the first three Tier 1 apps.
