@@ -78,17 +78,38 @@ definition in a preloaded library still wins.
 
 The shim answers the version, threads, spam-detection and mapping calls, so
 `ProcessState::self()` succeeds and the framework gets a real `IBinder` for the
-context manager. `BINDER_WRITE_READ` is parsed and logged but refused, so the
-framework stops on the first transaction, which is exactly the call the service
-manager has to answer.
+context manager. It parses `BINDER_WRITE_READ` and fails fast on a stream it does
+not understand, which keeps a mistake in Java rather than in a spin.
 
-What is left for Phase 3:
+The command stream's exact framing is **not yet settled**, and that is the next
+thing to do. Every write buffer observed begins with bytes that are not a command
+word:
 
-1. Reply to `BINDER_WRITE_READ`: consume the write stream, and for a transaction
-   to handle 0 dispatch it to the service registry and write a `BR_REPLY` with
-   the resulting handle.
+```
+write_size=68  [00 63 40 40 00 00 00 00 00 00 00 00 ... 47 4e 50 5f]
+write_size=8   [05 63 04 40 00 00 00 00]
+```
+
+The first four bytes on the two calls differ, so it is not a fixed prefix, and the
+three bytes after `00` on the first line read like the low bytes of a pointer into
+a `0x40xxxxxx` mapping. The next step is to read the layout out of libbinder
+rather than infer it from bytes: `IPCThreadState::talkWithDriver` and how it sets
+`write_buffer` from its outgoing `Parcel`, and what `Parcel::data()` and
+`dataSize()` count. `tools/binder-shim/probe.c` prints the first bytes of every
+write buffer for exactly this.
+
+An early attempt at answering the transaction produced a process that spun until
+it filled a 5 GB log, because libbinder waits for a reply that never comes.
+`with-logd.sh` now bounds every run with `MOSAIC_TIMEOUT` (120 seconds by
+default), and the shim refuses an unparsed stream instead of staying silent.
+
+## What is left for Phase 3
+
+1. Settle the write-stream framing, then reply to `BINDER_WRITE_READ`: for a
+   transaction to handle 0, dispatch it to the service registry and write a
+   `BR_REPLY` carrying the resulting handle.
 2. Reference counting: `BC_ACQUIRE`/`BC_RELEASE`/`BC_INCREFS`/`BC_DECREFS`, which
    are what keep a remote object alive.
 3. Route transactions to handles the registry handed out. For now those services
    do not exist, so the honest answer is an error reply rather than a hang, and
-   the framework reports "service unavailable" instead of crashing.
+   the framework reports the service as unavailable instead of aborting.

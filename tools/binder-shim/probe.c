@@ -127,8 +127,12 @@ static void dump_parcel_string(unsigned char *data, long size) {
     emit("\"");
 }
 
-static void dump_commands(unsigned char *buffer, long size) {
+static int saw_unknown_command = 0;
+
+static int dump_commands(unsigned char *buffer, long size) {
     long offset = 0;
+    int wants_reply = 0;
+    saw_unknown_command = 0;
     while (offset + 4 <= size) {
         unsigned int command;
         __builtin_memcpy(&command, buffer + offset, 4);
@@ -139,6 +143,7 @@ static void dump_commands(unsigned char *buffer, long size) {
         if (!name) {
             emit("cmd:");
             emit_dec((long)command);
+            saw_unknown_command = 1;
             continue;
         }
         emit(name);
@@ -164,6 +169,10 @@ static void dump_commands(unsigned char *buffer, long size) {
                 dump_parcel_string((unsigned char *)data_ptr, data_size);
             }
             emit(")");
+            if (command == BC_TRANSACTION && !(flags & 1)) {
+                /* TF_ONE_WAY is bit 0; anything else expects an answer. */
+                wants_reply = 1;
+            }
             offset += TRANSACTION_DATA_SIZE;
         } else if (command == BC_FREE_BUFFER) {
             offset += 8;
@@ -179,6 +188,7 @@ static void dump_commands(unsigned char *buffer, long size) {
             offset += 4;
         }
     }
+    return wants_reply;
 }
 
 static int binder_fd = -1;
@@ -354,9 +364,52 @@ int ioctl(int fd, unsigned long request, ...) {
         emit(" read_size=");
         emit_dec(bwr->read_size);
         emit(" commands:");
-        dump_commands((unsigned char *)bwr->write_buffer, bwr->write_size);
+        {
+            /* The first bytes of the stream are the quickest way to see whether
+             * a command starts at offset 0 or after a header. */
+            emit(" [");
+            unsigned char *raw = (unsigned char *)bwr->write_buffer;
+            for (long i = 0; i < 24 && i < bwr->write_size; i++) {
+                emit_hex(raw[i], 2);
+                emit(" ");
+            }
+            emit("]");
+        }
+        int replied = dump_commands((unsigned char *)bwr->write_buffer, bwr->write_size);
         emit("\n");
-        return -1;
+        bwr->write_consumed = bwr->write_size;
+        if (replied) {
+            /* The reply is an empty Parcel: the generated AIDL proxy reads an
+             * exception code (0 from an empty buffer) and then a strong binder,
+             * which an empty buffer returns as null. That is the honest answer
+             * while no service exists, and it keeps the failure in Java where
+             * the framework can report it, instead of in the driver. */
+            long written = 0;
+            unsigned char *out = (unsigned char *)bwr->read_buffer;
+            if (bwr->read_size >= 4 + TRANSACTION_DATA_SIZE) {
+                unsigned int br_reply = BR_REPLY;
+                __builtin_memcpy(out, &br_reply, 4);
+                unsigned char *tr = out + 4;
+                long zero = 0;
+                for (int i = 0; i < TRANSACTION_DATA_SIZE; i++) tr[i] = 0;
+                /* target.handle, code, flags, sender ids, sizes and pointers stay
+                 * zero: an empty reply with no objects. */
+                __builtin_memcpy(tr + 24, &zero, 8);  /* data_size */
+                __builtin_memcpy(tr + 32, &zero, 8);  /* offsets_size */
+                written = 4 + TRANSACTION_DATA_SIZE;
+            }
+            bwr->read_consumed = written;
+            emit("binder-shim: replied with an empty parcel (");
+            emit_dec(written);
+            emit(" bytes)\n");
+        } else {
+            bwr->read_consumed = 0;
+            if (saw_unknown_command) {
+                emit("binder-shim: unparsed command stream; failing fast\n");
+                return -1;
+            }
+        }
+        return 0;
     }
     if (request == 0x40046210UL) {
         /* BINDER_ENABLE_ONEWAY_SPAM_DETECTION: advisory, and refusing it makes

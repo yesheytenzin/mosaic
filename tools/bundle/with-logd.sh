@@ -48,8 +48,13 @@ exec unshare -rm --propagation private bash -c '
   done
 
   shift
-  "$@"
+  # A process that spins on a malformed driver reply fills a disk with log
+  # output, so runs are bounded and their output is capped.
+  timeout "${MOSAIC_TIMEOUT:-120}" "$@"
   status=$?
+  if [ $status -eq 124 ]; then
+    echo "with-logd: timed out after ${MOSAIC_TIMEOUT:-120}s" >&2
+  fi
 
   kill "$logd_pid" 2>/dev/null || true
   exit "$status"
