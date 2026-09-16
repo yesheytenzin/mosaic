@@ -32,17 +32,27 @@ socket by `src/binder/transport.rs`.
       parse of the flat_binder_object, which stored a bare pointer and let it go
       stale under the framework's `getService`, is gone. Verified: no SIGSEGV, no
       staleness guard, and lookups still find what is registered.
-- [~] A transaction for a *handle*, the shim forwarding to the broker, and the
-      shim as a client of the transport. **Three of the four layers are verified**
-      against a running broker with the framework in one process and
-      `tools/two-process-call.py` in another: the shim publishes what it registers
-      (`published memtrack.proxy`), a second process resolves a name the first
-      published (`handle=1 node=0x8e3600000002 owner=1`), and the broker forwards
-      the call to the owner (`the broker sent a transaction`). The owner does not
-      *serve* it: `broker_serve` never completes, so the caller waits and the
-      broker drops the connection. Off by default until that works, because a
-      local miss would otherwise wait on a socket for every service the framework
-      does not have.
+- [x] A transaction for a *handle*, the shim forwarding to the broker, and the
+      shim as a client of the transport. Verified from both ends, with the
+      framework in one process and `tools/two-process-call.py` in another:
+
+      - the shim publishes what it registers -- `published memtrack.proxy`
+      - a second process resolves a name the first published -- `handle=1
+        node=0xe53800000002 owner=1`
+      - the broker forwards the call to the owner -- `the broker sent a
+        transaction`
+      - the owner serves it and answers -- `served node ...` on one side, and a
+        Reply with status 0 on the other
+
+      The hang in the way of the last of those was the request Parcel:
+      `ipcSetDataReference` never returned, so the call was never dispatched and
+      the caller waited until the broker gave up. The bytes the sender wrote are
+      now copied into a fresh Parcel instead. On by default; `MOSAIC_BINDER_BROKER=0`
+      turns it off for a harness with no broker to talk to.
+
+      What it cannot carry yet is a binder object among a transaction's
+      arguments, which the copy does not preserve -- nothing in the boot path
+      sends one.
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
@@ -87,12 +97,14 @@ registered.
 - [x] A timeout, so a process that stops answering cannot hold a caller forever
 - [x] The daemon serves it: verified by `tools/binder-probe.py` against
       `mosaic daemon`, not only by tests
-- [ ] The C shim as a client of it
+- [x] The C shim as a client of it -- connect, `Export` on registration, `Lookup`
+      on a local miss, `Transaction` for a handle it does not own, and a reader
+      thread that serves an `Incoming` by entering `BBinder::transact` on the
+      local object. Verified from both ends against a running broker.
 
 *Gate:* a transaction between two processes works. Met over real sockets by
-`a_transaction_crosses_between_two_connections`, with the two connections served
-on separate threads; not yet used by the framework, because of A2's Java-path
-item.
+`a_transaction_crosses_between_two_connections`, and end to end by the framework's
+own process serving a call from a second one.
 
 ## A6. One privileged step ✅ (except one unverifiable gate)
 
