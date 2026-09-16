@@ -28,7 +28,17 @@ packaging step chooses. That is the price of not creating the absolute paths an
 Android image uses, which would mean a mount namespace and a return toward the
 container model this project exists to avoid.
 
-Verified so far: a Bionic `toybox` runs, and ART initializes far enough to print
-`ART version 2.1.0 x86_64` and its full option list. Executing a DEX stops at
-`Failed to get system namespace for loading libandroid.so`, which is exactly the
-linker-config gap above. See `docs/runtime-bundle.md` for the record.
+The linker configuration is the part that is easy to get wrong, and the
+consequence is worth stating in the decision rather than in a comment: the
+namespace that holds libc.so must be the one ART and libnativebridge look up by
+name. A separate namespace named `system` looks equivalent and is not, because
+ART's classloader namespace then becomes a child of an empty namespace, so every
+later `dlopen` loads a second copy of libc.so, which bionic refuses since libc
+uses initial-exec TLS. The bundle therefore declares one section covering the
+whole bundle with its default namespace visible.
+
+Verified: a Bionic `toybox` runs, ART prints `ART version 2.1.0 x86_64`, and a
+DEX executes. `am.jar` from the image starts, initialises the framework classes,
+and fails only where it needs a JNI method that `libandroid_runtime.so` would
+register — which is Phase 2 work, not a problem with this decision. See
+`docs/runtime-bundle.md` for the record and `tools/bundle/` for the tooling.

@@ -2,30 +2,37 @@
 # Build and inspect a Mosaic runtime bundle straight out of an Android system
 # image, using only debugfs. No root, no loop mounts, no container.
 #
-#   bundle.sh index   <image> <bundle>
-#   bundle.sh closure <image> <bundle> ["linker64 ..." args...]
+#   bundle.sh build   <image> <bundle>     # produce a complete, runnable bundle
+#   bundle.sh index   <image> <bundle>     # catalog the image's libraries
+#   bundle.sh closure <image> <bundle>     # fill in every missing dependency
 #   bundle.sh stage   <image> <bundle> <inode> <name> [args...]
 #   bundle.sh run     <bundle> <binary> [args...]
 #
-# This is the tool that answers "what does the runtime bundle actually contain".
-# Its output is the input to the real packaging step: the bundle is a directory
-# of Bionic and ART libraries plus a linker, a linker config, and the environment
-# a Bionic process expects, not an operating system.
+# `build` is the one that matters: it produces the artifact ADR-0010 describes,
+# and it is the input to every later phase. The other subcommands are the
+# pieces, useful when a dependency is wrong and one binary needs chasing.
 #
-# The two things that are easy to get wrong and expensive to debug:
+# Things that cost real time to discover, all encoded below:
 #
-#  * Android's /system/lib64 is mostly symlinks into /system/apex/*. Dumping a
-#    symlink yields a zero-byte file that the linker reports as
-#    "file offset for the library ... >= file size". So the index records
-#    whether an entry is a real file and only real files are staged.
+#  * /system/lib64 is mostly symlinks into /system/apex/*. Dumping a symlink
+#    yields a zero-byte file, reported by the linker as
+#    "file offset for the library ... >= file size". Only real files are staged.
 #
-#  * A dlopen failure can be silent, and the library the linker wanted is only
-#    named in an error that never appears. Walking DT_NEEDED with readelf finds
-#    those gaps first, which is the difference between one command and twenty
-#    rounds of guessing. Libraries that are dlopen'd rather than declared are
-#    seeded by name in <bundle>/seed.txt.
+#  * A dlopen failure can be silent, and the library is named only in an error
+#    that never appears. Walking DT_NEEDED with readelf finds those gaps first.
+#    Libraries that are dlopen'd rather than declared are seeded by name.
+#
+#  * The linker config must make the process's *own* namespace the one that is
+#    visible, or ART's classloader namespace is a sibling of the namespace
+#    holding libc.so, and every later dlopen tries to load a second libc.so.
+#    Bionic refuses that ("TLS symbol ... using IE access model") because libc
+#    uses initial-exec TLS. Hence one section, named system, default visible.
+#
+#  * ART reads public.libraries.txt relative to ANDROID_ROOT and preloads every
+#    entry, aborting on the first failure. That path is not exercised yet and is
+#    left disabled in the bundle (see "Known gaps" in docs/runtime-bundle.md).
 
-set -u
+set -uo pipefail
 
 cmd="${1:?subcommand}"
 
@@ -36,12 +43,12 @@ search_dirs() {
   echo /system/apex/com.android.runtime/bin
   echo /system/apex/com.android.art/lib64
   echo /system/apex/com.android.art/bin
-  echo /system/lib64
-  echo /system/lib64/hw
   echo /system/apex/com.android.i18n/lib64
-  echo /system/apex/com.android.conscrypt/lib64
   echo /system/apex/com.android.os.statsd/lib64
   echo /system/apex/com.android.adbd/lib64
+  echo /system/apex/com.android.conscrypt/lib64
+  echo /system/lib64
+  echo /system/lib64/hw
 }
 
 # Every other apex too, since libraries move between them between releases.
@@ -72,7 +79,7 @@ do_index() {
       }' "$out/index/$key.txt" >> "$out/index/all.txt"
   done
 
-  echo "index: $(wc -l < "$out/index/all.txt") entries in $out/index/all.txt"
+  echo "index: $(wc -l < "$out/index/all.txt") entries"
 }
 
 find_real() { # <bundle> <basename> -> inode of a real file
@@ -125,8 +132,8 @@ do_closure() {
       break
     fi
     if [ "$round" -gt 25 ]; then
-      echo "gave up after 25 rounds; still missing:"
-      echo "$missing" | sed 's/^/  /'
+      echo "gave up after 25 rounds; still missing:" >&2
+      echo "$missing" | sed 's/^/  /' >&2
       return 1
     fi
     for lib in $missing; do stage_one "$img" "$out" "$lib"; done
@@ -137,30 +144,33 @@ do_closure() {
 write_linker_config() { # <bundle>
   local out="$1"
   cat > "$out/ld.config.txt" <<EOF
-# Generated for a Mosaic runtime bundle. Android generates the equivalent at
-# boot with linkerconfig, from system/etc/linker.config.pb plus properties;
-# this file stands in for that, pointing at the bundle instead of /system.
+# Linker configuration for a Mosaic runtime bundle.
 #
-# The linker reads this file at startup for the process it is loading, so it
-# has to cover the linker's own path as well as the program's. A file already
-# in the bundle is left alone.
-dir.bundle = $out
+# On a device, linkerconfig generates the equivalent at boot from
+# system/etc/linker.config.pb plus system properties. This stands in for it.
+#
+# One section, named system, covering the whole bundle: the linker creates the
+# process's namespaces at startup from the section that matches the executable,
+# and the namespace holding libc.so has to be the one ART looks up by name.
+# A separate namespace named "system" looks equivalent and is not: ART's
+# classloader namespace would be its child, so every dlopen would load a second
+# libc.so, which bionic refuses because libc uses initial-exec TLS.
+#
+# visible = true is what exports the namespace to
+# android_get_exported_namespace, which is how ART and libnativebridge ask for
+# it by name.
+dir.system = $out
 
-[bundle]
-additional.namespaces = system
+[system]
 namespace.default.isolated = false
+namespace.default.visible = true
 namespace.default.search.paths = $out/lib64:$out/lib64/bionic
 namespace.default.permitted.paths = $out/lib64:$out/lib64/bionic
-namespace.system.is_exported = true
-namespace.system.search.paths = $out/lib64:$out/lib64/bionic
-namespace.system.permitted.paths = $out/lib64:$out/lib64/bionic
 EOF
 }
 
-do_stage() { # <image> <bundle> <inode> <name> [args...]
+stage_payload() { # <image> <bundle> <inode> <name>
   local img="$1" out="$2" inode="$3" name="$4"
-  shift 4
-  [ -f "$out/index/all.txt" ] || do_index "$img" "$out"
 
   debugfs -R "dump <$inode> $out/bin/$name" "$img" 2>/dev/null >/dev/null
   chmod 755 "$out/bin/$name"
@@ -179,14 +189,21 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
 
   [ -f "$out/ld.config.txt" ] || write_linker_config "$out"
 
-  # Point the binary at our linker instead of /system/bin/linker64. The bundle
+  # Point the binary at our linker instead of /system/bin/linker64: the bundle
   # is not installed at the paths an Android image uses, and the kernel looks up
   # PT_INTERP as an absolute path.
   if command -v patchelf >/dev/null; then
     patchelf --set-interpreter "$out/linker64" "$out/bin/$name"
   else
-    echo "warning: patchelf not found; run the binary as '$out/linker64 $name'" >&2
+    echo "warning: patchelf not found; run it as '$out/linker64 $name'" >&2
   fi
+}
+
+do_stage() { # <image> <bundle> <inode> <name> [args...]
+  local img="$1" out="$2" inode="$3" name="$4"
+  shift 4
+  [ -f "$out/index/all.txt" ] || do_index "$img" "$out"
+  stage_payload "$img" "$out" "$inode" "$name" || return 1
 
   local attempt
   for attempt in $(seq 1 40); do
@@ -200,6 +217,12 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
     fi
     missing=$(printf '%s\n' "$output" | sed -n 's/.*library "\([^"]*\)" not found.*/\1/p' | head -1)
     if [ -z "$missing" ]; then
+      # dalvikvm dlopens libart.so and reports a null name when that fails, so
+      # the missing library has to be inferred rather than read.
+      if printf '%s\n' "$output" | grep -q 'initialize JNI invocation API'; then
+        stage_one "$img" "$out" libart.so || return 1
+        continue
+      fi
       echo "UNRESOLVED (not a missing library):"
       printf '%s\n' "$output" | head -20
       return 1
@@ -213,20 +236,168 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
   return 1
 }
 
+# The classpath and the data files ART needs beyond the shared libraries.
+JARS=(
+  "/system/apex/com.android.art/javalib/core-oj.jar:javalib"
+  "/system/apex/com.android.art/javalib/core-libart.jar:javalib"
+  "/system/apex/com.android.i18n/javalib/core-icu4j.jar:javalib"
+  "/system/apex/com.android.art/javalib/okhttp.jar:javalib"
+  "/system/apex/com.android.art/javalib/bouncycastle.jar:javalib"
+  "/system/apex/com.android.art/javalib/apache-xml.jar:javalib"
+  "/system/framework/framework.jar:framework"
+  "/system/framework/framework-graphics.jar:framework"
+  "/system/framework/ext.jar:framework"
+  "/system/framework/ims-common.jar:framework"
+  "/system/framework/android.hidl.base-V1.0-java.jar:framework"
+  "/system/framework/android.hidl.manager-V1.0-java.jar:framework"
+)
+
+dump_path() { # <image> <source path> <destination file>
+  local img="$1" src="$2" dst="$3" name dir inode
+  name=$(basename "$src")
+  dir=$(dirname "$src")
+  inode=$(debugfs -R "ls -l $dir" "$img" 2>/dev/null \
+    | awk -v want="$name" '$1 ~ /^[0-9]+$/ && $NF == want { print $1; exit }')
+  if [ -z "$inode" ]; then
+    echo "  MISSING: $src" >&2
+    return 1
+  fi
+  debugfs -R "dump <$inode> $dst" "$img" 2>/dev/null >/dev/null
+  echo "  + $name -> $dst ($(stat -c %s "$dst") bytes)"
+}
+
+do_jars() { # <image> <bundle>
+  local img="$1" out="$2" entry src rel
+  for entry in "${JARS[@]}"; do
+    src="${entry%%:*}"
+    rel="${entry##*:}"
+    mkdir -p "$out/$rel"
+    dump_path "$img" "$src" "$out/$rel/$(basename "$src")"
+  done
+
+  # ART loads the ICU data file by name from ANDROID_I18N_ROOT.
+  mkdir -p "$out/i18n/etc/icu"
+  dump_path "$img" /system/apex/com.android.i18n/etc/icu/icudt70l.dat \
+    "$out/i18n/etc/icu/icudt70l.dat"
+
+  # The boot classpath, in the order ART expects it: core libraries, then the
+  # framework, then the optional modules.
+  {
+    local rel
+    for rel in core-oj.jar core-libart.jar core-icu4j.jar okhttp.jar \
+               bouncycastle.jar apache-xml.jar; do
+      printf '%s/javalib/%s:' "$out" "$rel"
+    done
+    for rel in framework.jar framework-graphics.jar ext.jar ims-common.jar \
+               android.hidl.base-V1.0-java.jar android.hidl.manager-V1.0-java.jar; do
+      printf '%s/framework/%s:' "$out" "$rel"
+    done
+  } | sed 's/:$//' > "$out/bootclasspath.txt"
+  echo "  + bootclasspath.txt"
+}
+
+do_build() { # <image> <bundle>
+  local img="$1" out="$2"
+  mkdir -p "$out/bin" "$out/lib64" "$out/lib64/bionic" "$out/data/dalvik-cache" "$out/tmp"
+
+  echo "indexing..."
+  do_index "$img" "$out"
+
+  echo "staging the linker and the ART binary..."
+  local dalvikvm_inode
+  dalvikvm_inode=$(debugfs -R "ls -l /system/apex/com.android.art/bin" "$img" 2>/dev/null \
+    | awk '$NF == "dalvikvm64" { print $1 }')
+  if [ -z "$dalvikvm_inode" ]; then
+    echo "could not find dalvikvm64 in the image" >&2
+    return 1
+  fi
+  stage_payload "$img" "$out" "$dalvikvm_inode" dalvikvm64 || return 1
+
+  echo "staging libraries..."
+  cat > "$out/seed.txt" <<'SEED'
+# Loaded with dlopen, so a DT_NEEDED walk cannot see them.
+libart.so
+libartbase.so
+libartpalette.so
+libartpalette-system.so
+libart-compiler.so
+libdexfile.so
+libnativebridge.so
+libnativeloader.so
+libprofile.so
+libnativehelper.so
+libicu_jni.so
+libjavacore.so
+libopenjdk.so
+libopenjdkjvm.so
+libadbconnection.so
+libsigchain.so
+SEED
+
+  # ART preloads every entry in the device's public library list, so the bundle
+  # has to carry them and their dependencies. The list itself is part of the
+  # bundle too: libnativeloader aborts when it cannot read it.
+  mkdir -p "$out/etc"
+  if dump_path "$img" /system/etc/public.libraries.txt "$out/etc/public.libraries.txt"; then
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$out/etc/public.libraries.txt" \
+      | grep -v nopreload | awk '{ print $1 }' >> "$out/seed.txt"
+  fi
+
+  do_closure "$img" "$out" || return 1
+
+  echo "staging the boot classpath and data files..."
+  do_jars "$img" "$out"
+
+  echo "writing the linker configuration and environment..."
+  write_linker_config "$out"
+  do_env "$out"
+
+  echo "checking that ART starts..."
+  local reported
+  reported=$(do_run "$out" dalvikvm64 -XXlib:"$out/lib64/libart.so" -showversion 2>&1 | head -1)
+  echo "  $reported"
+  case "$reported" in
+    *"ART version"*) echo "bundle ready at $out" ;;
+    *) echo "bundle built but ART did not report a version" >&2; return 1 ;;
+  esac
+}
+
+# The environment a Bionic process in this bundle expects. init sets these on a
+# device; without them ART cannot find its configuration or a writable data
+# directory. The broker applies the same set when it launches an app process,
+# so it lives in the bundle rather than in whichever script happens to run it.
+do_env() {
+  local out="$1"
+  cat > "$out/env.sh" <<EOF
+# Generated by tools/bundle/bundle.sh. Source this before running a Bionic
+# binary out of this bundle.
+export LD_CONFIG_FILE="$out/ld.config.txt"
+export ANDROID_ROOT="$out"
+export ANDROID_DATA="$out/data"
+export ANDROID_ART_ROOT="$out"
+export ANDROID_I18N_ROOT="$out/i18n"
+export ANDROID_TZDATA_ROOT="$out"
+export ANDROID_TMP="$out/tmp"
+EOF
+  cat > "$out/run.sh" <<'EOF'
+#!/bin/bash
+# Run a binary from this bundle: run.sh dalvikvm64 [args...]
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/env.sh"
+exec "$here/bin/$1" "${@:2}"
+EOF
+  chmod +x "$out/run.sh"
+  echo "  + env.sh, run.sh"
+}
+
 do_run() { # <bundle> <binary> [args...]
   local out="$1" name="$2"
   shift 2
-  # A Bionic process expects the environment init would have set. Without
-  # ANDROID_ROOT it cannot find its configuration; without ANDROID_DATA it has
-  # nowhere to write dalvik-cache.
-  export LD_CONFIG_FILE="$out/ld.config.txt"
-  export ANDROID_ROOT="$out" ANDROID_DATA="$out/data" ANDROID_ART_ROOT="$out" \
-         ANDROID_I18N_ROOT="$out/javalib" ANDROID_TZDATA_ROOT="$out" ANDROID_TMP="$out/tmp"
+  [ -f "$out/env.sh" ] || do_env "$out"
   mkdir -p "$out/data/dalvik-cache" "$out/tmp"
+  # shellcheck disable=SC1091
+  . "$out/env.sh"
 
-  # Let the kernel load the binary when its interpreter is inside the bundle,
-  # which is what stage does. Otherwise drive the linker by hand, which is how
-  # a binary staged by hand with debugfs still runs.
   local interp
   interp=$(readelf -p .interp "$out/bin/$name" 2>/dev/null | sed -n 's/.*\]  //p' | head -1)
   if [ -n "$interp" ] && [ -x "$interp" ]; then
@@ -236,10 +407,14 @@ do_run() { # <bundle> <binary> [args...]
   fi
 }
 
+# Run the boot classpath through dalvikvm, which is how an app process is
+# started (ADR-0012).
 case "$cmd" in
   index)   do_index "${2:?image}" "${3:?bundle}" ;;
   closure) do_closure "${2:?image}" "${3:?bundle}" ;;
   stage)   do_stage "${2:?image}" "${3:?bundle}" "${4:?inode}" "${5:?name}" "${@:6}" ;;
+  jars)    do_jars "${2:?image}" "${3:?bundle}" ;;
+  build)   do_build "${2:?image}" "${3:?bundle}" ;;
   run)     do_run "${2:?bundle}" "${3:?binary}" "${@:4}" ;;
-  *)       sed -n '2,10p' "$0"; exit 2 ;;
+  *)       sed -n '2,8p' "$0"; exit 2 ;;
 esac
