@@ -411,17 +411,17 @@ static char broker_path[256];
 static int broker_lock = 0;
 static int broker_wanted = -1;
 
-/* Talking to the broker is off unless asked for.
+/* Talking to the broker is on by default, because the broker is part of the
+ * product: it owns the names more than one process can see. MOSAIC_BINDER_BROKER=0
+ * turns it off, for a harness that has no broker to talk to.
  *
- * It is written and it builds, and it is not finished: the first run published
- * nothing and the reason is not yet found. Because a lookup that misses locally
- * would then wait on a socket for every service the framework does not have --
- * hundreds of them, five seconds each -- leaving it on by default would turn an
- * unverified path into a broken boot. MOSAIC_BINDER_BROKER=1 turns it on. */
+ * The environment is read here, on the first use, and not at load: a constructor
+ * runs before Bionic's environment is readable, which is how an earlier version
+ * of this concluded the client was disabled when it was not. */
 static int broker_enabled(void) {
     if (broker_wanted < 0) {
         const char *v = getenv("MOSAIC_BINDER_BROKER");
-        broker_wanted = (v && v[0] == '1') ? 1 : 0;
+        broker_wanted = (v && v[0] == '0') ? 0 : 1;
     }
     return broker_wanted;
 }
@@ -895,31 +895,48 @@ static void *object_for_node(ulong node) {
 static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
                          const unsigned char *data, ulong size) {
     (void)from;
+    say("android-binder:   serve: looking up the object\n");
+    say_once();
     void *object = object_for_node(node);
+    say(object ? "android-binder:   serve: object found\n"
+               : "android-binder:   serve: no object for that node\n");
+    say_once();
     int status = -1;
     unsigned char *out = 0;
     ulong out_size = 0;
 
-    if (object && parcel_ctor && parcel_dtor && binder_transact) {
+    if (object && parcel_ctor && parcel_dtor && binder_transact && parcel_write_bytes) {
         void *request = malloc(PARCEL_BYTES);
         void *reply = malloc(PARCEL_BYTES);
         if (request && reply) {
             parcel_ctor(request);
-            if (parcel_set_reference) {
-                parcel_set_reference(request, data, size, 0, 0, 0);
-                parcel_ctor(reply);
-                status = binder_transact(object, code, request, reply, flags);
-                const unsigned char *bytes = parcel_ipc_data ? parcel_ipc_data(reply) : 0;
-                ulong length = parcel_ipc_data_size ? parcel_ipc_data_size(reply) : 0;
-                if (bytes && length) {
-                    out = (unsigned char *)malloc(length ? length : 8);
-                    if (out) {
-                        __builtin_memcpy(out, bytes, length);
-                        out_size = length;
-                    }
+            /* The bytes the sender wrote are copied into a fresh Parcel rather
+             * than referenced in place. ipcSetDataReference is the other way to
+             * do it, and it is what this used first, and it did not return: the
+             * call was never dispatched and the caller waited until the broker
+             * gave up on the connection. A binder object among the arguments
+             * does not survive the copy, which is the next thing to fix here;
+             * nothing in the boot path sends one yet. */
+            if (size > 0) parcel_write_bytes(request, data, size);
+            say("android-binder:   serve: request parcel built\n");
+            say_once();
+            parcel_ctor(reply);
+            say("android-binder:   serve: calling transact\n");
+            say_once();
+            status = binder_transact(object, code, request, reply, flags);
+            say("android-binder:   serve: transact returned\n");
+            say_once();
+
+            const unsigned char *bytes = parcel_ipc_data ? parcel_ipc_data(reply) : 0;
+            ulong length = parcel_ipc_data_size ? parcel_ipc_data_size(reply) : 0;
+            if (bytes && length) {
+                out = (unsigned char *)malloc(length);
+                if (out) {
+                    __builtin_memcpy(out, bytes, length);
+                    out_size = length;
                 }
-                parcel_dtor(reply);
             }
+            parcel_dtor(reply);
             parcel_dtor(request);
         }
         free(reply);
