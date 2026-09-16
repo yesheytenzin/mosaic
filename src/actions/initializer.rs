@@ -40,7 +40,7 @@ pub fn get_vendor_type() -> String {
 
 fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
     let mut cfg = crate::config::load(&args.config);
-    let arch = crate::helpers::arch::host();
+    let arch = crate::helpers::arch::host()?;
     args.cache.insert("arch".to_string(), arch.clone());
     cfg.mosaic.insert("arch".to_string(), arch.clone());
 
@@ -177,8 +177,12 @@ fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
         .insert("system_type".to_string(), system_type.clone());
 
     let system_ota = format!(
-        "{}/{}/mosaic_{}/{}.json",
-        system_channel, rom_type, arch, system_type
+        "{}/{}/{}{}/{}.json",
+        system_channel,
+        rom_type,
+        crate::guest::OTA_PATH_PREFIX,
+        arch,
+        system_type
     );
     args.cache
         .insert("system_ota".to_string(), system_ota.clone());
@@ -202,8 +206,9 @@ fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
             continue;
         }
         let vendor_ota = format!(
-            "{}/mosaic_{}/{}.json",
+            "{}/{}{}/{}.json",
             vendor_channel,
+            crate::guest::OTA_PATH_PREFIX,
             arch,
             vendor.replace(' ', "_")
         );

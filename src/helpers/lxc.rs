@@ -49,7 +49,7 @@ fn add_node_entry(
     true
 }
 
-pub fn generate_nodes_lxc_config(args: &MosaicArgs) -> Vec<String> {
+pub fn generate_nodes_lxc_config(args: &MosaicArgs) -> anyhow::Result<Vec<String>> {
     let mut nodes = Vec::new();
 
     add_node_entry(
@@ -165,7 +165,7 @@ pub fn generate_nodes_lxc_config(args: &MosaicArgs) -> Vec<String> {
         "bind,create=file,optional 0 0",
         true,
     );
-    let (render, _) = crate::helpers::gpu::get_dri_node();
+    let (render, _) = crate::helpers::gpu::get_dri_node(args)?;
     if !render.is_empty() {
         add_node_entry(
             &mut nodes,
@@ -466,7 +466,7 @@ pub fn generate_nodes_lxc_config(args: &MosaicArgs) -> Vec<String> {
         true,
     );
 
-    nodes
+    Ok(nodes)
 }
 
 pub const LXC_APPARMOR_PROFILE: &str = "lxc-mosaic";
@@ -553,7 +553,7 @@ pub fn set_lxc_config(args: &MosaicArgs) -> anyhow::Result<()> {
         Some(true),
     )?;
 
-    let arch = crate::helpers::arch::host();
+    let arch = crate::helpers::arch::host()?;
     crate::helpers::run::user(
         args,
         &[
@@ -613,7 +613,7 @@ pub fn set_lxc_config(args: &MosaicArgs) -> anyhow::Result<()> {
         )?;
     }
 
-    let nodes = generate_nodes_lxc_config(args);
+    let nodes = generate_nodes_lxc_config(args)?;
     let tmp_path = format!("{}/config_nodes", args.work);
     std::fs::write(&tmp_path, nodes.join("\n") + "\n")?;
     crate::helpers::run::user(
@@ -777,37 +777,164 @@ pub fn setup_host_perms(args: &MosaicArgs) -> anyhow::Result<()> {
 }
 
 pub fn make_base_props(args: &MosaicArgs) -> anyhow::Result<()> {
-    // HAL detection is limited to host props and DRI nodes; full HIDL/AIDL
-    // probing lives behind the binder interfaces.
-    let mut props = Vec::new();
+    use crate::interfaces::gbinder::ServiceManager;
+    use std::collections::HashMap;
+
+    let cfg = crate::config::load(&args.config);
+    let vendor_type = cfg
+        .mosaic
+        .get("vendor_type")
+        .cloned()
+        .unwrap_or_else(|| "MAINLINE".to_string());
+    let binder_driver = cfg
+        .mosaic
+        .get("binder")
+        .cloned()
+        .unwrap_or_else(|| "binder".to_string());
+    let sm_protocol = cfg.mosaic.get("service_manager_protocol").cloned();
+    let binder_protocol = cfg.mosaic.get("binder_protocol").cloned();
+
+    // Find the HAL blobs the host ships for a hardware type.
+    let find_hal = |hardware: &str| -> String {
+        let hardware_props = [
+            format!("ro.hardware.{}", hardware),
+            "ro.hardware".to_string(),
+            "ro.product.board".to_string(),
+            "ro.arch".to_string(),
+            "ro.board.platform".to_string(),
+        ];
+        for p in hardware_props {
+            let prop = crate::helpers::props::host_get(&p);
+            if prop.is_empty() {
+                continue;
+            }
+            for lib in [
+                "/odm/lib",
+                "/odm/lib64",
+                "/vendor/lib",
+                "/vendor/lib64",
+                "/system/lib",
+                "/system/lib64",
+            ] {
+                if Path::new(&format!("{}/hw/{}.{}.so", lib, hardware, prop)).is_file() {
+                    return prop;
+                }
+            }
+        }
+        String::new()
+    };
+
+    let find_hidl = |intf: &str| -> bool {
+        if vendor_type == "MAINLINE" {
+            return false;
+        }
+        let device = format!("/dev/{}", binder_driver);
+        match ServiceManager::new(&device, sm_protocol.as_deref(), binder_protocol.as_deref()) {
+            Ok(sm) => sm.list_sync().iter().any(|s| s == intf),
+            Err(_) => false,
+        }
+    };
+
+    let find_aidl = |intf: &str| -> bool {
+        if vendor_type == "MAINLINE" {
+            return false;
+        }
+        match ServiceManager::new("/dev/binder", None, None) {
+            Ok(sm) => sm.list_sync().iter().any(|s| s == intf),
+            Err(_) => false,
+        }
+    };
+
+    let mut props: Vec<String> = Vec::new();
 
     if !Path::new("/dev/ashmem").exists() {
         props.push("sys.use_memfd=true".to_string());
     }
+
+    // Added for security reasons
     props.push("ro.adb.secure=1".to_string());
     props.push("ro.debuggable=0".to_string());
 
-    // EGL/dri logic simplified
-    let egl = crate::helpers::props::host_get("ro.hardware.egl");
-    let (dri, _) = crate::helpers::gpu::get_dri_node();
+    let mut egl = crate::helpers::props::host_get("ro.hardware.egl");
+    let (dri, _) = crate::helpers::gpu::get_dri_node(args)?;
 
-    // gralloc fallback logic
-    let mut gralloc = String::new();
+    let mut gralloc = find_hal("gralloc");
+    if gralloc.is_empty()
+        && (find_hidl("android.hardware.graphics.allocator@4.0::IAllocator/default")
+            || find_aidl("android.hardware.graphics.allocator.IAllocator/default"))
+    {
+        gralloc = "android".to_string();
+    }
     if gralloc.is_empty() {
         if !dri.is_empty() {
             gralloc = "gbm".to_string();
+            egl = "mesa".to_string();
             props.push(format!("gralloc.gbm.device={}", dri));
         } else {
             gralloc = "default".to_string();
-            props.push("debug.stagefright.ccodec=0".to_string());
+            egl = "swiftshader".to_string();
         }
+        props.push("debug.stagefright.ccodec=0".to_string());
     }
     props.push(format!("ro.hardware.gralloc={}", gralloc));
+
     if !egl.is_empty() {
         props.push(format!("ro.hardware.egl={}", egl));
     }
 
-    let cfg = crate::config::load(&args.config);
+    let mut media_profiles = crate::helpers::props::host_get("media.settings.xml");
+    if !media_profiles.is_empty() {
+        media_profiles = media_profiles.replace("vendor/", "vendor_extra/");
+        media_profiles = media_profiles.replace("odm/", "odm_extra/");
+        props.push(format!("media.settings.xml={}", media_profiles));
+    }
+
+    let ccodec = crate::helpers::props::host_get("debug.stagefright.ccodec");
+    if !ccodec.is_empty() {
+        props.push(format!("debug.stagefright.ccodec={}", ccodec));
+    }
+
+    let mut ext_library = crate::helpers::props::host_get("ro.vendor.extension_library");
+    if !ext_library.is_empty() {
+        ext_library = ext_library.replace("vendor/", "vendor_extra/");
+        ext_library = ext_library.replace("odm/", "odm_extra/");
+        props.push(format!("ro.vendor.extension_library={}", ext_library));
+    }
+
+    let mut vulkan = find_hal("vulkan");
+    if vulkan.is_empty() && !dri.is_empty() {
+        let base = Path::new(&dri)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        vulkan = crate::helpers::gpu::get_vulkan_driver(args, &base);
+    }
+    if !vulkan.is_empty() {
+        props.push(format!("ro.hardware.vulkan={}", vulkan));
+    }
+
+    let treble = crate::helpers::props::host_get("ro.treble.enabled");
+    if treble != "true" {
+        let camera = find_hal("camera");
+        if !camera.is_empty() {
+            props.push(format!("ro.hardware.camera={}", camera));
+        } else if vendor_type == "MAINLINE" {
+            props.push("ro.hardware.camera=v4l2".to_string());
+        }
+    }
+
+    let mut opengles = crate::helpers::props::host_get("ro.opengles.version");
+    if opengles.is_empty() {
+        opengles = "196610".to_string();
+    }
+    props.push(format!("ro.opengles.version={}", opengles));
+
+    // Some Mali devices require ro.vendor.arm.egl.* props from the host.
+    let arm_egl: HashMap<String, String> = crate::helpers::props::host_list("ro.vendor.arm.egl.");
+    for (k, v) in arm_egl {
+        props.push(format!("{}={}", k, v));
+    }
+
     let images_path = cfg
         .mosaic
         .get("images_path")
@@ -830,16 +957,47 @@ pub fn make_base_props(args: &MosaicArgs) -> anyhow::Result<()> {
         crate::config::VERSION
     ));
 
-    let vendor_type = cfg
-        .mosaic
-        .get("vendor_type")
-        .cloned()
-        .unwrap_or_else(|| "MAINLINE".to_string());
     if vendor_type == "MAINLINE" {
         props.push("ro.vndk.lite=true".to_string());
     }
 
-    // Append properties overrides
+    for product in ["brand", "device", "manufacturer", "model", "name"] {
+        let prop_product =
+            crate::helpers::props::host_get(&format!("ro.product.vendor.{}", product));
+        if !prop_product.is_empty() {
+            props.push(format!(
+                "{}{}={}",
+                crate::guest::PRODUCT_PREFIX,
+                product,
+                prop_product
+            ));
+        } else {
+            let dt = format!("/proc/device-tree/{}", product);
+            if Path::new(&dt).is_file() {
+                if let Ok(raw) = std::fs::read(&dt) {
+                    let value = String::from_utf8_lossy(&raw)
+                        .trim_matches(char::from(0))
+                        .trim()
+                        .to_string();
+                    if !value.is_empty() {
+                        props.push(format!(
+                            "{}{}={}",
+                            crate::guest::PRODUCT_PREFIX,
+                            product,
+                            value
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let prop_fp = crate::helpers::props::host_get("ro.vendor.build.fingerprint");
+    if !prop_fp.is_empty() {
+        props.push(format!("ro.build.fingerprint={}", prop_fp));
+    }
+
+    // Append or override with the [properties] section of the config.
     for (k, v) in &cfg.properties {
         props.retain(|p| !p.starts_with(&format!("{}=", k)));
         props.push(format!("{}={}", k, v));

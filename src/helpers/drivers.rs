@@ -24,6 +24,67 @@ pub fn is_binderfs_loaded() -> bool {
     false
 }
 
+/// Allocate binder device nodes through the binderfs control device. Mirrors
+/// the BINDER_CTL_ADD ioctl Waydroid issues, which `ln -s` alone cannot do.
+pub fn alloc_binder_nodes(nodes: &[&str]) {
+    // linux/androids/binderfs.h and linux/ioctl.h
+    const NRBITS: u64 = 8;
+    const TYPEBITS: u64 = 8;
+    const SIZEBITS: u64 = 14;
+    const NRSHIFT: u64 = 0;
+    const TYPESHIFT: u64 = NRSHIFT + NRBITS;
+    const SIZESHIFT: u64 = TYPESHIFT + TYPEBITS;
+    const DIRSHIFT: u64 = SIZESHIFT + SIZEBITS;
+    const WRITE: u64 = 0x1;
+    const READ: u64 = 0x2;
+
+    const fn ioc(direction: u64, ty: u64, nr: u64, size: u64) -> u64 {
+        (direction << DIRSHIFT) | (ty << TYPESHIFT) | (nr << NRSHIFT) | (size << SIZESHIFT)
+    }
+    const fn iowr(ty: u64, nr: u64, size: u64) -> u64 {
+        ioc(READ | WRITE, ty, nr, size)
+    }
+
+    #[repr(C)]
+    struct BinderfsDevice {
+        name: [libc::c_char; 256],
+        major: u32,
+        minor: u32,
+    }
+
+    const BINDER_CTL_ADD: u64 = iowr(98, 1, std::mem::size_of::<BinderfsDevice>() as u64);
+
+    let Ok(control) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/binderfs/binder-control")
+    else {
+        return;
+    };
+    use std::os::unix::io::AsRawFd;
+
+    for node in nodes {
+        let bytes = node.as_bytes();
+        if bytes.len() >= 256 {
+            continue;
+        }
+        // SAFETY: name is a fixed 256-byte array, and we only copy a shorter
+        // name into it. The ioctl expects exactly this struct layout.
+        let mut dev: BinderfsDevice = unsafe { std::mem::zeroed() };
+        for (i, b) in bytes.iter().enumerate() {
+            dev.name[i] = *b as libc::c_char;
+        }
+        // EEXIST is expected when the node is already present.
+        unsafe {
+            libc::ioctl(
+                control.as_raw_fd(),
+                BINDER_CTL_ADD,
+                &dev as *const BinderfsDevice,
+            );
+        }
+    }
+}
+
 pub fn probe_binder_driver(args: &MosaicArgs) -> anyhow::Result<()> {
     let mut needed = Vec::new();
     let mut has_binder = false;
@@ -98,7 +159,8 @@ pub fn probe_binder_driver(args: &MosaicArgs) -> anyhow::Result<()> {
             false,
             Some(false),
         )?;
-        // alloc binder nodes via ioctl would require unsafe FFI; for now, try symlink
+        // Create the requested binder device nodes through binderfs.
+        alloc_binder_nodes(&needed);
         if let Ok(entries) = std::fs::read_dir("/dev/binderfs") {
             let nodes: Vec<String> = entries
                 .filter_map(|e| e.ok())

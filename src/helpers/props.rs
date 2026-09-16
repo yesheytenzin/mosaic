@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use crate::args::MosaicArgs;
 use std::collections::HashMap;
 
 pub fn host_get(key: &str) -> String {
@@ -32,6 +33,18 @@ pub fn host_list(prefix: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+pub fn host_set(args: &MosaicArgs, prop: &str, value: &str) {
+    if which::which("setprop").is_ok() {
+        let _ = crate::helpers::run::user(
+            args,
+            &["setprop".to_string(), prop.to_string(), value.to_string()],
+            "log",
+            false,
+            Some(true),
+        );
+    }
 }
 
 fn parse_getprop_line(line: &str) -> Option<(String, String)> {
