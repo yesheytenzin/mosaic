@@ -7,31 +7,45 @@ running something, because that is how every phase so far has been settled.
 Working today: the runtime bundle builds from an image in one command; ART runs a
 DEX and AOT-compiles a real app; the framework starts and `SystemServer` completes
 `PlatformCompat`, `ReadingSystemConfig`, `startBootstrapServices` and
-`StartWatchdog`; properties are read and written; a userspace binder answers
-`checkService`, `getService` and `addService` at the `libbinder` API level; 151 JNI
+`StartWatchdog`; properties are read and written; a userspace binder with per-process handle
+tables, reference counting, descriptor passing and a broker transport is served by
+the daemon (reached by the broker's own callers, not yet by the framework); 151 JNI
 registrars resolve; the shim presents Android's absolute paths.
 
 ## A. The critical path, next
 
 1. **Font map** ✅ — `stat`/`access` were not redirected, so the font parser could
    not see the fonts. Fixed; `SystemServer` moved on.
-2. **Binder registry.** Store the binder `addService` carries, hand it back on
-   `getService`, route a transaction to a handle by calling the stored
-   `BBinder::transact` (exported). Also `listServices`, `isDeclared`, and
-   `BpBinder`'s handle offset, which is still unknown because only handle 0 has
-   been reachable. *Gate:* a service registered by name is found by name and a
-   transaction reaches it.
-3. **Reference counting and lifetime.** `BC_ACQUIRE`/`RELEASE`/`INCREFS`/`DECREFS`
-   and death notification, so a held binder stays alive. *Gate:* a binder survives
-   while referenced and is cleaned up after.
-4. **Descriptor passing.** `SCM_RIGHTS` for `Parcel` file descriptors. *Gate:* a
-   transaction carrying an fd arrives intact.
-5. **Broker transport.** Move binder out of the in-process shim to the broker over
-   its socket (ADR-0011, ADR-0014), with per-process handle tables. *Gate:* a
-   transaction between two processes works.
-6. **One privileged step (ADR-0013).** `LimitNICE` on the broker's unit, the
-   property area, and the paths a product presents instead of redirecting.
-   *Gate:* `Process.setThreadPriority` works without the harness stand-ins.
+2. **Binder registry.** The authority is `src/binder/broker.rs`, served over the
+   socket by `src/binder/transport.rs`, and it is exercised: a name resolves to a
+   node and an owner, handles are per process, a transaction to another process is
+   forwarded and its answer relayed, and a process cannot publish a node that
+   belongs to another pid. What is *not* done is the shim forwarding to it, and
+   behind that a harder fact: the Java path cannot reach any of it, because
+   `BinderProxy.transact` resolves inside libbinder and no preload can see it.
+   Those calls land at `ioctl`, whose framing is now settled (see `docs/binder.md`)
+   and whose reply is the next thing to write. *Gate:* a service registered by
+   name is found by name and a transaction reaches it -- met for the broker's own
+   callers, not yet for a Java one.
+3. **Reference counting and lifetime** ✅ — `src/binder/table.rs` holds the counts
+   and `src/binder/broker.rs` the accounts, with `Acquire`/`Release`/`IncRefs`/
+   `DecRefs` and `LinkToDeath`/`UnlinkToDeath` on the wire. A process that goes
+   away takes its nodes out of every table and tells whoever asked. *Gate:* met.
+4. **Descriptor passing** ✅ — `SCM_RIGHTS` in the codec, and a descriptor
+   survives a forwarded transaction, which is the case that matters: the broker
+   hands it on rather than copying bytes. *Gate:* met.
+5. **Broker transport** ✅ — the data plane is a framed, self-describing protocol
+   on the broker's own socket, told apart from the control plane by its magic; one
+   thread per connection; per-process handle tables; a transaction for another
+   process is sent as `Incoming` and the answer relayed. `tools/binder-probe.py`
+   checks it against the shipped daemon, not only against tests. *Gate:* met, with
+   two connections served on separate threads. What is left is the shim as a
+   client of it.
+6. **One privileged step (ADR-0013)** ✅ except the gate — `LimitNICE` on the
+   broker's unit *and* the system-side grant to the user manager, without which
+   the unit's line is silently a no-op, plus a `tmpfiles.d` entry for the one path
+   Bionic compiles in. A test keeps the two limits from drifting. *Gate:* not
+   verifiable here; `RLIMIT_NICE` cannot be raised from a user namespace.
 7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
    `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
    (empty, and says so) because `SystemConfig` treats its absence as fatal.
@@ -45,50 +59,40 @@ registrars resolve; the shim presents Android's absolute paths.
 ### Where the system server is now
 
 `startBootstrapServices` starts `StartFileIntegrityService`, `StartInstaller`,
-`StartIStatsService`, `StartPowerStatsService`, `DeviceIdentifiersPolicyService`
-and `UriGrantsManagerService`. The next wall is HAL registration: the framework
-registers its HAL implementations with `hwservicemanager` (HIDL, over
-`/dev/hwbinder`) and with `servicemanager` (AIDL), and neither answers --
-`defaultServiceManager() is null` for HIDL, and the registrations fail with -38
-and -129, after which statsd aborts the process.
+`StartIStatsService`, `StartPowerStatsService`, `StartActivityManager`,
+`StartPowerManager`, `StartThermalManager`, `StartIncrementalService`,
+`StartDataLoaderManagerService` and `StartWatchdog`, and then stops:
 
-So the next work is a second device: `/dev/hwbinder` needs its own service
-manager in the shim, the way `/dev/binder` already has one.
+```
+AppOps: AppOpsService published
+SystemServiceRegistry: No service published for: appops
+	at com.android.server.power.PowerManagerService$Injector.createAppOpsManager
+java.lang.NullPointerException: ... PowerManager.newWakeLock ... on a null object
+	at com.android.server.wm.ActivityTaskSupervisor.initPowerManagement
+System: ************ Failure starting system services
+```
 
-Two things were learned trying to get there, both worth keeping:
+`PowerManagerService`'s constructor asks for the app-ops service, does not get it,
+the service never registers, and `initPowerManagement` then dereferences a null
+power manager. The app-ops service *was* published a moment earlier: the call was
+made, and lost.
 
-- `name_is_binder` in the shim compared the last path segment to `binder`
-  exactly, so `/dev/hwbinder` and `/dev/vndbinder` were not recognised and their
-  `ProcessState` never opened. It matches the family now.
-- The service manager's handle is **12**, not 0, in this build: every
-  IServiceManager call arrives with handle 12. That is why the shim answers by
-  code rather than by handle, and it is what the handle will mean once there is a
-  second binder to tell apart.
+### Why it was lost, and what to do about it
 
-### What can and cannot be interposed
+The Java path is `BinderProxy.transact` -> `IBinder::transact` ->
+`BpBinder::transact` -> `IPCThreadState::transact`, all inside libbinder, so every
+one of them is a local bind and no preload can interpose them. The API-level
+interposition that made the **AIDL** path work -- `AServiceManager_addService`, a
+plain C function exported for other libraries -- has no equivalent on the Java
+path. What the Java path does reach is `ioctl`, and there the shim answers a read
+with an empty parcel, which libbinder reads as a null binder. That is why every
+service looks absent, and it is not a registry problem at all.
 
-The AIDL path resolved this, and the rule is worth stating once:
-
-**Android builds with `-fno-semantic-interposition`.** A C++ method that libbinder
-calls *inside itself* binds locally and a preload never sees it -- which is why the
-AIDL proxy's `transact` never reached the interposed method, while the framework's
-Java binder calls did, those coming from `libandroid_runtime`, a different library.
-A plain C function that libbinder_ndk exports *for other libraries* is reachable,
-which is what `AServiceManager_addService` is.
-
-Interposing that pair -- registration acknowledged, lookup answering null -- let the
-framework past the HAL registration abort, and `startBootstrapServices` now starts
-`StartActivityManager`, `StartPowerManager`, `StartThermalManager`,
-`StartIncrementalService` and the rest.
-
-### The wall after it, which is A5
-
-`KernelWakelockReader.waitForSuspendControlService` gets a null service and
-dereferences it. The suspend control HAL is a *native daemon* on a device, and
-there is no way to answer for it in-process: the framework now needs genuinely
-remote services, which is exactly what the broker and its transport provide. A3,
-A4 and A5 stop being deferred at this point -- they are the next thing, not a
-later one.
+The command stream at that `ioctl` was the thing four attempts failed to decode.
+It is now decoded: the `BC_*`/`BR_*` constants are `_IOW('c', nr, size)`
+encodings, so each command word carries its own argument length and the stream is
+self-describing. `docs/binder.md` has the two observed streams decoded byte for
+byte and the shape of the reply.
 
 ## B. `system_server` to completion
 

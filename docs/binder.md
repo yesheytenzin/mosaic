@@ -189,29 +189,61 @@ handle by calling the stored `BBinder::transact`, which is exported too. That is
 complete minimal userspace binder, and it is what makes the framework's own
 services reachable.
 
-## Where it stands
+## The framing, settled
 
-The shim answers the version, threads, spam-detection and mapping calls, so
-`ProcessState::self()` succeeds and the framework gets a real `IBinder` for the
-context manager. It parses `BINDER_WRITE_READ` and fails fast on a stream it does
-not understand, which keeps a mistake in Java rather than in a spin.
+Every `BC_*` and `BR_*` constant in `binder.h` is an `_IO`-style encoding, not a
+small integer:
 
-The command stream's exact framing is **not yet settled**, and that is the next
-thing to do. Every write buffer observed begins with bytes that are not a command
-word:
-
-```
-write_size=68  [00 63 40 40 00 00 00 00 00 00 00 00 ... 47 4e 50 5f]
-write_size=8   [05 63 04 40 00 00 00 00]
+```c
+#define BC_TRANSACTION  _IOW('c', 0, struct binder_transaction_data)
+#define BC_DECREFS      _IOW('c', 5, __u32)
+#define BR_REPLY        _IOR('c', 1, struct binder_transaction_data)
 ```
 
-The first four bytes on the two calls differ, so it is not a fixed prefix, and the
-three bytes after `00` on the first line read like the low bytes of a pointer into
-a `0x40xxxxxx` mapping. The next step is to read the layout out of libbinder
-rather than infer it from bytes: `IPCThreadState::talkWithDriver` and how it sets
-`write_buffer` from its outgoing `Parcel`, and what `Parcel::data()` and
-`dataSize()` count. `tools/binder-shim/probe.c` prints the first bytes of every
-write buffer for exactly this.
+So the command word carries its own argument length in bits 16..29, and the
+stream is self-describing: read a word, take that many bytes, repeat. Earlier
+attempts read the word as a command *number*, which is why the bytes "looked like
+they were not a command word" -- they were, and the two are decodable exactly:
+
+```
+write_size=68  [00 63 40 40 ...]  == 0x40406300 == _IOW('c', 0, 64) == BC_TRANSACTION
+                                  68 == 4 + 64, the size field
+write_size=8   [05 63 04 40 00 00 00 00] == 0x40046305 == _IOW('c', 5, 4) == BC_DECREFS
+                                  8 == 4 + 4
+```
+
+The trailing `47 4e 50 5f` that looked like text is the last four bytes of the
+64-byte `binder_transaction_data`, which is the size the constant itself declares.
+The two calls differ because they *are* different commands; that was never a
+puzzle.
+
+What that leaves is ordinary work rather than a mystery: parse the stream, dispatch
+`BC_TRANSACTION` for handle 0 through the service registry that
+`tools/binder-shim/android-binder.c` already implements at the parcel level, and
+answer with `BR_REPLY` (0x80406301) plus a `binder_transaction_data` whose
+`data.ptr.buffer` addresses a reply parcel this side allocates. The framework
+returns that buffer with `BC_FREE_BUFFER`, which is where it gets freed, and
+`read_consumed` has to be set to what was written.
+
+That is the only way the *Java* path can work. Its calls are
+`BinderProxy.transact` -> `IBinder::transact` -> `BpBinder::transact` ->
+`IPCThreadState::transact`, all inside libbinder, so every one of them is a local
+bind under `-fno-semantic-interposition` and no preload can see them; the API-level
+interposition that made the AIDL path work cannot reach it. What the Java path does
+reach is `ioctl`, and that is why the framework reports every service as missing:
+
+```
+SystemServiceRegistry: No service published for: appops
+java.os.ServiceManager$ServiceNotFoundException
+	at com.android.server.power.PowerManagerService$Injector.createAppOpsManager
+	at com.android.server.power.PowerManagerService.<init>
+System: ************ Failure starting system services
+```
+
+`AppOpsService published` appears earlier in the same log, so the registration was
+made and then lost: the publication is a Java call, so it went to the driver, where
+the shim answered a read with an empty parcel, which libbinder reads as a null
+binder. The registry was never involved.
 
 An early attempt at answering the transaction produced a process that spun until
 it filled a 5 GB log, because libbinder waits for a reply that never comes.

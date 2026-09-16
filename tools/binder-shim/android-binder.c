@@ -228,29 +228,36 @@ int _ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j(
  * interposed method while the framework's Java binder calls did -- those come from
  * libandroid_runtime, a different library.
  *
- * Registering is acknowledged; looking up answers nothing, which is the truth
- * while the only registered things are in this process. */
+ * The binder that comes back out is the pointer that went in, which is sound while
+ * registration and lookup happen in one process: it is the same object, and
+ * `asInterface` finds its local implementation without a transaction. Discarding it
+ * on the way out is what left `memtrack.proxy` registered but unreachable.
+ */
 static int logged_registrations = 0;
 
 int AServiceManager_addService(void *binder, const char *instance) {
-    (void)binder;
+    if (!instance) return 0; /* STATUS_OK: nothing to remember, nothing to say */
+    remember(instance, binder, 0);
     if (logged_registrations < 40) {
         logged_registrations++;
         say("android-binder: AIDL register ");
-        say(instance ? instance : "(null)");
+        say(instance);
+        say(" -> ");
+        say_dec((long)(unsigned long)binder);
         say("\n");
     }
     return 0; /* STATUS_OK */
 }
 
 void *AServiceManager_getService(const char *instance) {
+    void *binder = instance ? lookup(instance) : 0;
     if (logged_registrations < 40) {
         logged_registrations++;
         say("android-binder: AIDL lookup ");
         say(instance ? instance : "(null)");
-        say("\n");
+        say(binder ? " found\n" : " not found\n");
     }
-    return 0; /* not found, as an absent service should be */
+    return binder;
 }
 
 static int handle_transaction(int handle, uint32 code, const void *data, void *reply, uint32 flags) {
@@ -293,6 +300,10 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
                     say_dec((long)type);
                     say(")\n");
                 }
+            } else {
+                say("android-binder: addService ");
+                say(name);
+                say(" carried no readable binder object\n");
             }
         }
         if (parcel_write_int32) parcel_write_int32(reply, 0);
