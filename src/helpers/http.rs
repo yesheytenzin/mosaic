@@ -120,6 +120,15 @@ pub async fn download(
     Ok(Some(path))
 }
 
+/// sha256 of a file, used to verify a downloaded runtime bundle against the
+/// hash published next to it.
+pub fn sha256_file(path: &str) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub fn download_blocking(
     args: &MosaicArgs,
     url: &str,

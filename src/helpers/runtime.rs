@@ -44,7 +44,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn block_on_drives_tokio_timers_from_inside_a_runtime() {
         // Proves the runtime's driver keeps running while we block, which is
-        // what lets reqwest and zbus futures complete here.
+        // what lets reqwest and other async futures complete here.
         let value = block_on(async {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             "timer fired"

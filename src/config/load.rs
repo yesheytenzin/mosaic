@@ -1,26 +1,44 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use crate::config::{channels_defaults, CHANNELS_CONFIG_KEYS, CONFIG_KEYS};
+use crate::config::{Defaults, CONFIG_KEYS};
 
 #[derive(Debug, Clone)]
 pub struct MosaicConfig {
     pub mosaic: HashMap<String, String>,
-    pub properties: HashMap<String, String>,
 }
 
 impl MosaicConfig {
-    pub fn get(&self, section: &str, key: &str) -> Option<&String> {
-        match section {
-            "mosaic" => self.mosaic.get(key),
-            "properties" => self.properties.get(key),
-            _ => None,
-        }
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.mosaic.get(key)
+    }
+
+    pub fn bundle_version(&self) -> String {
+        self.mosaic
+            .get("bundle_version")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string())
+    }
+
+    pub fn uid_range(&self) -> (u32, u32) {
+        let defaults = Defaults::new();
+        let start = self
+            .mosaic
+            .get("uid_range_start")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.uid_range_start);
+        let end = self
+            .mosaic
+            .get("uid_range_end")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.uid_range_end);
+        (start, end)
     }
 }
 
+/// Minimal INI reader. Kept hand rolled so quoting and comment behaviour match
+/// the config files the project has always written.
 fn parse_ini(path: &str) -> HashMap<String, HashMap<String, String>> {
     let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
     let content = match std::fs::read_to_string(path) {
@@ -38,145 +56,75 @@ fn parse_ini(path: &str) -> HashMap<String, HashMap<String, String>> {
             result.entry(current_section.clone()).or_default();
             continue;
         }
-        if let Some(eq) = line.find('=') {
-            let key = line[..eq].trim().to_string();
-            let value = line[eq + 1..].trim().to_string();
-            if current_section.is_empty() {
-                continue;
-            }
+        if current_section.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=').or_else(|| line.split_once(':')) {
             result
                 .entry(current_section.clone())
                 .or_default()
-                .insert(key, value);
-        } else if let Some(colon) = line.find(':') {
-            let key = line[..colon].trim().to_string();
-            let value = line[colon + 1..].trim().to_string();
-            if current_section.is_empty() {
-                continue;
-            }
-            result
-                .entry(current_section.clone())
-                .or_default()
-                .insert(key, value);
+                .insert(key.trim().to_string(), value.trim().to_string());
         }
     }
     result
 }
 
 pub fn load(config_path: &str) -> MosaicConfig {
-    let defaults = crate::config::Defaults::new();
+    let defaults = Defaults::new();
     let mut mosaic = HashMap::new();
-    let mut properties = HashMap::new();
 
     let ini = parse_ini(config_path);
-
     if let Some(section) = ini.get("mosaic") {
         for (k, v) in section {
             mosaic.insert(k.clone(), v.clone());
         }
     }
 
-    // Apply defaults for missing config_keys
     for key in CONFIG_KEYS {
         if !mosaic.contains_key(*key) {
-            let default_val = match *key {
-                "arch" => defaults.arch.clone(),
-                "images_path" => defaults.images_path.clone(),
-                "vendor_type" => defaults.vendor_type.clone(),
-                "system_datetime" => defaults.system_datetime.clone(),
-                "vendor_datetime" => defaults.vendor_datetime.clone(),
-                "suspend_action" => defaults.suspend_action.clone(),
-                "mount_overlays" => defaults.mount_overlays.clone(),
-                "auto_adb" => defaults.auto_adb.clone(),
+            let value = match *key {
+                "bundle_version" => defaults.bundle_version.clone(),
+                "uid_range_start" => defaults.uid_range_start.to_string(),
+                "uid_range_end" => defaults.uid_range_end.to_string(),
                 _ => continue,
             };
-            mosaic.insert(key.to_string(), default_val);
+            mosaic.insert(key.to_string(), value);
         }
     }
 
-    // Remove unconfigurable keys that were saved in old configs
-    let all_default_keys = [
-        "arch",
-        "work",
-        "vendor_type",
-        "system_datetime",
-        "vendor_datetime",
-        "preinstalled_images_paths",
-        "suspend_action",
-        "mount_overlays",
-        "auto_adb",
-        "container_xdg_runtime_dir",
-        "container_wayland_display",
-        "images_path",
-        "rootfs",
-        "overlay",
-        "overlay_rw",
-        "overlay_work",
-        "data",
-        "lxc",
-        "host_perms",
-        "container_pulse_runtime_path",
-    ];
-    for key in all_default_keys {
-        if !CONFIG_KEYS.contains(&key) && mosaic.contains_key(key) {
-            log::debug!(
-                "Ignored unconfigurable and possibly outdated default value from config: {}",
-                mosaic[key]
-            );
-            mosaic.remove(key);
-        }
+    // Drop anything that is not a current key, so an old file cannot resurrect
+    // container-era settings.
+    let stale: Vec<String> = mosaic
+        .keys()
+        .filter(|k| !CONFIG_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for key in stale {
+        mosaic.remove(&key);
     }
 
-    if let Some(section) = ini.get("properties") {
-        for (k, v) in section {
-            properties.insert(k.clone(), v.clone());
-        }
-    }
-
-    MosaicConfig { mosaic, properties }
+    MosaicConfig { mosaic }
 }
 
+/// Kept as an alias so callers can read the bundle channel without a second
+/// config file. The bundle replaces the old image channels.
 #[derive(Debug, Clone)]
 pub struct ChannelsConfig {
     pub channels: HashMap<String, String>,
 }
 
-pub fn load_channels() -> ChannelsConfig {
-    let defaults = channels_defaults();
-    let config_path = defaults.get("config_path").unwrap().clone();
-    let mut channels = HashMap::new();
-
-    let ini = if Path::new(&config_path).is_file() {
-        parse_ini(&config_path)
-    } else {
-        HashMap::new()
-    };
-
-    if let Some(section) = ini.get("channels") {
-        for (k, v) in section {
-            channels.insert(k.clone(), v.clone());
-        }
+impl ChannelsConfig {
+    pub fn new() -> Self {
+        let mut channels = HashMap::new();
+        channels.insert("bundle_channel".to_string(), Defaults::new().bundle_channel);
+        Self { channels }
     }
+}
 
-    for key in CHANNELS_CONFIG_KEYS {
-        if !channels.contains_key(*key) {
-            if let Some(v) = defaults.get(*key) {
-                channels.insert(key.to_string(), v.clone());
-            }
-        }
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self::new()
     }
-
-    for k in defaults.keys() {
-        if !CHANNELS_CONFIG_KEYS.contains(&k.as_str()) && channels.contains_key(k) {
-            log::debug!(
-                "Ignored unconfigurable and possibly outdated default value from config: {}",
-                channels[k]
-            );
-            channels.remove(k);
-        }
-    }
-
-    ChannelsConfig { channels }
 }
 
 #[cfg(test)]
@@ -187,42 +135,31 @@ mod tests {
     #[test]
     fn load_missing_file_returns_defaults() {
         let cfg = load("/nonexistent/path/mosaic.cfg");
-        assert_eq!(cfg.mosaic.get("arch").unwrap(), "arm64");
-        assert_eq!(cfg.mosaic.get("system_datetime").unwrap(), "0");
-        assert!(cfg.properties.is_empty());
+        assert_eq!(cfg.bundle_version(), "0");
+        assert_eq!(cfg.uid_range(), (5000, 5999));
     }
 
     #[test]
-    fn load_channels_missing_file_returns_defaults() {
-        let cfg = load_channels();
-        assert_eq!(
-            cfg.channels.get("system_channel").unwrap(),
-            "https://ota.waydro.id/system"
-        );
-        assert_eq!(cfg.channels.get("rom_type").unwrap(), "lineage");
-    }
-
-    #[test]
-    fn load_preserves_properties_section() {
+    fn load_reads_overrides() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(tmp, "[mosaic]").unwrap();
-        writeln!(tmp, "arch = x86_64").unwrap();
-        writeln!(tmp, "[properties]").unwrap();
-        writeln!(tmp, "ro.sf.lcd_density = 320").unwrap();
+        writeln!(tmp, "bundle_version = 42").unwrap();
+        writeln!(tmp, "uid_range_start = 6000").unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
         let cfg = load(&path);
-        assert_eq!(cfg.mosaic.get("arch").unwrap(), "x86_64");
-        assert_eq!(cfg.properties.get("ro.sf.lcd_density").unwrap(), "320");
+        assert_eq!(cfg.bundle_version(), "42");
+        assert_eq!(cfg.uid_range().0, 6000);
     }
 
     #[test]
-    fn load_removes_unconfigurable_keys() {
+    fn load_drops_stale_container_keys() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(tmp, "[mosaic]").unwrap();
-        writeln!(tmp, "arch = arm64").unwrap();
-        writeln!(tmp, "work = /custom/work").unwrap();
+        writeln!(tmp, "rootfs = /var/lib/mosaic/rootfs").unwrap();
+        writeln!(tmp, "mount_overlays = True").unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
         let cfg = load(&path);
-        assert!(!cfg.mosaic.contains_key("work"));
+        assert!(cfg.get("rootfs").is_none());
+        assert!(cfg.get("mount_overlays").is_none());
     }
 }
