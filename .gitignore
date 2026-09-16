@@ -40,3 +40,6 @@ tools/binder-shim/out/
 # Generated launcher artifacts
 tools/launcher/out/
 tools/launcher/registrars.inc
+
+# A session checkpoint, not project documentation.
+docs.md
