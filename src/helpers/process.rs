@@ -2,33 +2,27 @@
 
 use crate::args::MosaicArgs;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-static SUDO_TIMER_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 /// Recursively kill a pid and its children, so a timeout does not leave
 /// grandchildren (sh -c, helpers) running.
-pub fn kill_process_tree(args: &MosaicArgs, pid: u32, ppids: &[(String, String)], sudo: bool) {
-    let cmd = vec!["kill".to_string(), "-9".to_string(), pid.to_string()];
-    if sudo {
-        let _ = crate::helpers::run::root(args, &cmd, "log", false, Some(false));
-    } else {
-        let _ = crate::helpers::run::user(args, &cmd, "log", false, Some(false));
-    }
+pub fn kill_process_tree(pid: u32, ppids: &[(String, String)]) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
 
     for (child_pid, child_ppid) in ppids {
         if *child_ppid == pid.to_string() {
             if let Ok(child) = child_pid.parse::<u32>() {
-                kill_process_tree(args, child, ppids, sudo);
+                kill_process_tree(child, ppids);
             }
         }
     }
 }
 
 /// Kill a command and everything it spawned.
-pub fn kill_command(args: &MosaicArgs, pid: u32, sudo: bool) {
+pub fn kill_command(pid: u32) {
     let mut ppids = Vec::new();
     if let Ok(out) = std::process::Command::new("ps")
         .args(["-e", "-o", "pid,ppid"])
@@ -43,18 +37,7 @@ pub fn kill_command(args: &MosaicArgs, pid: u32, sudo: bool) {
             ppids.push((items[0].to_string(), items[1].to_string()));
         }
     }
-    kill_process_tree(args, pid, &ppids, sudo);
-}
-
-/// Keep the sudo timestamp fresh so the password is only asked once.
-pub fn sudo_timer_start() {
-    if SUDO_TIMER_ACTIVE.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    std::thread::spawn(|| loop {
-        let _ = std::process::Command::new("sudo").arg("-v").status();
-        std::thread::sleep(Duration::from_secs(60));
-    });
+    kill_process_tree(pid, &ppids);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +74,6 @@ pub fn core(
     output: &str,
     output_return: bool,
     check: bool,
-    sudo: bool,
     disable_timeout: bool,
 ) -> anyhow::Result<Option<String>> {
     let mode = OutputMode::from_str(output)?;
@@ -101,10 +83,6 @@ pub fn core(
     }
     if mode == OutputMode::Tui && output_return {
         anyhow::bail!("Can't use output_return with output: tui");
-    }
-
-    if args.sudo_timer && sudo {
-        sudo_timer_start();
     }
 
     log::debug!("{}", log_message);
@@ -290,7 +268,7 @@ pub fn core(
                         args.timeout
                     );
                     log::info!("NOTE: The timeout can be increased with 'mosaic -t'.");
-                    kill_command(args, child.id(), sudo);
+                    kill_command(child.id());
                     let _ = child.wait();
                     handle_out.join().ok();
                     handle_err.join().ok();
@@ -309,7 +287,7 @@ mod tests {
     use clap::Parser;
 
     fn test_args(timeout: u64) -> MosaicArgs {
-        let cli = Cli::try_parse_from(["mosaic", "-t", &timeout.to_string(), "status"]).unwrap();
+        let cli = Cli::try_parse_from(["mosaic", "-t", &timeout.to_string(), "query"]).unwrap();
         MosaicArgs::from_cli(cli)
     }
 
@@ -324,7 +302,6 @@ mod tests {
             "log",
             true,
             true,
-            false,
             false,
         )
         .unwrap()
@@ -344,7 +321,6 @@ mod tests {
             false,
             true,
             false,
-            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("Command failed"));
@@ -362,7 +338,6 @@ mod tests {
             "log",
             false,
             true,
-            false,
             false,
         )
         .unwrap_err();
@@ -384,7 +359,6 @@ mod tests {
             "log",
             true,
             true,
-            false,
             false,
         )
         .unwrap()

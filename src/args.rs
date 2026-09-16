@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Command line surface for the native-execution model.
+//!
+//! There is no container, no session and no image. The verbs are the broker's:
+//! install an app (allocate its user), launch it, query what is installed. Two
+//! more run a process in a special mode: the daemon itself, and the privileged
+//! UID helper the broker calls.
+
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "mosaic",
     version = crate::config::VERSION,
-    about = "Mosaic container manager",
-    long_about = None,
+    about = "Run Android apps as native Linux processes",
     disable_version_flag = true
 )]
 pub struct Cli {
@@ -29,7 +35,8 @@ pub struct Cli {
     #[arg(short = 'w', long = "work", hide = true)]
     pub work: Option<String>,
 
-    #[arg(short = 't', long = "timeout", hide = true, default_value = "1800")]
+    /// Seconds a command may go without output before it is killed
+    #[arg(short = 't', long = "timeout", default_value = "60", hide = true)]
     pub timeout: u64,
 
     #[command(subcommand)]
@@ -38,171 +45,94 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Action {
-    Status,
-    Log(LogArgs),
-    Init(InitArgs),
-    Upgrade(UpgradeArgs),
-    Session(SessionArgs),
-    Container(ContainerArgs),
-    App(AppArgs),
-    Prop(PropArgs),
-    #[command(name = "show-full-ui")]
-    ShowFullUi,
-    #[command(name = "first-launch")]
-    FirstLaunch,
-    Shell(ShellArgs),
-    Logcat(LogcatArgs),
-    Adb(AdbArgs),
-    Bugreport,
+    /// Install an APK and allocate the app its own system user
+    Install(InstallArgs),
+    /// Remove an installed app and its user data
+    Uninstall(UninstallArgs),
+    /// Launch an installed app
+    Launch(LaunchArgs),
+    /// List installed apps, or describe one
+    Query(QueryArgs),
+    /// Manage the host-native ART and Bionic runtime bundle
+    Runtime(RuntimeArgs),
+    /// Run the broker in the foreground (started by systemd)
+    Daemon,
+    /// Allocate a UID for an app. Privileged, invoked by the broker
+    #[command(name = "uid-helper")]
+    UidHelper(UidHelperArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct LogArgs {
-    #[arg(short = 'n', long = "lines", default_value = "60")]
-    pub lines: String,
-
-    #[arg(short = 'c', long = "clear", action = clap::ArgAction::SetTrue)]
-    pub clear_log: bool,
+pub struct InstallArgs {
+    /// Path to the APK
+    pub apk: String,
+    /// Skip the polkit prompt and pretend the user answered yes. For tests
+    #[arg(long, hide = true)]
+    pub yes: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct InitArgs {
-    #[arg(short = 'i', long = "images_path")]
-    pub images_path: Option<String>,
-
-    #[arg(short = 'f', long = "force", action = clap::ArgAction::SetTrue)]
-    pub force: bool,
-
-    #[arg(short = 'c', long = "system_channel")]
-    pub system_channel: Option<String>,
-
-    #[arg(short = 'v', long = "vendor_channel")]
-    pub vendor_channel: Option<String>,
-
-    #[arg(short = 'r', long = "rom_type")]
-    pub rom_type: Option<String>,
-
-    #[arg(short = 's', long = "system_type")]
-    pub system_type: Option<String>,
-
-    #[arg(long = "client", action = clap::ArgAction::SetTrue)]
-    pub client: bool,
+pub struct UninstallArgs {
+    pub package: String,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct UpgradeArgs {
-    #[arg(short = 'o', long = "offline", action = clap::ArgAction::SetTrue)]
-    pub offline: bool,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct SessionArgs {
-    #[command(subcommand)]
-    pub subaction: Option<SessionSubaction>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum SessionSubaction {
-    Start,
-    Stop,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct ContainerArgs {
-    #[command(subcommand)]
-    pub subaction: Option<ContainerSubaction>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum ContainerSubaction {
-    Start,
-    Stop,
-    Restart,
-    Freeze,
-    Unfreeze,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct AppArgs {
-    #[command(subcommand)]
-    pub subaction: Option<AppSubaction>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum AppSubaction {
-    Install { package: String },
-    Remove { package: String },
-    Launch { package: String },
-    Intent { action: String, uri: String },
-    List,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct PropArgs {
-    #[command(subcommand)]
-    pub subaction: Option<PropSubaction>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum PropSubaction {
-    Get { key: String },
-    Set { key: String, value: String },
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct ShellArgs {
-    #[arg(short = 'u', long = "uid")]
-    pub uid: Option<String>,
-
-    #[arg(short = 'g', long = "gid")]
-    pub gid: Option<String>,
-
-    #[arg(short = 's', long = "context")]
-    pub context: Option<String>,
-
-    #[arg(short = 'L', long = "nolsm", action = clap::ArgAction::SetTrue)]
-    pub nolsm: bool,
-
-    #[arg(short = 'C', long = "allcaps", action = clap::ArgAction::SetTrue)]
-    pub allcaps: bool,
-
-    #[arg(short = 'G', long = "nocgroup", action = clap::ArgAction::SetTrue)]
-    pub nocgroup: bool,
-
-    #[arg(value_name = "COMMAND", num_args = 0.., allow_hyphen_values = true)]
-    pub command: Vec<String>,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct LogcatArgs {
-    #[arg(value_name = "ARGS", num_args = 0.., allow_hyphen_values = true)]
+pub struct LaunchArgs {
+    pub package: String,
+    /// Extra arguments passed to the app process
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct AdbArgs {
+pub struct QueryArgs {
+    /// Package name. Omit to list everything
+    pub package: Option<String>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct RuntimeArgs {
     #[command(subcommand)]
-    pub subaction: Option<AdbSubaction>,
+    pub subaction: RuntimeSubaction,
 }
 
 #[derive(Subcommand, Debug, Clone)]
-pub enum AdbSubaction {
-    Connect,
-    Disconnect,
+pub enum RuntimeSubaction {
+    /// Download and verify the runtime bundle
+    Fetch,
+    /// Show whether a bundle is installed and which version
+    Status,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub struct UidHelperArgs {
+    /// Package name to allocate a user for
+    pub package: String,
+    /// UID chosen by the broker, in the reserved range
+    #[arg(long)]
+    pub uid: Option<u32>,
+    /// APK to place in the app's data directory
+    #[arg(long)]
+    pub apk: Option<String>,
+    /// Remove the app's data directory and user instead of allocating
+    #[arg(long)]
+    pub remove: bool,
+    /// Data directory (with --remove)
+    #[arg(long)]
+    pub data_dir: Option<String>,
+}
+
+/// The work directory and derived paths, resolved once at startup.
 #[derive(Debug, Clone)]
 pub struct MosaicArgs {
     pub cli: Cli,
     pub work: String,
     pub config: String,
     pub log: String,
-    pub sudo_timer: bool,
-    pub timeout: u64,
-    pub cache: std::collections::HashMap<String, String>,
     pub details_to_stdout: bool,
     pub verbose: bool,
     pub quiet: bool,
+    pub timeout: u64,
 }
 
 impl MosaicArgs {
@@ -210,50 +140,42 @@ impl MosaicArgs {
         let work = cli
             .work
             .clone()
-            .unwrap_or_else(|| "/var/lib/mosaic".to_string());
+            .unwrap_or_else(|| crate::config::Defaults::new().work);
         let config = format!("{}/mosaic.cfg", work);
         let log_path = cli
             .log
             .clone()
             .unwrap_or_else(|| format!("{}/mosaic.log", work));
-
-        let timeout = cli.timeout;
         let details_to_stdout = cli.details_to_stdout;
         let verbose = cli.verbose;
         let quiet = cli.quiet;
-
+        let timeout = cli.timeout;
         Self {
             work,
             config,
             log: log_path,
-            sudo_timer: true,
-            timeout,
-            cache: std::collections::HashMap::new(),
-            cli,
             details_to_stdout,
             verbose,
             quiet,
+            timeout,
+            cli,
         }
     }
 
     pub fn action_name(&self) -> Option<String> {
-        match &self.cli.action {
-            Some(Action::Status) => Some("status".to_string()),
-            Some(Action::Log(_)) => Some("log".to_string()),
-            Some(Action::Init(_)) => Some("init".to_string()),
-            Some(Action::Upgrade(_)) => Some("upgrade".to_string()),
-            Some(Action::Session(_)) => Some("session".to_string()),
-            Some(Action::Container(_)) => Some("container".to_string()),
-            Some(Action::App(_)) => Some("app".to_string()),
-            Some(Action::Prop(_)) => Some("prop".to_string()),
-            Some(Action::ShowFullUi) => Some("show-full-ui".to_string()),
-            Some(Action::FirstLaunch) => Some("first-launch".to_string()),
-            Some(Action::Shell(_)) => Some("shell".to_string()),
-            Some(Action::Logcat(_)) => Some("logcat".to_string()),
-            Some(Action::Adb(_)) => Some("adb".to_string()),
-            Some(Action::Bugreport) => Some("bugreport".to_string()),
-            None => None,
-        }
+        self.cli
+            .action
+            .as_ref()
+            .map(|a| match a {
+                Action::Install(_) => "install",
+                Action::Uninstall(_) => "uninstall",
+                Action::Launch(_) => "launch",
+                Action::Query(_) => "query",
+                Action::Runtime(_) => "runtime",
+                Action::Daemon => "daemon",
+                Action::UidHelper(_) => "uid-helper",
+            })
+            .map(|s| s.to_string())
     }
 }
 
@@ -263,45 +185,44 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn parse_status() {
-        let cli = Cli::try_parse_from(["mosaic", "status"]).unwrap();
-        assert!(matches!(cli.action, Some(Action::Status)));
+    fn parse_install() {
+        let cli = Cli::try_parse_from(["mosaic", "install", "/tmp/app.apk"]).unwrap();
+        matches!(cli.action, Some(Action::Install(_)));
     }
 
     #[test]
-    fn parse_init_with_options() {
-        let cli = Cli::try_parse_from(["mosaic", "init", "-f", "-c", "https://example.com/system"])
-            .unwrap();
-        if let Some(Action::Init(args)) = cli.action {
-            assert!(args.force);
-            assert_eq!(args.system_channel.unwrap(), "https://example.com/system");
+    fn parse_launch_with_args() {
+        let cli = Cli::try_parse_from(["mosaic", "launch", "com.termux", "--", "-e", "x"]).unwrap();
+        if let Some(Action::Launch(a)) = cli.action {
+            assert_eq!(a.package, "com.termux");
+            assert!(a.args.contains(&"-e".to_string()));
         } else {
-            panic!("expected init");
+            panic!("expected launch");
         }
     }
 
     #[test]
-    fn parse_app_install() {
-        let cli = Cli::try_parse_from(["mosaic", "app", "install", "/tmp/foo.apk"]).unwrap();
-        if let Some(Action::App(a)) = cli.action {
-            if let Some(AppSubaction::Install { package }) = a.subaction {
-                assert_eq!(package, "/tmp/foo.apk");
-            } else {
-                panic!("expected install");
-            }
-        } else {
-            panic!("expected app");
-        }
+    fn parse_daemon_and_helper() {
+        assert!(matches!(
+            Cli::try_parse_from(["mosaic", "daemon"]).unwrap().action,
+            Some(Action::Daemon)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mosaic", "uid-helper", "com.termux"])
+                .unwrap()
+                .action,
+            Some(Action::UidHelper(_))
+        ));
     }
 
     #[test]
-    fn parse_shell_with_flags() {
-        let cli = Cli::try_parse_from(["mosaic", "shell", "-u", "1000", "ls", "-l"]).unwrap();
-        if let Some(Action::Shell(s)) = cli.action {
-            assert_eq!(s.uid.unwrap(), "1000");
-            assert_eq!(s.command, vec!["ls", "-l"]);
-        } else {
-            panic!("expected shell");
-        }
+    fn parse_runtime_status() {
+        let cli = Cli::try_parse_from(["mosaic", "runtime", "status"]).unwrap();
+        assert!(matches!(
+            cli.action,
+            Some(Action::Runtime(RuntimeArgs {
+                subaction: RuntimeSubaction::Status
+            }))
+        ));
     }
 }

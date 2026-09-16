@@ -86,7 +86,7 @@ pub fn init(
         .level(stdout_level)
         .chain(std::io::stdout());
 
-    let should_log_file = action == Some("container") && !details_to_stdout;
+    let should_log_file = action == Some("daemon") && !details_to_stdout;
 
     if should_log_file {
         if let Some(parent) = Path::new(log_path).parent() {

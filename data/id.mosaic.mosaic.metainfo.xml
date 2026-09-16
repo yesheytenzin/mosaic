@@ -23,19 +23,17 @@
 
   <description>
     <p>
-      Mosaic is a container-based approach to boot a full Android system on a regular GNU/Linux system. The Android system inside the container has direct access to needed hardware through LXC and the binder interface.
+      Mosaic runs Android apps as native Linux processes. There is no Android system to boot and no container to manage: an installed app is an ordinary desktop application that opens a real Wayland window, and its data lives under its own system user.
     </p>
-    <p xml:lang="ru">Mosaic запускает полноценную систему Android в контейнере поверх обычной системы GNU/Linux. Android внутри контейнера получает прямой доступ к нужному оборудованию через LXC и интерфейс binder.</p>
+    <p>
+      The Android API surface, framework services, Binder and the hardware abstraction layer are translated to host equivalents, with AOSP's ART and Bionic reused as host-native libraries rather than reimplemented.
+    </p>
   </description>
 
   <launchable type="desktop-id">Mosaic.desktop</launchable>
 
-  <!-- Update to latest release information -->
   <releases>
-    <release version="0.0.1" date="2026-09-15"/>
-    <release version="1.4.1" date="2023-04-24"/>
-    <release version="1.4.0" date="2023-02-08"/>
-    <release version="1.3.4" date="2022-12-14"/>
+    <release version="0.0.1" date="2026-09-16"/>
   </releases>
 
   <content_rating type="oars-1.1">
