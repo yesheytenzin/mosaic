@@ -73,7 +73,8 @@ if [ ! -S "$socket" ]; then
 fi
 
 shim="$root/tools/binder-shim/out"
-preload="$root/tools/launcher/out/launcher.so $shim/probe.so $shim/pretend-nice.so"
+preload="$root/tools/launcher/out/launcher.so $shim/probe.so"
+preload="$preload $shim/pretend-nice.so $shim/pretend-cgroups.so"
 preload="$preload $shim/android-binder.so $shim/android-properties.so"
 
 echo "running the framework, with the broker client on"
