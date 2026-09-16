@@ -202,12 +202,25 @@ static int bp_handle(const void *self) {
     return *(const int *)((const char *)self + 8);
 }
 
+/* The same handler serves both entry points. IPCThreadState::transact is the one
+ * everything funnels through, including the NDK's, and it carries the handle as an
+ * argument -- which BpBinder::transact does not, where the handle is a member at an
+ * offset this does not know. So this is both the wider and the easier hook. */
+static int handle_transaction(int handle, uint32 code, const void *data, void *reply, uint32 flags);
+
+int _ZN7android14IPCThreadState7transactEiRKNS_6ParcelEPS1_j(
+    void *self, int handle, uint32 code, const void *data, void *reply, uint32 flags) {
+    (void)self;
+    return handle_transaction(handle, code, data, reply, flags);
+}
+
 int _ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j(
     void *self, uint32 code, const void *data, void *reply, uint32 flags) {
-    resolve();
+    return handle_transaction(bp_handle(self), code, data, reply, flags);
+}
 
-    int handle = bp_handle(self);
-    (void)handle;
+static int handle_transaction(int handle, uint32 code, const void *data, void *reply, uint32 flags) {
+    resolve();
 
     if (!reply) {
         /* A oneway transaction: accept it and let the caller continue. */

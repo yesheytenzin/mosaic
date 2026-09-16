@@ -359,16 +359,20 @@ static const char *redirect(const char *path) {
 
 static int name_is_binder(const char *path) {
     if (!path) return 0;
-    /* "/dev/binder", "/dev/binderfs/binder", anything that ends in binder. */
-    const char *p = path;
-    while (*p) p++;
-    while (p > path && p[-1] != '/') p--;
-    const char *last = p;
-    const char *want = "binder";
-    int i = 0;
-    while (want[i]) {
-        if (last[i] != want[i]) return 0;
-        i++;
+    /* The devices are named for what they are: binder, hwbinder, vndbinder. An
+     * exact match on "binder" silently skipped the other two, so their
+     * ProcessState never opened and libhidl's service manager was null --
+     * which is what stopped HAL registration. */
+    const char *last = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/') last = p + 1;
+    }
+    const char *suffix = "binder";
+    size_t n = str_len(last);
+    size_t m = str_len(suffix);
+    if (n < m) return 0;
+    for (size_t i = 0; i < m; i++) {
+        if (last[n - m + i] != suffix[i]) return 0;
     }
     return 1;
 }
