@@ -168,7 +168,7 @@ pub async fn start(args: MosaicArgs) -> anyhow::Result<()> {
         mosaic_data: session.get("mosaic_data").cloned().unwrap_or_default(),
     };
 
-    crate::services::user_manager::start(&args, &session_defaults_for_services).ok();
+    crate::services::user_manager::start(&args, &session_defaults_for_services, None).ok();
     crate::services::clipboard_manager::start(&args).ok();
     crate::services::notification_manager::start(&args, &session_defaults_for_services).ok();
 
