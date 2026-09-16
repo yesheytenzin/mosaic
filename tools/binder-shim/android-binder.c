@@ -910,12 +910,7 @@ static void *object_for_node(ulong node) {
 static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
                          const unsigned char *data, ulong size) {
     (void)from;
-    say("android-binder:   serve: looking up the object\n");
-    say_once();
     void *object = object_for_node(node);
-    say(object ? "android-binder:   serve: object found\n"
-               : "android-binder:   serve: no object for that node\n");
-    say_once();
     int status = -1;
     unsigned char *out = 0;
     ulong out_size = 0;
@@ -933,14 +928,8 @@ static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
              * does not survive the copy, which is the next thing to fix here;
              * nothing in the boot path sends one yet. */
             if (size > 0) parcel_write_bytes(request, data, size);
-            say("android-binder:   serve: request parcel built\n");
-            say_once();
             parcel_ctor(reply);
-            say("android-binder:   serve: calling transact\n");
-            say_once();
             status = binder_transact(object, code, request, reply, flags);
-            say("android-binder:   serve: transact returned\n");
-            say_once();
 
             const unsigned char *bytes = parcel_ipc_data ? parcel_ipc_data(reply) : 0;
             ulong length = parcel_ipc_data_size ? parcel_ipc_data_size(reply) : 0;
@@ -957,6 +946,8 @@ static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
         free(reply);
         free(request);
     }
+    /* One line per call served, which is the record that a transaction crossed:
+     * the caller's side says it got an answer, and this says the owner ran it. */
     say("android-binder: served node ");
     say_dec((long)node);
     say(" code ");
