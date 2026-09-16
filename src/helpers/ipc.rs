@@ -33,6 +33,15 @@ trait SessionManager {
 trait Initializer {
     fn init(&self, params: HashMap<String, String>) -> zbus::Result<()>;
     fn cancel(&self) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn progress_changed(&self, message: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn finished(&self) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn interrupted(&self) -> zbus::Result<()>;
 }
 
 pub async fn container_start(session: HashMap<String, String>) -> anyhow::Result<()> {
