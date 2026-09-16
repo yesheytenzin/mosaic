@@ -96,13 +96,8 @@ pub fn bugreport(args: &MosaicArgs) -> anyhow::Result<()> {
         p
     };
 
-    let session = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(crate::helpers::ipc::container_get_session())
-            .ok()
-    };
+    let session =
+        { crate::helpers::runtime::block_on(crate::helpers::ipc::container_get_session()).ok() };
 
     let session = if session.is_none() || session.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
         println!("Mosaic session not found. Trying to start one...");
@@ -110,11 +105,7 @@ pub fn bugreport(args: &MosaicArgs) -> anyhow::Result<()> {
             procs.push(child);
         }
         sleep_progress(10);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(crate::helpers::ipc::container_get_session())
-            .ok()
+        crate::helpers::runtime::block_on(crate::helpers::ipc::container_get_session()).ok()
     } else {
         session
     };

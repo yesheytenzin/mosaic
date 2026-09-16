@@ -256,22 +256,16 @@ pub fn do_stop(args: &MosaicArgs) -> anyhow::Result<()> {
 
 pub fn stop(_args: &MosaicArgs) -> anyhow::Result<()> {
     // Try D-Bus SessionManager Stop
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let res = rt.block_on(crate::helpers::ipc::session_stop());
+    let res = crate::helpers::runtime::block_on(crate::helpers::ipc::session_stop());
     if res.is_ok() {
         return Ok(());
     }
     // Fallback to container Stop via SystemBus
-    let _ = rt.block_on(crate::helpers::ipc::container_stop(true));
+    let _ = crate::helpers::runtime::block_on(crate::helpers::ipc::container_stop(true));
     Ok(())
 }
 
 fn stop_container(quit_session: bool) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let _ = rt.block_on(crate::helpers::ipc::container_stop(quit_session));
+    let _ = crate::helpers::runtime::block_on(crate::helpers::ipc::container_stop(quit_session));
     Ok(())
 }

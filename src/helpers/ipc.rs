@@ -124,8 +124,5 @@ pub fn dbus_container_interface() -> &'static str {
 }
 
 pub fn get_session_via_dbus_blocking() -> anyhow::Result<HashMap<String, String>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(container_get_session())
+    crate::helpers::runtime::block_on(container_get_session())
 }

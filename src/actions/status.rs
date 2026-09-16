@@ -44,8 +44,5 @@ pub async fn print_status(args: &MosaicArgs) -> anyhow::Result<()> {
 }
 
 pub fn print_status_blocking(args: &MosaicArgs) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(print_status(args))
+    crate::helpers::runtime::block_on(print_status(args))
 }

@@ -83,13 +83,11 @@ pub fn upgrade(args: &MosaicArgs, offline: bool) -> anyhow::Result<()> {
     let mut session: Option<std::collections::HashMap<String, String>> = None;
     if status != "STOPPED" {
         log::info!("Stopping container");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        match rt.block_on(crate::helpers::ipc::container_get_session()) {
+        match crate::helpers::runtime::block_on(crate::helpers::ipc::container_get_session()) {
             Ok(s) => {
                 session = Some(s.clone());
-                let _ = rt.block_on(crate::helpers::ipc::container_stop(false));
+                let _ =
+                    crate::helpers::runtime::block_on(crate::helpers::ipc::container_stop(false));
             }
             Err(e) => {
                 log::debug!("{:?}", e);
@@ -112,10 +110,7 @@ pub fn upgrade(args: &MosaicArgs, offline: bool) -> anyhow::Result<()> {
             .unwrap_or_else(|| format!("{}/images", args.work));
         let preinstalled = crate::config::Defaults::new().preinstalled_images_paths;
         if !preinstalled.contains(&images_path) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(crate::helpers::images::get(args))?;
+            crate::helpers::runtime::block_on(crate::helpers::images::get(args))?;
         } else {
             log::info!("Upgrade refused because Mosaic was configured to load pre-installed image from {}.", images_path);
         }
@@ -128,11 +123,8 @@ pub fn upgrade(args: &MosaicArgs, offline: bool) -> anyhow::Result<()> {
 
     if status != "STOPPED" {
         log::info!("Starting container");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         let res = if let Some(sess) = session {
-            rt.block_on(crate::helpers::ipc::container_start(sess))
+            crate::helpers::runtime::block_on(crate::helpers::ipc::container_start(sess))
         } else {
             Err(anyhow::anyhow!("No session"))
         };
