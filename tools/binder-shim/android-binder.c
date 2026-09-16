@@ -47,6 +47,9 @@ extern void free(void *);
 #define SYM_IPC_DATA_SIZE "_ZNK7android6Parcel11ipcDataSizeEv"
 #define SYM_IPC_OBJECTS "_ZNK7android6Parcel10ipcObjectsEv"
 #define SYM_IPC_OBJECTS_COUNT "_ZNK7android6Parcel15ipcObjectsCountEv"
+#define SYM_SET_POSITION "_ZNK7android6Parcel15setDataPositionEm"
+#define SYM_GET_POSITION "_ZNK7android6Parcel12dataPositionEv"
+#define SYM_READ_BINDER "_ZNK7android6Parcel16readStrongBinderEv"
 
 /* A Parcel is a few hundred bytes and its layout is libbinder's business, so it
  * is allocated with room to spare and initialised by its own constructor. */
@@ -58,8 +61,16 @@ extern void free(void *);
 #define TRANSACTION_LIST_SERVICES 4
 #define TRANSACTION_IS_DECLARED 5
 
-/* From binder.h. */
-#define BINDER_TYPE_BINDER 0x73 /* 's' */
+/* The object types libbinder actually writes, read out of Parcel::unflattenBinder:
+ *
+ *   0x73682a85  BINDER_TYPE_HANDLE -- a remote object
+ *   0x73622a85  BINDER_TYPE_BINDER -- a local one
+ *
+ * The 0x73 this used to carry is the *old* ASCII encoding and matches nothing,
+ * so every addService was read as "not a local binder" and remembered nothing --
+ * which is why the framework's own services were never found. */
+#define BINDER_TYPE_BINDER 0x73622a85u
+#define BINDER_TYPE_HANDLE 0x73682a85u
 
 #define MAX_SERVICES 128
 #define NAME_MAX 128
@@ -167,6 +178,9 @@ typedef void (*parcel_ctor_fn)(void *);
 typedef void (*parcel_dtor_fn)(void *);
 typedef const unsigned long *(*parcel_objects_fn)(const void *);
 typedef ulong (*parcel_count_fn)(const void *);
+typedef int (*parcel_position_fn)(const void *, ulong);
+typedef ulong (*parcel_where_fn)(const void *);
+typedef void *(*parcel_read_fn)(const void *);
 
 static write_int32_fn parcel_write_int32;
 static write_binder_fn parcel_write_binder;
@@ -178,6 +192,9 @@ static parcel_data_fn parcel_ipc_data;
 static parcel_size_fn parcel_ipc_data_size;
 static parcel_objects_fn parcel_ipc_objects;
 static parcel_count_fn parcel_ipc_objects_count;
+static parcel_position_fn parcel_set_position;
+static parcel_where_fn parcel_data_position;
+static parcel_read_fn parcel_read_strong;
 
 static void resolve(void) {
     if (parcel_write_int32) return;
@@ -196,12 +213,9 @@ static void resolve(void) {
     parcel_ipc_data_size = (parcel_size_fn)dlsym(binder, SYM_IPC_DATA_SIZE);
     parcel_ipc_objects = (parcel_objects_fn)dlsym(binder, SYM_IPC_OBJECTS);
     parcel_ipc_objects_count = (parcel_count_fn)dlsym(binder, SYM_IPC_OBJECTS_COUNT);
-}
-
-static uint32 u32_at(const unsigned char *p) {
-    uint32 v;
-    __builtin_memcpy(&v, p, 4);
-    return v;
+    parcel_set_position = (parcel_position_fn)dlsym(binder, SYM_SET_POSITION);
+    parcel_data_position = (parcel_where_fn)dlsym(binder, SYM_GET_POSITION);
+    parcel_read_strong = (parcel_read_fn)dlsym(binder, SYM_READ_BINDER);
 }
 
 static ulong u64_at(const unsigned char *p) {
@@ -210,14 +224,26 @@ static ulong u64_at(const unsigned char *p) {
     return v;
 }
 
-/* A Parcel string16 is a character count, the UTF-16 data, and -- when the count
- * is odd -- four bytes of padding, because writeString16 pads with an int32. */
+static uint32 u32_at(const unsigned char *p) {
+    uint32 v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+
+/* A Parcel string16 is a character count and its UTF-16 data, then padding to a
+ * four byte boundary -- two bytes when the count is odd, because four plus an
+ * even number of characters leaves it two short.
+ *
+ * Getting this wrong cost three attempts. Four bytes of padding put the object
+ * that follows a service name past its first field, so the type read out of an
+ * addService was the object's *flags* instead of BINDER_TYPE_BINDER and every
+ * registration was dropped as "not a local binder"; no padding read it one field
+ * early. The counts here are direct: a fifteen character name puts
+ * BINDER_TYPE_BINDER (0x73622a85) at offset 4 + 30 + 2. */
 static const unsigned char *skip_string16(const unsigned char *p, const unsigned char *end) {
     if (!p || p + 4 > end) return 0;
     uint32 chars = u32_at(p);
-    const unsigned char *q = p + 4 + (ulong)chars * 2;
-    if (q > end) return 0;
-    if (chars & 1) q += 4;
+    const unsigned char *q = p + 4 + (ulong)chars * 2 + ((chars & 1) ? 2 : 0);
     return q <= end ? q : 0;
 }
 
@@ -389,7 +415,8 @@ void *mosaic_binder_lookup(const char *name) {
  * or a module it does not have is not a failure, so it gets a valid, empty
  * answer rather than an error. Answering with an error made PowerStatsService
  * throw a SecurityException out of onStart. */
-static int service_manager(uint32 code, const unsigned char *data, ulong size, void *reply) {
+static int service_manager(uint32 code, const unsigned char *data, ulong size, void *request_parcel,
+                           void *reply) {
     resolve();
     if (!parcel_write_int32) return 0;
     if (!after_token(data, size, SERVICE_MANAGER_TOKEN)) return 0;
@@ -445,11 +472,10 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             const unsigned char *p = name_after_token(data, size, name, NAME_MAX);
             if (p && p + 24 <= end) {
                 uint32 type = u32_at(p);
-                unsigned long cookie = u64_at(p + 16);
+                ulong cookie = u64_at(p + 16);
                 if (type == BINDER_TYPE_BINDER) {
-                    /* The object is the cookie for a local binder; the other
-                     * field is its weak reference table, which is not an IBinder
-                     * and must not be handed back as one. */
+                    /* For a local object the cookie is the IBinder itself; the
+                     * other field is its weak reference table, which is not one. */
                     remember(name, (void *)cookie, cookie);
                     say("android-binder: registered ");
                     say(name);
@@ -458,8 +484,14 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
                 } else {
                     say("android-binder: ");
                     say(name);
-                    say(" is not a local binder (type ");
-                    say_dec((long)type);
+                    say(" is not a local binder (type 0x");
+                    for (int shift = 28; shift >= 0; shift -= 4) {
+                        static const char hex[] = "0123456789abcdef";
+                        char digit[2];
+                        digit[0] = hex[(type >> shift) & 0xf];
+                        digit[1] = 0;
+                        say(digit);
+                    }
                     say(")\n");
                     say_once();
                 }
@@ -488,7 +520,27 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             say_once();
         }
         parcel_write_int32(reply, 0);
-        if (parcel_write_binder) {
+        /* Two things are being avoided here.
+         *
+         * A null object is written by writing nothing: libbinder's own
+         * writeStrongBinder dereferences the pointer it is given, so handing it
+         * null for a service that does not exist is a SIGSEGV inside the
+         * framework's getService.
+         *
+         * A remembered object may also be stale -- the registry stores a pointer
+         * without a reference of its own -- and handing libbinder one of those is
+         * the same SIGSEGV, from the vtable read. Its first word is the vtable
+         * pointer, so an object without one is treated as absent rather than
+         * passed on. The real fix is to hold a reference at registration; until
+         * then, an absent service is a better answer than a crash. */
+        int sane = object && *(const unsigned long *)object != 0;
+        if (!sane && object) {
+            say("android-binder: ");
+            say(have_name ? name : "(unnamed)");
+            say(" is no longer a live object; reporting it absent\n");
+            say_once();
+        }
+        if (sane && parcel_write_binder) {
             unsigned long value[2] = {(unsigned long)object, 0};
             parcel_write_binder(reply, value);
         }
@@ -537,7 +589,7 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
         return 0;
     }
     if (!parcel_data || !parcel_data_size || !parcel_write_int32) return 0;
-    if (!service_manager(code, parcel_data(data), parcel_data_size(data), reply)) {
+    if (!service_manager(code, parcel_data(data), parcel_data_size(data), (void *)data, reply)) {
         /* Either not the service manager, or a request whose interface token
          * could not be found. Answering an empty, successful reply is what this
          * did before, and failing instead stopped the framework earlier than it
@@ -609,7 +661,7 @@ int mosaic_binder_reply(uint32 code, const unsigned char *request, ulong request
     if (!reply) return 0;
     parcel_ctor(reply);
 
-    service_manager(code, request, request_size, reply);
+    service_manager(code, request, request_size, 0, reply);
 
     const unsigned char *data = parcel_ipc_data(reply);
     ulong size = parcel_ipc_data_size(reply);

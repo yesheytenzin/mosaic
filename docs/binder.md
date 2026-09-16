@@ -278,8 +278,33 @@ read once already without settling it.
 
 ## The Java path, now answered
 
-The wall above was real but the conclusion drawn from it was wrong. The constant
-values were read out of libbinder's own machine code rather than recalled:
+The wall above was real, but three of the four things behind it were the shim's
+own, and all three are now fixed. Each was found by reading libbinder's machine
+code or its observed bytes rather than by recall.
+
+**The object types.** `Parcel::unflattenBinder` compares against
+
+```
+0x73682a85   BINDER_TYPE_HANDLE -- a remote object
+0x73622a85   BINDER_TYPE_BINDER -- a local one
+```
+
+and the 0x73 the shim carried is the *old* ASCII encoding, matching nothing. Every
+`addService` was therefore read as "not a local binder" and remembered nothing, so
+none of the framework's own services was ever found.
+
+**The string16 padding.** A four byte count and UTF-16 data, then padding to four
+bytes -- *two* bytes for an odd count, not four. Four put the object past its first
+field, so the type read out of an `addService` was the object's flags; none put it
+one field early. A fifteen character name puts `BINDER_TYPE_BINDER` at
+4 + 30 + 2, which is where the bytes say it is.
+
+**A null is written by writing nothing.** `Parcel::writeStrongBinder` dereferences
+the pointer it is given, so handing it null for a service that does not exist is a
+SIGSEGV inside the framework's own `getService` -- which is exactly where
+`ActivityManagerService` was dying, at `flattenBinder+52`, `fault addr 0x60`.
+
+The constant values and the frame layout came from disassembly, as before:
 
 ```
 BC_TRANSACTION  _IOW('c', 0, 64)  = 0x40406300   the observed 68-byte stream
@@ -289,37 +314,42 @@ BR_TRANSACTION_COMPLETE _IOR('r',4,4) = 0x80047204
 BR_NOOP         _IO('r', 12)      = 0x0000720c
 ```
 
-`IPCThreadState::writeTransactionData` was disassembled too, which settles
-`binder_transaction_data` at 64 bytes with the code at 16, the sizes at 32 and 40,
-and the two pointers at 48 and 56 -- and the command word's own size field agrees,
-which is what makes the stream self-describing.
+and `IPCThreadState::writeTransactionData` settles `binder_transaction_data` at 64
+bytes with the code at 16 and the pointers at 48 and 56.
 
-Two more things the running framework taught, both now implemented:
+Two more things the running framework taught:
 
-- **The interface token is not at the start of the request.** This build prefixes
-  it with twelve bytes and puts an int32 between it and the service name, so
-  skipping one string16 from the front reads the prefix, and taking the next one
-  reads an empty string. Searching for the descriptor and then for the first
-  printable string16 after it is what finds the name -- and checking the
-  descriptor is also what stops one interface's transaction code 2 from being
-  answered as `checkService`.
-- **A waiting thread must not be given nothing.** Returning with an empty read
-  buffer makes libbinder read command 0 out of it and log `*** BAD COMMAND 0
-  received from Binder driver`. `BR_NOOP` is the answer: its command loop treats
-  it as "nothing happened, ask again".
+- **The interface token is not at the start of the request.** Twelve bytes precede
+  it and an int32 sits between it and the name, so skipping one string16 from the
+  front reads the prefix and taking the next reads an empty string. Searching for
+  the descriptor, then for the first printable string16 after it, is what finds the
+  name -- and requiring the descriptor is what stops one interface's transaction
+  code 2 from being answered as `checkService`.
+- **A waiting thread must not be given nothing.** libbinder reads the next command
+  out of the buffer it was handed, and an empty one reads as command 0, which it
+  reports as `*** BAD COMMAND 0 received from Binder driver`. `BR_NOOP` is the
+  answer that means nothing happened.
 
-With that, the framework's Java calls reach the registry: names are read
-correctly, registrations are remembered, and lookups find them --
+With that, services are registered and found:
 
 ```
-android-binder: AIDL register memtrack.proxy
+android-binder: registered platform_compat
+android-binder: checkService platform_compat found
 android-binder: checkService memtrack.proxy found
 ```
 
--- which is the first time any service lookup in this project has returned
-anything. `BpBinder::transact` *is* reachable for these calls after all, so the
-driver door turns out to be needed for the HIDL half (`/dev/hwbinder`, where
-`defaultServiceManager() is null`) rather than for the Java service manager.
+and the run reaches `StartActivityManager` with **no SIGSEGV at all**, where before
+it died there.
+
+### One thing still wrong, stated plainly
+
+The registry stores the object pointer without a reference of its own, so an object
+can be freed while it is registered. One of the two registrations in the last run
+was already stale when it was asked for -- the shim reports it as absent rather
+than handing libbinder a dangling pointer, and a stale pointer is now a missing
+service instead of a crash. Holding a reference at registration is the fix, and the
+attempt to do it through `RefBase::incStrong` made registrations *worse*, so it was
+backed out rather than kept half-working.
 
 ## What is left for Phase 3
 
