@@ -42,6 +42,16 @@ exec unshare -rm --propagation private bash -c '
   mount -t tmpfs none /dev || exit 1
   mkdir -p /dev/socket || exit 1
 
+  # Android has a filesystem layout and the framework refers to it by absolute
+  # path in places that cannot be configured -- AssetManager inlines
+  # "/system/framework/framework-res.apk" as a compile-time constant. Presenting
+  # those paths with a mount namespace needs root, and a user namespace cannot
+  # even create /system, so the harness redirects the opens instead (see
+  # tools/binder-shim/android-paths.c). A product can do either; the plan says so.
+  if [ -n "${MOSAIC_ANDROID_ROOT:-}" ]; then
+    echo "android root: $MOSAIC_ANDROID_ROOT, paths redirected by android-paths.so" >&2
+  fi
+
   # The Android framework raises its own thread priorities (Process
   # .setThreadPriority, which wants a negative nice), and an unprivileged process
   # may only do that within RLIMIT_NICE. On a desktop that limit is 0, so the

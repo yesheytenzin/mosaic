@@ -271,8 +271,41 @@ Past that, it asks for another class the boot class loader does not have, which 
 where this stops. Finding it needs the systemserverclasspath from every partition,
 or a way to get ART to name the class — the message does not.
 
-So the order is: that class, then the binder framing, which gates the services
-themselves.
+**The class wall is behind us, and the framework now reaches the binder.** Reading
+every classpath config in the image (not just the ones I guessed) fixed the class
+lookups, and the gaps that followed were each named by a stack trace:
+
+- `libstats_jni.so`, then `libandroid_servers.so`, then `libjavacrypto.so` — all
+  libraries the framework loads by name, now staged.
+- `Failed to create system AssetManager` — the platform resources are opened by
+  **absolute path**, and `AssetManager` inlines
+  `FRAMEWORK_APK_PATH = "/system/framework/framework-res.apk"` as a compile-time
+  constant, so no property can redirect it. Android has a filesystem layout and
+  the framework knows it; Mosaic keeps the same layout under its own root, so the
+  difference is the prefix. Either present the paths (mount namespace or a symlink
+  made once by the privileged step, extending ADR-0012) or redirect the opens; the
+  harness does the latter in `tools/binder-shim/probe.c`, which now rewrites
+  `/system`, `/data` and `/apex` paths as well as intercepting the binder device.
+  Staging *every* `*-res.apk` rather than one at a time is what finally got past
+  it, since a LineageOS image adds its own.
+- `Process.setThreadPriority` — `RLIMIT_NICE`, a capability the harness cannot
+  have (see `pretend-nice.c`).
+
+And then:
+
+```
+binder-shim: open /dev/binder
+binder-shim: ioctl BINDER_VERSION -> 8
+binder-shim: ioctl BINDER_SET_MAX_THREADS -> ok
+binder-shim: mmap of the binder fd, length 1040384
+```
+
+`ProcessState` initialises through the userspace shim — the exact device surface
+`docs/binder.md` measured, now being used by the real system server. It goes on to
+`ActivityThread.systemMain()` → `attach()` → creating the system Application, which
+is where it stops with `RuntimeException: Unknown error`, ten binder calls in. That
+is the boundary the plan predicted: the framework is now asking the binder for
+something and getting nothing back, which is the framing work in P3.
 
 A measurement was taken with a missing launcher and looked like a stall for a
 reason that did not exist; `tools/build-native.sh` now builds every Bionic
