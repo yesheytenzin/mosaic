@@ -268,6 +268,14 @@ JARS=(
   "/system/apex/com.android.art/javalib/bouncycastle.jar:javalib"
   "/system/apex/com.android.art/javalib/apache-xml.jar:javalib"
   "/system/framework/framework.jar:framework"
+  "/system/framework/telephony-common.jar:framework"
+  "/system/framework/voip-common.jar:framework"
+  "/system/framework/com.android.location.provider.jar:framework"
+  "/system/framework/org.lineageos.platform.jar:framework"
+  "/system/apex/com.android.conscrypt/javalib/conscrypt.jar:framework"
+  "/system/apex/com.android.os.statsd/javalib/framework-statsd.jar:framework"
+  "/system/apex/com.android.art/javalib/service-art.jar:framework"
+  "/system/apex/com.android.os.statsd/javalib/service-statsd.jar:framework"
   "/system/framework/services.jar:framework"
   "/system/framework/framework-graphics.jar:framework"
   "/system/framework/ext.jar:framework"
@@ -312,11 +320,23 @@ do_jars() { # <image> <bundle>
                bouncycastle.jar apache-xml.jar; do
       printf '%s/javalib/%s:' "$out" "$rel"
     done
-    for rel in framework.jar framework-graphics.jar ext.jar ims-common.jar \
+    for rel in framework.jar framework-graphics.jar ext.jar telephony-common.jar \
+               voip-common.jar ims-common.jar conscrypt.jar framework-statsd.jar \
                android.hidl.base-V1.0-java.jar android.hidl.manager-V1.0-java.jar; do
       printf '%s/framework/%s:' "$out" "$rel"
     done
   } | sed 's/:$//' > "$out/bootclasspath.txt"
+
+  # And the system server's own classpath, from
+  # /system/etc/classpaths/systemserverclasspath.pb. It is not the boot class
+  # path: services.jar and its companions go here.
+  {
+    local rel
+    for rel in services.jar com.android.location.provider.jar org.lineageos.platform.jar \
+               service-art.jar service-statsd.jar; do
+      printf '%s/framework/%s:' "$out" "$rel"
+    done
+  } | sed 's/:$//' > "$out/systemserverclasspath.txt"
   echo "  + bootclasspath.txt"
 }
 
@@ -356,6 +376,7 @@ libopenjdk.so
 libopenjdkjvm.so
 libadbconnection.so
 libsigchain.so
+libstats_jni.so
 SEED
 
   # ART preloads every entry in the device's public library list, so the bundle
