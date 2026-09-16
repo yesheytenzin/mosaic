@@ -131,6 +131,30 @@ command plus a transaction. And the harness now caps output as well as time
 (`MOSAIC_MAX_OUTPUT`), because that was the second five-gigabyte log this project
 has produced and the first fix only bounded the clock.
 
+## The way around it
+
+The driver protocol does not have to be reproduced. `libbinder` exports the level
+above it, with declared arguments instead of an opaque buffer:
+
+```
+android::IPCThreadState::transact(int, unsigned int, android::Parcel const&,
+                                  android::Parcel*, unsigned int)@@LIBBINDER
+android::BpBinder::transact(unsigned int, android::Parcel const&,
+                            android::Parcel*, unsigned int)@@LIBBINDER
+```
+
+A shim can interpose `IPCThreadState::transact` and implement the *semantics* --
+handle 0 is the service manager, a code is a call, the replies are Parcels -- using
+`Parcel`'s own exported methods. That is a far smaller surface than the driver
+protocol, and it is exactly what a binder shim in a container-style project does.
+The kernel driver is only a transport between two processes; replacing it at the
+API level skips the part that has resisted four attempts at decoding.
+
+The trade is that the shim then lives at `libbinder`'s version of the ABI rather
+than at the driver's, which is stable in practice but is a foreign C++ ABI: the
+calls have to be made through `dlsym`ed symbols with hand-written signatures, as
+the launcher already does for `JNI_CreateJavaVM`.
+
 ## Where it stands
 
 The shim answers the version, threads, spam-detection and mapping calls, so
