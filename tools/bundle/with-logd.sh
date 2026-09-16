@@ -24,10 +24,30 @@ if [ $# -lt 1 ]; then
   exit 2
 fi
 
+# A preload library that is not there makes the process fail to link, which looks
+# like the program stopping for its own reasons. That cost two wrong readings, so
+# it is checked here rather than noticed later.
+if [ -n "${MOSAIC_PRELOAD:-}" ]; then
+  for library in $MOSAIC_PRELOAD; do
+    if [ ! -f "$library" ]; then
+      echo "with-logd: MOSAIC_PRELOAD names $library, which does not exist." >&2
+      echo "           Build the native artifacts first: tools/build-native.sh <bundle>" >&2
+      exit 2
+    fi
+  done
+fi
+
 exec unshare -rm --propagation private bash -c '
   set -uo pipefail
   mount -t tmpfs none /dev || exit 1
   mkdir -p /dev/socket || exit 1
+
+  # The Android framework raises its own thread priorities (Process
+  # .setThreadPriority, which wants a negative nice), and an unprivileged process
+  # may only do that within RLIMIT_NICE. On a desktop that limit is 0, so the
+  # framework throws SecurityException; systemd can raise it per unit with
+  # LimitNICE, and this is the same thing for the harness.
+  ulimit -e 40 2>/dev/null || true
 
   # A Bionic process reads system properties from /dev/__properties__, which
   # libc hardcodes, and writes them over a socket at /dev/socket/property_service.

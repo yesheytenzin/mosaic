@@ -234,9 +234,45 @@ last classes loaded are `libcore.util.ArrayUtils` and `java.nio.NIOAccess`. The
 missing class is resolved by the boot class loader, which means something on the
 boot classpath wants a class that is not on it.
 
-So the order is: find that class (and the jar it lives in, most likely
-`services.jar`, which is on the class path and not the boot class path), then the
-binder framing, which gates the services themselves.
+**That wall is now fixed, and the classpaths came from the device itself.** Every
+apex and the system ship their own classpath config, and they are authoritative:
+
+| Config | Contributes |
+| --- | --- |
+| `/system/apex/com.android.art/etc/classpaths/bootclasspath.pb` | core-oj, core-libart, okhttp, bouncycastle, apache-xml |
+| `/system/etc/classpaths/bootclasspath.pb` | framework, framework-graphics, ext, telephony-common, voip-common, ims-common |
+| `/system/apex/com.android.i18n/...` | core-icu4j |
+| `/system/apex/com.android.conscrypt/...` | conscrypt |
+| `/system/apex/com.android.os.statsd/...` | framework-statsd |
+
+plus `systemserverclasspath.pb` (system, art and statsd) for the services:
+services.jar, com.android.location.provider.jar, org.lineageos.platform.jar,
+service-art.jar, service-statsd.jar. Reading those is not guesswork — the image
+has them, and `derive_classpath` is what turns them into `BOOTCLASSPATH` at boot
+(`init.rc` does `load_exports /data/system/environ/classpath`).
+
+The bundle now mirrors that list, and the class-not-found wall went away
+immediately. What followed was a normal sequence of gaps, each with a stack trace
+thanks to the launcher's exception reporting:
+
+- `UnsatisfiedLinkError: dlopen failed: library "libstats_jni.so"` at
+  `StatsLog.<clinit>` — the statsd apex's JNI library, now in the bundle.
+- `SecurityException: No permission to set the priority of <tid>` at
+  `SystemServer.run(SystemServer.java:858)` — **not a Mosaic defect but a real
+  requirement**: the framework raises its own thread priorities, and an
+  unprivileged process may only lower its nice within `RLIMIT_NICE`. On a desktop
+  that limit is 0 and cannot be raised (the hard limit needs privilege in the
+  initial user namespace), so the broker's unit needs `LimitNICE` or an equivalent
+  privileged step, in the shape of ADR-0008. The harness carries a small stand-in
+  (`tools/binder-shim/pretend-nice.c`) so a run can get past a capability the
+  harness cannot have.
+
+Past that, it asks for another class the boot class loader does not have, which is
+where this stops. Finding it needs the systemserverclasspath from every partition,
+or a way to get ART to name the class — the message does not.
+
+So the order is: that class, then the binder framing, which gates the services
+themselves.
 
 A measurement was taken with a missing launcher and looked like a stall for a
 reason that did not exist; `tools/build-native.sh` now builds every Bionic
