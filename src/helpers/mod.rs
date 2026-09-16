@@ -4,4 +4,3 @@ pub mod http;
 pub mod logging;
 pub mod process;
 pub mod runtime;
-pub mod version;

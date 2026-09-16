@@ -140,6 +140,21 @@ abort, and the linker's own view of the world. It needs no root.
 
 Phase 2 starts at the exception above: an app process needs
 `libandroid_runtime.so` and the JNI registration it performs, which in turn
-needs a property service, because `SystemProperties.native_get_boolean` reads
-through one. `app_process64` from the image is the entry point that does this on
-a device, and is what the broker should launch.
+needs system properties, because `SystemProperties.native_get_boolean` reads
+through them. `app_process64` is the entry point that does this on a device and
+is what the broker should launch; it currently stops at
+
+```
+app_process: Unable to determine ABI list from property ro.product.cpu.abilist64.
+```
+
+That is the property service in ADR-0013, and it is the next unit of work. The
+tooling side of Phase 2 is done: `mosaic runtime verify` starts ART out of a
+bundle through the same code path the broker will use to start an app process,
+and reports what it says.
+
+```
+$ mosaic runtime verify
+Verifying the runtime bundle at /var/lib/mosaic/runtime/0-x86_64
+ART version 2.1.0 x86_64
+```

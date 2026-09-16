@@ -205,8 +205,12 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
   [ -f "$out/index/all.txt" ] || do_index "$img" "$out"
   stage_payload "$img" "$out" "$inode" "$name" || return 1
 
+  # Iterate: run it, read the missing library out of the linker's error, stage
+  # it, run again. A binary with a large closure needs many rounds, and a
+  # library that stages but is still not found would otherwise spin silently, so
+  # every round says what it is chasing.
   local attempt
-  for attempt in $(seq 1 40); do
+  for attempt in $(seq 1 200); do
     local output status missing
     output=$(do_run "$out" "$name" "$@" 2>&1)
     status=$?
@@ -215,24 +219,28 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
       printf '%s\n' "$output"
       return 0
     fi
+
     missing=$(printf '%s\n' "$output" | sed -n 's/.*library "\([^"]*\)" not found.*/\1/p' | head -1)
     if [ -z "$missing" ]; then
       # dalvikvm dlopens libart.so and reports a null name when that fails, so
       # the missing library has to be inferred rather than read.
       if printf '%s\n' "$output" | grep -q 'initialize JNI invocation API'; then
+        echo "  chasing libart.so (dlopen reports no name)"
         stage_one "$img" "$out" libart.so || return 1
         continue
       fi
       echo "UNRESOLVED (not a missing library):"
-      printf '%s\n' "$output" | head -20
+      printf '%s\n' "$output" | head -25
       return 1
     fi
+
+    echo "  chasing $missing"
     stage_one "$img" "$out" "$missing" || {
       printf '%s\n' "$output" | head -5
       return 1
     }
   done
-  echo "gave up after 40 libraries"
+  echo "gave up after 200 libraries" >&2
   return 1
 }
 
@@ -351,6 +359,10 @@ SEED
   echo "writing the linker configuration and environment..."
   write_linker_config "$out"
   do_env "$out"
+  # Keep the generator in the bundle so run.sh can regenerate both for whatever
+  # path the bundle ends up at.
+  cp -f "${BASH_SOURCE[0]}" "$out/bundle.sh"
+  chmod +x "$out/bundle.sh"
 
   echo "checking that ART starts..."
   local reported
@@ -379,10 +391,20 @@ export ANDROID_I18N_ROOT="$out/i18n"
 export ANDROID_TZDATA_ROOT="$out"
 export ANDROID_TMP="$out/tmp"
 EOF
+  # app_process reads the boot classpath from the environment, because unlike
+  # dalvikvm it takes no -Xbootclasspath argument.
+  if [ -f "$out/bootclasspath.txt" ]; then
+    printf 'export BOOTCLASSPATH="%s"\n' "$(cat "$out/bootclasspath.txt")" >> "$out/env.sh"
+  fi
   cat > "$out/run.sh" <<'EOF'
 #!/bin/bash
 # Run a binary from this bundle: run.sh dalvikvm64 [args...]
+#
+# The linker configuration and the environment both contain absolute paths, so
+# they are regenerated from wherever this bundle now lives. That keeps a copied
+# or moved bundle working.
 here=$(cd "$(dirname "$0")" && pwd)
+"$here/bundle.sh" env "$here" >/dev/null
 . "$here/env.sh"
 exec "$here/bin/$1" "${@:2}"
 EOF
@@ -415,6 +437,7 @@ case "$cmd" in
   stage)   do_stage "${2:?image}" "${3:?bundle}" "${4:?inode}" "${5:?name}" "${@:6}" ;;
   jars)    do_jars "${2:?image}" "${3:?bundle}" ;;
   build)   do_build "${2:?image}" "${3:?bundle}" ;;
+  env)     write_linker_config "${2:?bundle}"; do_env "${2:?bundle}" ;;
   run)     do_run "${2:?bundle}" "${3:?binary}" "${@:4}" ;;
   *)       sed -n '2,8p' "$0"; exit 2 ;;
 esac

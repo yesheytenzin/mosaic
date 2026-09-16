@@ -37,10 +37,6 @@ pub async fn retrieve(url: &str, headers: Option<HashMap<String, String>>) -> (i
     }
 }
 
-pub fn retrieve_blocking(url: &str, headers: Option<HashMap<String, String>>) -> (i32, Vec<u8>) {
-    crate::helpers::runtime::block_on(retrieve(url, headers))
-}
-
 fn cache_path(work: &str, prefix: &str, url: &str) -> String {
     let prefix = prefix.replace('/', "_");
     let mut hasher = Sha256::new();
@@ -129,16 +125,6 @@ pub fn sha256_file(path: &str) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-pub fn download_blocking(
-    args: &MosaicArgs,
-    url: &str,
-    prefix: &str,
-    cache: bool,
-    allow_404: bool,
-) -> anyhow::Result<Option<String>> {
-    crate::helpers::runtime::block_on(download(args, url, prefix, cache, allow_404))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,8 +139,11 @@ mod tests {
         assert_ne!(a, c, "different urls must get different cache keys");
     }
 
-    #[test]
-    fn malformed_url_reports_minus_one() {
-        assert_eq!(retrieve_blocking("not a url", None).0, -1);
+    #[tokio::test]
+    async fn malformed_url_reports_minus_one() {
+        assert_eq!(
+            crate::helpers::http::retrieve("not a url", None).await.0,
+            -1
+        );
     }
 }

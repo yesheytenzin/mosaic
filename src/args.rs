@@ -102,6 +102,8 @@ pub enum RuntimeSubaction {
     Fetch,
     /// Show whether a bundle is installed and which version
     Status,
+    /// Check that the installed bundle runs: start ART from it and report back
+    Verify,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
