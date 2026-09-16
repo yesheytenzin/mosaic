@@ -98,6 +98,29 @@ hand, rather than reading more bytes at the receiving end.
 A segfault was caused along the way by following a pointer without checking it was
 mapped, so the safety check is worth keeping in whatever diagnostic comes next.
 
+A fourth attempt dumped a window *around* `write_buffer` rather than reading from
+it, on the theory that the stream might not begin at the pointer given. It does
+not, and the buffer is not a command stream at all:
+
+```
+ -16: 0b 01 10 00 00 00 ca 88 00 00 00 00 00 00 00 00
+   0: 00 63 40 40 00 00 00 00 00 00 00 00 00 00 00 00
+  16: 00 00 00 00 47 4e 50 5f 10 00 00 00 00 00 00 00
+  32: 00 00 00 00 ... (all zeros to +160)
+```
+
+`write_size` is 68, which is exactly one command plus one `binder_transaction_data`,
+and the transaction for `checkService` must carry non-zero data pointers. This
+buffer has none: it is zeros with two small islands, the first word is
+`0x000040406300`, and that word is **not a readable address** either. So it is
+neither a command stream nor a pointer. Every reading of the receiving side has
+now been ruled out with evidence, which is the strongest argument for the next
+attempt being on the sender: log `IPCThreadState::mOut`'s size and data pointer
+from inside `talkWithDriver`, or interpose the Parcel writes, and compare with
+what arrives here. The window dump is worth recreating (non-destructively parsing
+`/proc/self/maps` once a query, since writing a NUL over each line's dash made
+every query after the first report mapped memory as unmapped).
+
 A third attempt tried the reply itself, guessing that the stream begins four bytes
 in (the word there parses as a transaction to handle 0 with a plausible code). It
 does not: after skipping four bytes only 64 remain, and a transaction needs 68, so
