@@ -26,6 +26,14 @@ is the same shape as UID allocation: one root step, at a known time, doing one
 thing. The broker then writes values through a socket the helper's step created
 writable, so no further privilege is needed.
 
+Implemented and verified. `tools/bundle/make-property-area.py` writes the area —
+the `property_info` trie and the `prop_area` shared memory — from the formats in
+AOSP, and `bundle.sh build` puts the result in `<bundle>/properties` for the
+helper to install. Bionic reads it: `getprop ro.build.version.sdk` answers `33`,
+and `app_process64` starts the framework instead of aborting on its ABI list.
+The area at `/dev/__properties__` is hardcoded in libc, so the provisioning step
+is the one part that needs root; everything else about it does not.
+
 The alternative — build Bionic with the property area path configurable, since
 ADR-0002 has Mosaic building Bionic anyway — is strictly better in the long run
 and strictly more work now, because building Bionic needs an AOSP tree this

@@ -136,25 +136,62 @@ abort, and the linker's own view of the world. It needs no root.
 - Nothing here is packaged as a pinned archive yet (ADR-0010). The bundle is
   built locally from an image; publishing it is still to do.
 
+## Phase 2: an app process runs
+
+`app_process64` is the entry point a device uses: it loads `libandroid_runtime.so`
+and starts the framework. It now starts, registers its JNI natives, initialises
+`Build.VERSION` and `RuntimeInit`, and runs `am` until it needs Binder:
+
+```
+AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 0 <<<<<<
+...
+  at android.os.ServiceManager.getIServiceManager(ServiceManager.java:129)
+  at android.os.ServiceManager.rawGetService(ServiceManager.java:372)
+  at android.os.ServiceManager.getService(ServiceManager.java:147)
+  at android.app.ActivityManager.getService(ActivityManager.java:4693)
+```
+
+That is the Phase 3 boundary, not a problem with the execution model.
+
+Two things were missing to get here, and both are the same shape: something
+`init` provides on a device that has no equivalent on a host.
+
+### System properties
+
+ART and `app_process` read properties throughout startup, and Bionic reads them
+from a mapped area at `/dev/__properties__` rather than from a daemon. Without
+it, every property is empty and `app_process` stops at
+`Unable to determine ABI list from property ro.product.cpu.abilist64`.
+
+`tools/bundle/make-property-area.py` generates that area. It implements both
+formats from AOSP: the `property_info` trie that maps a name to a context, and
+the `prop_area` shared memory that holds the values, with the trie of `prop_bt`
+nodes whose siblings are a binary search tree ordered by (length, bytes). The
+trie it writes is deliberately minimal — one root node with no children and one
+exact match per property, which the reader accepts because it breaks out of its
+descent when a node has no children.
+
+`bundle.sh build` runs it into `<bundle>/properties`, seeded from the image's
+`build.prop`, so the bundle carries the area the privileged step installs
+(ADR-0013). Verified with a property-reading binary from the image:
+
+```
+$ getprop ro.build.version.sdk
+33
+$ getprop ro.product.cpu.abilist64
+x86_64
+```
+
+### A working logd
+
+Covered above: without one, a Bionic process aborts with no explanation. It is
+also how the two remaining property gaps were found — `Build.VERSION`
+dereferences `ALL_CODENAMES[0]` before checking its length, so an empty list
+aborts the framework's static initialisation, and that is only visible in a log.
+
 ## Next
 
-Phase 2 starts at the exception above: an app process needs
-`libandroid_runtime.so` and the JNI registration it performs, which in turn
-needs system properties, because `SystemProperties.native_get_boolean` reads
-through them. `app_process64` is the entry point that does this on a device and
-is what the broker should launch; it currently stops at
-
-```
-app_process: Unable to determine ABI list from property ro.product.cpu.abilist64.
-```
-
-That is the property service in ADR-0013, and it is the next unit of work. The
-tooling side of Phase 2 is done: `mosaic runtime verify` starts ART out of a
-bundle through the same code path the broker will use to start an app process,
-and reports what it says.
-
-```
-$ mosaic runtime verify
-Verifying the runtime bundle at /var/lib/mosaic/runtime/0-x86_64
-ART version 2.1.0 x86_64
-```
+Phase 3, userspace Binder (ADR-0004). The boundary is exact:
+`BinderInternal.getContextObject` returns null, so `ServiceManager` throws.
+Everything above it — the framework classes, JNI registration, the runtime — is
+working.

@@ -30,3 +30,6 @@
 
 # Logs
 *.log
+
+# Python bytecode from the bundle tools
+__pycache__/
