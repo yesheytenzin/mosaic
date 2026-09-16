@@ -3,7 +3,7 @@
 use crate::args::MosaicArgs;
 use crate::config::Defaults;
 use std::collections::HashMap;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 /// Reports human readable progress while initializing, used by the remote
@@ -395,9 +395,6 @@ pub fn init(
             }
         }
     }
-
-    // Fix permissions on work dir
-    let _ = std::fs::set_permissions(&args.work, std::fs::Permissions::from_mode(0o700));
 
     Ok(())
 }

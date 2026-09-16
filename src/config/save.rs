@@ -7,12 +7,16 @@ use crate::config::load::MosaicConfig;
 pub fn save(config_path: &str, cfg: &MosaicConfig) -> anyhow::Result<()> {
     log::debug!("Save config: {}", config_path);
     if let Some(parent) = Path::new(config_path).parent() {
-        std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            let _ = std::fs::set_permissions(parent, perms);
+        // The mode only applies when the directory is created, matching
+        // os.makedirs(dir, 0o700, exist_ok=True). Changing an existing
+        // directory would lock non-root commands out of their own state.
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
     let mut content = String::new();

@@ -309,11 +309,13 @@ pub fn start(
     unlocked_cb: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let apps_dir: PathBuf = Path::new(&session.xdg_data_home).join("applications");
-    std::fs::create_dir_all(&apps_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&apps_dir, std::fs::Permissions::from_mode(0o700));
+    if !apps_dir.exists() {
+        std::fs::create_dir_all(&apps_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&apps_dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     let user_state_dir = PathBuf::from(&session.mosaic_user_state);
