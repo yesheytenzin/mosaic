@@ -2,8 +2,60 @@
 
 use crate::args::MosaicArgs;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+static SUDO_TIMER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Recursively kill a pid and its children, so a timeout does not leave
+/// grandchildren (sh -c, helpers) running.
+pub fn kill_process_tree(args: &MosaicArgs, pid: u32, ppids: &[(String, String)], sudo: bool) {
+    let cmd = vec!["kill".to_string(), "-9".to_string(), pid.to_string()];
+    if sudo {
+        let _ = crate::helpers::run::root(args, &cmd, "log", false, Some(false));
+    } else {
+        let _ = crate::helpers::run::user(args, &cmd, "log", false, Some(false));
+    }
+
+    for (child_pid, child_ppid) in ppids {
+        if *child_ppid == pid.to_string() {
+            if let Ok(child) = child_pid.parse::<u32>() {
+                kill_process_tree(args, child, ppids, sudo);
+            }
+        }
+    }
+}
+
+/// Kill a command and everything it spawned.
+pub fn kill_command(args: &MosaicArgs, pid: u32, sudo: bool) {
+    let mut ppids = Vec::new();
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-e", "-o", "pid,ppid"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for row in text.lines().skip(1) {
+            let items: Vec<&str> = row.split_whitespace().collect();
+            if items.len() != 2 {
+                continue;
+            }
+            ppids.push((items[0].to_string(), items[1].to_string()));
+        }
+    }
+    kill_process_tree(args, pid, &ppids, sudo);
+}
+
+/// Keep the sudo timestamp fresh so the password is only asked once.
+pub fn sudo_timer_start() {
+    if SUDO_TIMER_ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        let _ = std::process::Command::new("sudo").arg("-v").status();
+        std::thread::sleep(Duration::from_secs(60));
+    });
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputMode {
@@ -39,7 +91,7 @@ pub fn core(
     output: &str,
     output_return: bool,
     check: bool,
-    _sudo: bool,
+    sudo: bool,
     disable_timeout: bool,
 ) -> anyhow::Result<Option<String>> {
     let mode = OutputMode::from_str(output)?;
@@ -49,6 +101,10 @@ pub fn core(
     }
     if mode == OutputMode::Tui && output_return {
         anyhow::bail!("Can't use output_return with output: tui");
+    }
+
+    if args.sudo_timer && sudo {
+        sudo_timer_start();
     }
 
     log::debug!("{}", log_message);
@@ -234,7 +290,7 @@ pub fn core(
                         args.timeout
                     );
                     log::info!("NOTE: The timeout can be increased with 'mosaic -t'.");
-                    let _ = child.kill();
+                    kill_command(args, child.id(), sudo);
                     let _ = child.wait();
                     handle_out.join().ok();
                     handle_err.join().ok();

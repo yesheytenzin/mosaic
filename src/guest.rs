@@ -48,6 +48,12 @@ pub const PROP_FILE: &str = "waydroid.prop";
 pub const BASE_PROP_FILE: &str = "waydroid_base.prop";
 pub const GUEST_VENDOR_PROP: &str = "/vendor/waydroid.prop";
 
+/// Prop prefix carrying host product identity into the guest.
+pub const PRODUCT_PREFIX: &str = "ro.product.waydroid.";
+
+/// Image channel path segment. The OTA server serves `waydroid_<arch>`.
+pub const OTA_PATH_PREFIX: &str = "waydroid_";
+
 /// Directory the guest reads a pushed APK from.
 pub const TMP_DIR: &str = "waydroid_tmp";
 pub const GUEST_TMP_APK: &str = "/data/waydroid_tmp/base.apk";
@@ -113,5 +119,7 @@ mod tests {
         assert_eq!(GUEST_VENDOR_PROP, "/vendor/waydroid.prop");
         assert_eq!(GUEST_TMP_APK, "/data/waydroid_tmp/base.apk");
         assert_eq!(SENSORD_BIN, "waydroid-sensord");
+        assert_eq!(PRODUCT_PREFIX, "ro.product.waydroid.");
+        assert_eq!(OTA_PATH_PREFIX, "waydroid_");
     }
 }
