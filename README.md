@@ -43,8 +43,10 @@ mosaic status                  # show session state
 ```
 
 Run `mosaic --help` for the full command list. Runtime dependencies are
-`lxc`, `dbus`, a polkit authority, a PulseAudio or PipeWire server, and
-`iptables`.
+`lxc`, `libgbinder` (AUR `libgbinder-git`, loaded at runtime), `dbus`, a polkit
+authority, a PulseAudio or PipeWire server, and `iptables`. The binder kernel
+driver is required and is not in the Arch mainline kernel; see
+`packaging/arch/setup-host.sh`.
 
 ## Documentation
 

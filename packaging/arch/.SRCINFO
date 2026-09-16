@@ -14,6 +14,7 @@ pkgbase = mosaic
 	depends = polkit
 	depends = iptables
 	depends = xz
+	depends = libgbinder-git
 	options = !debug
 
 pkgname = mosaic
