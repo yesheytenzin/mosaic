@@ -33,3 +33,6 @@
 
 # Python bytecode from the bundle tools
 __pycache__/
+
+# Built binder shim objects
+tools/binder-shim/out/
