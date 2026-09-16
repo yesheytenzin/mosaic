@@ -397,6 +397,25 @@ do_jars() { # <image> <bundle>
   done
   echo "  + $(ls "$out/fonts" | wc -l) font files"
 
+  # Files the framework reads from the other partitions. The vendor image is
+  # optional because a bundle can be built from a system image alone; when it is
+  # given, the files the framework refuses to do without come from it --
+  # /vendor/etc/public.libraries.txt is fatal to SystemConfig when absent.
+  # SystemConfig treats a missing /vendor/etc/public.libraries.txt as fatal, and
+  # neither image has one (in this image /vendor lives inside system and only the
+  # system list exists). An empty list is valid and says the truth: no vendor
+  # libraries are exposed.
+  mkdir -p "$out/vendor/etc"
+  if [ -n "${MOSAIC_VENDOR_IMAGE:-}" ] && [ -f "${MOSAIC_VENDOR_IMAGE}" ]; then
+    dump_path "$MOSAIC_VENDOR_IMAGE" "/etc/public.libraries.txt" \
+      "$out/vendor/etc/public.libraries.txt" 2>/dev/null || true
+  fi
+  if [ ! -s "$out/vendor/etc/public.libraries.txt" ]; then
+    printf '# No vendor libraries are exposed by this bundle.\n' \
+      > "$out/vendor/etc/public.libraries.txt"
+    echo "  + vendor/etc/public.libraries.txt (empty)"
+  fi
+
   for entry in "${JARS_DATA[@]}"; do
     src="${entry%%:*}"
     rel="${entry##*:}"

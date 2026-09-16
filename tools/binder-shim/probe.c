@@ -314,6 +314,14 @@ static const char *redirect(const char *path) {
     } else if (strncmp(path, "/data/", 6) == 0) {
         prefix = "/data";
         rest = path + 6;
+    } else if (strncmp(path, "/vendor/", 8) == 0 ||
+               strncmp(path, "/product/", 9) == 0 ||
+               strncmp(path, "/system_ext/", 12) == 0 ||
+               strncmp(path, "/odm/", 5) == 0) {
+        /* The other partitions, kept under the bundle with their own names, so
+         * /vendor/etc/x resolves to <bundle>/vendor/etc/x. */
+        prefix = "";
+        rest = path + 1;
     } else if (strncmp(path, "/apex/", 6) == 0) {
         /* /apex/<module>/javalib/<file> and .../lib64/<file> both live in the
          * bundle's flat framework and lib64 directories. */

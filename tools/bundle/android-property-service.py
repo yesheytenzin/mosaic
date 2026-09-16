@@ -27,10 +27,19 @@ broker; this is the same thing in the harness, and the shape the broker's versio
 should take.
 """
 
+import importlib.util
 import os
 import socket
 import struct
 import sys
+
+# The area builder knows how to append to a prop_area, so a property created at
+# runtime is added with the same code that writes the area in the first place.
+_spec = importlib.util.spec_from_file_location(
+    "make_property_area", os.path.join(os.path.dirname(os.path.abspath(__file__)), "make-property-area.py")
+)
+make_property_area = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(make_property_area)
 
 SOCKET_PATH = os.environ.get("ANDROID_PROPERTY_SOCKET", "/dev/socket/property_service")
 # Where the areas and the index live. The harness points this at its private
@@ -61,10 +70,52 @@ def load_index() -> dict:
     return index
 
 
+def context_file() -> str:
+    """The file the areas live in, which is the only one that is not one of ours."""
+    for entry in sorted(os.listdir(AREA_DIR)):
+        if entry not in ("property_info", "properties_serial", INDEX_FILE):
+            return entry
+    return None
+
+
+def add_property(index: dict, name: str, value: str) -> str:
+    """Append a property the area does not define yet.
+
+    The trie has a catch-all prefix, so a name created here is findable without
+    rewriting property_info, which running processes have mapped. Only the area
+    grows, and it grows after everything already in it.
+    """
+    filename = context_file()
+    if filename is None:
+        return "no area file to add to"
+    path = os.path.join(AREA_DIR, filename)
+    with open(path, "rb") as handle:
+        existing = handle.read()
+    try:
+        area = make_property_area.PropArea(existing=existing)
+        area.add(name, value)
+        written = area.finish()
+    except Exception as error:  # noqa: BLE001 - reported, not raised
+        return f"could not add: {error}"
+    with open(path, "wb") as handle:
+        handle.write(written)
+    os.chmod(path, 0o644)
+    index[name] = (filename, area.index[name])
+    # Persist the index, so a restart of the service still knows where the
+    # property it added lives.
+    try:
+        with open(os.path.join(AREA_DIR, INDEX_FILE), "w") as handle:
+            for known, (where, offset) in sorted(index.items()):
+                handle.write(f"{known}\t{where}\t{offset}\n")
+    except OSError as error:
+        return f"added but could not record it: {error}"
+    return "added"
+
+
 def apply_write(index: dict, name: str, value: str) -> str:
     entry = index.get(name)
     if entry is None:
-        return "not in the area, dropped"
+        return add_property(index, name, value)
     filename, offset = entry
     raw = value.encode()
     if len(raw) >= PROP_VALUE_SIZE:
