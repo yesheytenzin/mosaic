@@ -1,0 +1,66 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Host prerequisites for running Mosaic in container mode on Arch.
+#
+# Mosaic boots Android inside LXC, which needs the binder kernel driver. On
+# Arch that driver is not in the mainline kernel, so it comes from the
+# binder_linux-dkms AUR package and is built against the running kernel's
+# headers. ashmem is not required; Mosaic falls back to memfd when /dev/ashmem
+# is absent.
+#
+# Run as your normal user. It uses yay for the AUR package and sudo only for
+# the module configuration files.
+#
+#   sh packaging/arch/setup-host.sh
+#
+# Then update the binary and initialize:
+#
+#   sudo make install
+#   sudo mosaic init
+
+set -eu
+
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Run this as your normal user, not root: yay must not run as root." >&2
+    exit 1
+fi
+
+if ! command -v yay >/dev/null 2>&1; then
+    echo "yay is required for the binder_linux-dkms AUR package." >&2
+    echo "Install an AUR helper, or build binder_linux-dkms manually." >&2
+    exit 1
+fi
+
+echo "==> Installing lxc and binder_linux-dkms"
+yay -S --needed --noconfirm lxc binder_linux-dkms
+
+echo "==> Configuring the binder module"
+sudo install -Dm644 /dev/stdin /etc/modprobe.d/mosaic-binder.conf <<'EOF'
+options binder_linux devices="binder,hwbinder,vndbinder"
+EOF
+sudo install -Dm644 /dev/stdin /etc/modules-load.d/mosaic-binder.conf <<'EOF'
+binder_linux
+EOF
+
+echo "==> Loading the binder module now"
+sudo modprobe binder_linux
+
+echo "==> Checking the result"
+for node in /dev/binder /dev/hwbinder /dev/vndbinder; do
+    if [ -e "$node" ]; then
+        echo "ok: $node"
+    else
+        echo "MISSING: $node" >&2
+        echo "Check 'dkms status' and that linux headers match 'uname -r'." >&2
+        exit 1
+    fi
+done
+if grep -qw binder /proc/filesystems; then
+    echo "ok: binderfs is available"
+fi
+
+echo
+echo "Host prerequisites are ready. From the repo root, next:"
+echo "  sudo make install"
+echo "  sudo mosaic init"
