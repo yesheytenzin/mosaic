@@ -29,6 +29,9 @@ socket by `src/binder/transport.rs`.
 - [ ] A transaction for a *handle* -- an object in another process. The shim hands
       back local objects, so nothing in this process needs it yet.
 - [ ] The shim forwards to the broker over the socket instead of answering locally
+- [ ] Hold a reference to a remembered object. The registry stores the pointer
+      without one, so a registration can go stale; the shim reports a stale object
+      as absent rather than handing libbinder a dangling pointer
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped

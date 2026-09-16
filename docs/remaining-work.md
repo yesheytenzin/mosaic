@@ -59,7 +59,7 @@ registrars resolve; the shim presents Android's absolute paths.
 ### Where the system server is now
 
 `startBootstrapServices` reaches `StartActivityManager` with real answers from the
-service manager:
+service manager, and no crash:
 
 ```
 SystemServerTiming: StartWatchdog ... StartInstaller ... UriGrantsManagerService
@@ -67,41 +67,30 @@ SystemServerTiming: StartPowerStatsService
 SystemServerTiming: StartIStatsService          (no longer aborts)
 SystemServerTiming: MemtrackProxyService
 SystemServerTiming: StartActivityManager
-android-binder: AIDL register memtrack.proxy
+android-binder: registered platform_compat
+android-binder: checkService platform_compat found
 android-binder: checkService memtrack.proxy found
 ```
 
-and then it stops, waiting for a service that does not exist:
+`ActivityManagerService`'s constructor still does not complete. Two known reasons,
+in order:
+
+1. The registry stores a pointer without a reference, so a remembered object can
+   be freed before it is handed back. One of two registrations was stale in the
+   last run. The shim reports a stale object as absent instead of passing
+   libbinder a dangling pointer -- a missing service rather than a SIGSEGV -- and
+   holding a reference at registration is the fix.
+2. Then `installd`, which does not exist and which the framework waits for:
 
 ```
-Installer: installd not found; trying again        (once a second, for good)
+Installer: installd not found; trying again
 ```
 
-`installd` is a native daemon on a device, and the service manager is telling the
-truth. This is not a binder problem any more. Two things follow, and they are one
-piece of work:
-
-1. Implement the AIDL interface in Rust and host it in the broker, so the shim
-   hands back a handle to something that answers.
-2. Forward a lookup the shim cannot answer to the broker over its socket. That is
-   what `src/binder/transport.rs` already does between two connections; the shim
-   has to become a client of it.
-
-### Why it was lost, and what was done about it
-
-The Java path used to get nothing from the service manager, for two reasons that
-both looked like "the registry does not work":
-
-- **The interface token is not first in the request.** Twelve bytes precede it and
-  an int32 sits between it and the name, so the name came out empty and every
-  lookup was a lookup for `""`. Searching for the descriptor, and then for the
-  first printable string after it, is what fixed it. `docs/binder.md` has the
-  layout and the constants, read out of libbinder's machine code rather than
-  recalled.
-- **An empty answer to a waiting thread is not neutral.** libbinder reads the next
-  command out of the buffer it was handed, and an empty buffer reads as command 0:
-  `*** BAD COMMAND 0 received from Binder driver`. `BR_NOOP` is the reply that
-  means "nothing happened", and a waiting thread gets that.
+Three shim bugs were fixed to get here, all recorded in `docs/binder.md`: the
+binder object type constants (the old ASCII encoding matched nothing, so no
+registration was ever kept), the string16 padding (two bytes for an odd count, not
+four), and writing a null strong binder by writing nothing (handing libbinder null
+is a SIGSEGV inside the framework's `getService`).
 
 ## B. `system_server` to completion
 
