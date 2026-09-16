@@ -45,7 +45,9 @@ registrars resolve; the shim presents Android's absolute paths.
    broker's unit *and* the system-side grant to the user manager, without which
    the unit's line is silently a no-op, plus a `tmpfiles.d` entry for the one path
    Bionic compiles in. A test keeps the two limits from drifting. *Gate:* not
-   verifiable here; `RLIMIT_NICE` cannot be raised from a user namespace.
+   verifiable here -- `RLIMIT_NICE` is 0, a process cannot raise its own hard
+   limit, and a user namespace does not help. `make verify-priority` is the check
+   for whoever has root, and what it establishes is in `docs/todo-a.md`.
 7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
    `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
    (empty, and says so) because `SystemConfig` treats its absence as fatal.
