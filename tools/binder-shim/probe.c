@@ -68,6 +68,33 @@ struct binder_write_read {
 static void emit(const char *s);
 static void emit_dec(long value);
 static void flush_log(void);
+
+extern int strncmp(const char *, const char *, unsigned long);
+extern int strcmp(const char *, const char *);
+extern char *strcpy(char *, const char *);
+extern char *strcat(char *, const char *);
+extern char *getenv(const char *);
+extern char *strstr(const char *, const char *);
+
+/* Report each rewritten path once, so a run stays readable. */
+#define MAX_REDIRECTIONS 24
+static const char *redirected[MAX_REDIRECTIONS];
+static int redirected_count = 0;
+
+static void report(const char *from, const char *to) {
+    if (redirected_count >= MAX_REDIRECTIONS) return;
+    for (int i = 0; i < redirected_count; i++) {
+        if (redirected[i] && strcmp(redirected[i], from) == 0) return;
+    }
+    redirected[redirected_count++] = from;
+    emit("android-paths: ");
+    emit(from);
+    emit(" -> ");
+    emit(to);
+    emit("\n");
+    flush_log();
+}
+static void flush_log(void);
 static char log_buffer[16384];
 static long log_length = 0;
 
@@ -271,6 +298,55 @@ static void emit_prefixed(const char *prefix, const char *value) {
     emit("\n");
 }
 
+/* Returns the rewritten path, or the original. */
+static const char *redirect(const char *path) {
+    static char buffer[4096];
+    const char *root = getenv("MOSAIC_ANDROID_ROOT");
+    if (!root || !*root || !path || path[0] != '/') return path;
+
+    const char *rest = 0;
+    const char *prefix = 0;
+    if (strncmp(path, "/system/", 8) == 0) {
+        prefix = "/system";
+        rest = path + 8;
+    } else if (strncmp(path, "/data/", 6) == 0) {
+        prefix = "/data";
+        rest = path + 6;
+    } else if (strncmp(path, "/apex/", 6) == 0) {
+        /* /apex/<module>/javalib/<file> and .../lib64/<file> both live in the
+         * bundle's flat framework and lib64 directories. */
+        const char *javalib = strstr(path, "/javalib/");
+        const char *lib64 = strstr(path, "/lib64/");
+        if (javalib) {
+            prefix = "/apex-javalib";
+            rest = javalib + 9;
+        } else if (lib64) {
+            prefix = "/apex-lib64";
+            rest = lib64 + 7;
+        } else {
+            return path;
+        }
+    } else {
+        return path;
+    }
+
+    if (strcmp(prefix, "/apex-javalib") == 0) {
+        strcpy(buffer, root);
+        strcat(buffer, "/framework/");
+    } else if (strcmp(prefix, "/apex-lib64") == 0) {
+        strcpy(buffer, root);
+        strcat(buffer, "/lib64/");
+    } else {
+        /* The bundle root stands in for /system, so those paths lose the prefix
+         * rather than gaining it. */
+        strcpy(buffer, root);
+        strcat(buffer, "/");
+    }
+    strcat(buffer, rest);
+    report(path, buffer);
+    return buffer;
+}
+
 static int name_is_binder(const char *path) {
     if (!path) return 0;
     /* "/dev/binder", "/dev/binderfs/binder", anything that ends in binder. */
@@ -299,6 +375,9 @@ static int make_placeholder_fd(void) {
 /* Bionic's <fcntl.h> defines open() as an inline wrapper around __openat, so a
  * preloaded open() is never called. These are the symbols that matter. */
 int __openat(int dirfd, const char *path, int flags, int mode) {
+    /* The framework hardcodes paths that cannot be configured, so they are
+     * rewritten first; then the binder device is intercepted. */
+    path = redirect(path);
     if (name_is_binder(path)) {
         binder_fd = make_placeholder_fd();
         emit_prefixed("open ", path);

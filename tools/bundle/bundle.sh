@@ -260,29 +260,21 @@ do_stage() { # <image> <bundle> <inode> <name> [args...]
 }
 
 # The classpath and the data files ART needs beyond the shared libraries.
-JARS=(
-  "/system/apex/com.android.art/javalib/core-oj.jar:javalib"
-  "/system/apex/com.android.art/javalib/core-libart.jar:javalib"
-  "/system/apex/com.android.i18n/javalib/core-icu4j.jar:javalib"
-  "/system/apex/com.android.art/javalib/okhttp.jar:javalib"
-  "/system/apex/com.android.art/javalib/bouncycastle.jar:javalib"
-  "/system/apex/com.android.art/javalib/apache-xml.jar:javalib"
-  "/system/framework/framework.jar:framework"
-  "/system/framework/telephony-common.jar:framework"
-  "/system/framework/voip-common.jar:framework"
-  "/system/framework/com.android.location.provider.jar:framework"
-  "/system/framework/org.lineageos.platform.jar:framework"
-  "/system/apex/com.android.conscrypt/javalib/conscrypt.jar:framework"
-  "/system/apex/com.android.os.statsd/javalib/framework-statsd.jar:framework"
-  "/system/apex/com.android.art/javalib/service-art.jar:framework"
-  "/system/apex/com.android.os.statsd/javalib/service-statsd.jar:framework"
-  "/system/framework/services.jar:framework"
-  "/system/framework/framework-graphics.jar:framework"
-  "/system/framework/ext.jar:framework"
-  "/system/framework/ims-common.jar:framework"
-  "/system/framework/android.hidl.base-V1.0-java.jar:framework"
-  "/system/framework/android.hidl.manager-V1.0-java.jar:framework"
+#
+# The jar lists are not hardcoded: the image ships them, in an /etc/classpaths
+# config per partition and per apex, and derive_classpath is what turns them into
+# BOOTCLASSPATH at boot (init.rc does `load_exports /data/system/environ/classpath`).
+# Reading them means the bundle matches whatever image it was built from, which is
+# how the missing-class wall was finally cleared.
+JARS_DATA=(
+  "/system/apex/com.android.i18n/etc/icu/icudt70l.dat:i18n/etc/icu"
 )
+
+# Resource packages the framework opens by path. AssetManager loads the platform
+# resources as /system/framework/framework-res.apk and every other *-res.apk the
+# build put there (a LineageOS image adds its own), and it fails to start without
+# them: "Failed to create system AssetManager", caused by whichever one is
+# missing. They are collected from the image rather than listed, for that reason.
 
 dump_path() { # <image> <source path> <destination file>
   local img="$1" src="$2" dst="$3" name dir inode
@@ -295,54 +287,106 @@ dump_path() { # <image> <source path> <destination file>
     return 1
   fi
   debugfs -R "dump <$inode> $dst" "$img" 2>/dev/null >/dev/null
-  echo "  + $name -> $dst ($(stat -c %s "$dst") bytes)"
+  echo "  + $name"
+}
+
+# The jar paths named by one classpath config: the entries are protobuf strings
+# with a length prefix before the path, so everything up to the first slash goes.
+jars_from_config() { # <config file>
+  strings -a "$1" 2>/dev/null \
+    | grep -oE '(/apex|/system|/vendor)/[^ ]*\.jar' | awk 'NF && !seen[$0]++'
+}
+
+# Every classpath config the image has: the system partition's and one per apex.
+classpath_configs() { # <image> <bootclasspath|systemserverclasspath>
+  local img="$1" want="$2" apex inode
+  inode=$(debugfs -R "ls -l /system/etc/classpaths" "$img" 2>/dev/null \
+    | awk -v n="$want.pb" '$NF == n { print $1 }')
+  [ -n "$inode" ] && debugfs -R "dump <$inode> $out/index/system-$want.pb" "$img" 2>/dev/null >/dev/null
+  for apex in $(debugfs -R "ls -l /system/apex" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF != "." && $NF != ".." { print $NF }'); do
+    inode=$(debugfs -R "ls -l /system/apex/$apex/etc/classpaths" "$img" 2>/dev/null \
+      | awk -v n="$want.pb" '$NF == n { print $1 }')
+    [ -n "$inode" ] || continue
+    debugfs -R "dump <$inode> $out/index/$apex-$want.pb" "$img" 2>/dev/null >/dev/null
+  done
+}
+
+# Stage the jars a classpath names and write the classpath file for the bundle.
+stage_classpath() { # <image> <bootclasspath|systemserverclasspath> <output file>
+  local img="$1" want="$2" list="$3" jar base where found
+  classpath_configs "$img" "$want"
+
+  # The ART core libraries come first, as they do on a device; the rest follow in
+  # the order the configs were read.
+  local ordered=""
+  for config in "$out/index"/*-"$want".pb; do
+    [ -f "$config" ] || continue
+    while read -r jar; do
+      base=$(basename "$jar")
+      case "$base" in core-oj.jar|core-libart.jar|core-icu4j.jar|okhttp.jar|bouncycastle.jar|apache-xml.jar)
+        ordered="$ordered $jar" ;; esac
+    done < <(jars_from_config "$config")
+  done
+  for config in "$out/index"/*-"$want".pb; do
+    [ -f "$config" ] || continue
+    while read -r jar; do ordered="$ordered $jar"; done < <(jars_from_config "$config")
+  done
+
+  : > "$list"
+  local seen=""
+  for jar in $ordered; do
+    base=$(basename "$jar")
+    case " $seen " in *" $base "*) continue ;; esac
+    seen="$seen $base"
+    if [ ! -f "$out/framework/$base" ]; then
+      where=""
+      for candidate in "/system$jar" "$jar" "/system/apex${jar#/apex}"; do
+        inode=$(debugfs -R "ls -l $(dirname "$candidate")" "$img" 2>/dev/null \
+          | awk -v n="$(basename "$candidate")" '$NF == n { print $1 }')
+        if [ -n "$inode" ]; then where="$candidate"; break; fi
+      done
+      if [ -z "$where" ]; then
+        echo "  MISSING from the image: $jar" >&2
+        continue
+      fi
+      dump_path "$img" "$where" "$out/framework/$base" >/dev/null || continue
+      echo "  + $base"
+    fi
+    printf '%s/framework/%s:' "$out" "$base" >> "$list"
+  done
+  sed -i 's/:$//' "$list"
+  echo "  $want: $(tr ':' '\n' < "$list" | wc -l) jars"
 }
 
 do_jars() { # <image> <bundle>
   local img="$1" out="$2" entry src rel
-  for entry in "${JARS[@]}"; do
+  mkdir -p "$out/framework"
+
+  echo "  boot classpath, from the image's own configs"
+  stage_classpath "$img" bootclasspath "$out/bootclasspath.txt"
+
+  echo "  system server classpath, from the image's own configs"
+  stage_classpath "$img" systemserverclasspath "$out/systemserverclasspath.txt"
+
+  # Every resource package in the framework directory.
+  local res
+  for res in $(debugfs -R "ls -l /system/framework" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /-res\.apk$/ { print $NF }'); do
+    dump_path "$img" "/system/framework/$res" "$out/framework/$res"
+  done
+
+  for entry in "${JARS_DATA[@]}"; do
     src="${entry%%:*}"
     rel="${entry##*:}"
     mkdir -p "$out/$rel"
-    dump_path "$img" "$src" "$out/$rel/$(basename "$src")"
+    dump_path "$img" "$src" "$out/$rel/$(basename "$src")" || true
   done
-
-  # ART loads the ICU data file by name from ANDROID_I18N_ROOT.
-  mkdir -p "$out/i18n/etc/icu"
-  dump_path "$img" /system/apex/com.android.i18n/etc/icu/icudt70l.dat \
-    "$out/i18n/etc/icu/icudt70l.dat"
-
-  # The boot classpath, in the order ART expects it: core libraries, then the
-  # framework, then the optional modules.
-  {
-    local rel
-    for rel in core-oj.jar core-libart.jar core-icu4j.jar okhttp.jar \
-               bouncycastle.jar apache-xml.jar; do
-      printf '%s/javalib/%s:' "$out" "$rel"
-    done
-    for rel in framework.jar framework-graphics.jar ext.jar telephony-common.jar \
-               voip-common.jar ims-common.jar conscrypt.jar framework-statsd.jar \
-               android.hidl.base-V1.0-java.jar android.hidl.manager-V1.0-java.jar; do
-      printf '%s/framework/%s:' "$out" "$rel"
-    done
-  } | sed 's/:$//' > "$out/bootclasspath.txt"
-
-  # And the system server's own classpath, from
-  # /system/etc/classpaths/systemserverclasspath.pb. It is not the boot class
-  # path: services.jar and its companions go here.
-  {
-    local rel
-    for rel in services.jar com.android.location.provider.jar org.lineageos.platform.jar \
-               service-art.jar service-statsd.jar; do
-      printf '%s/framework/%s:' "$out" "$rel"
-    done
-  } | sed 's/:$//' > "$out/systemserverclasspath.txt"
-  echo "  + bootclasspath.txt"
 }
 
 do_build() { # <image> <bundle>
   local img="$1" out="$2"
-  mkdir -p "$out/bin" "$out/lib64" "$out/lib64/bionic" "$out/data/dalvik-cache" "$out/tmp"
+  mkdir -p "$out/bin" "$out/lib64" "$out/lib64/bionic" "$out/data/dalvik-cache" "$out/tmp" "$out/index"
 
   echo "indexing..."
   do_index "$img" "$out"
@@ -377,6 +421,8 @@ libopenjdkjvm.so
 libadbconnection.so
 libsigchain.so
 libstats_jni.so
+libandroid_servers.so
+libjavacrypto.so
 SEED
 
   # ART preloads every entry in the device's public library list, so the bundle
