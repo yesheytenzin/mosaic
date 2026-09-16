@@ -39,6 +39,7 @@ extern void free(void *);
 
 #define SYM_WRITE_INT32 "_ZN7android6Parcel10writeInt32Ei"
 #define SYM_WRITE_BINDER "_ZN7android6Parcel17writeStrongBinderERKNS_2spINS_7IBinderEEE"
+#define SYM_WRITE_BYTES "_ZN7android6Parcel5writeEPKvm"
 #define SYM_DATA "_ZNK7android6Parcel4dataEv"
 #define SYM_DATA_SIZE "_ZNK7android6Parcel8dataSizeEv"
 #define SYM_PARCEL_CTOR "_ZN7android6ParcelC1Ev"
@@ -50,6 +51,9 @@ extern void free(void *);
 #define SYM_SET_POSITION "_ZNK7android6Parcel15setDataPositionEm"
 #define SYM_GET_POSITION "_ZNK7android6Parcel12dataPositionEv"
 #define SYM_READ_BINDER "_ZNK7android6Parcel16readStrongBinderEv"
+#define SYM_SET_REFERENCE "_ZN7android6Parcel19ipcSetDataReferenceEPKhmPKymPFvPS0_S2_mS4_mE"
+#define SYM_BINDER_TRANSACT "_ZN7android7BBinder8transactEjRKNS_6ParcelEPS1_j"
+extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
 
 /* A Parcel is a few hundred bytes and its layout is libbinder's business, so it
  * is allocated with room to spare and initialised by its own constructor. */
@@ -92,6 +96,9 @@ typedef struct {
     char name[NAME_MAX];
     void *object;
     unsigned long cookie;
+    /* The node this service was published under, which is what a transaction
+     * arriving from another process names. */
+    unsigned long node;
 } service_t;
 
 static service_t services[MAX_SERVICES];
@@ -172,6 +179,7 @@ static void say_once(void) {
 
 typedef int (*write_int32_fn)(void *, int);
 typedef int (*write_binder_fn)(void *, const void *);
+typedef int (*write_bytes_fn)(void *, const void *, ulong);
 typedef const unsigned char *(*parcel_data_fn)(const void *);
 typedef ulong (*parcel_size_fn)(const void *);
 typedef void (*parcel_ctor_fn)(void *);
@@ -180,10 +188,19 @@ typedef const unsigned long *(*parcel_objects_fn)(const void *);
 typedef ulong (*parcel_count_fn)(const void *);
 typedef int (*parcel_position_fn)(const void *, ulong);
 typedef ulong (*parcel_where_fn)(const void *);
-typedef void *(*parcel_read_fn)(const void *);
+/* readStrongBinder returns an sp<IBinder> by value. sp has a user-declared
+ * destructor, so the Itanium ABI returns it through a hidden first pointer --
+ * calling it as if it returned a pointer in rax is what made the first attempt
+ * at this crash. */
+typedef void (*parcel_read_fn)(void *out, const void *self);
+typedef void (*parcel_set_reference_fn)(void *self, const unsigned char *data, ulong size,
+                                        const ulong *objects, ulong count, void *release);
+typedef int (*binder_transact_fn)(void *self, uint32 code, const void *data, void *reply,
+                                  uint32 flags);
 
 static write_int32_fn parcel_write_int32;
 static write_binder_fn parcel_write_binder;
+static write_bytes_fn parcel_write_bytes;
 static parcel_data_fn parcel_data;
 static parcel_size_fn parcel_data_size;
 static parcel_ctor_fn parcel_ctor;
@@ -195,6 +212,8 @@ static parcel_count_fn parcel_ipc_objects_count;
 static parcel_position_fn parcel_set_position;
 static parcel_where_fn parcel_data_position;
 static parcel_read_fn parcel_read_strong;
+static parcel_set_reference_fn parcel_set_reference;
+static binder_transact_fn binder_transact;
 
 static void resolve(void) {
     if (parcel_write_int32) return;
@@ -204,6 +223,7 @@ static void resolve(void) {
         return;
     }
     parcel_write_int32 = (write_int32_fn)dlsym(binder, SYM_WRITE_INT32);
+    parcel_write_bytes = (write_bytes_fn)dlsym(binder, SYM_WRITE_BYTES);
     parcel_write_binder = (write_binder_fn)dlsym(binder, SYM_WRITE_BINDER);
     parcel_data = (parcel_data_fn)dlsym(binder, SYM_DATA);
     parcel_data_size = (parcel_size_fn)dlsym(binder, SYM_DATA_SIZE);
@@ -216,12 +236,8 @@ static void resolve(void) {
     parcel_set_position = (parcel_position_fn)dlsym(binder, SYM_SET_POSITION);
     parcel_data_position = (parcel_where_fn)dlsym(binder, SYM_GET_POSITION);
     parcel_read_strong = (parcel_read_fn)dlsym(binder, SYM_READ_BINDER);
-}
-
-static ulong u64_at(const unsigned char *p) {
-    ulong v;
-    __builtin_memcpy(&v, p, 8);
-    return v;
+    parcel_set_reference = (parcel_set_reference_fn)dlsym(binder, SYM_SET_REFERENCE);
+    binder_transact = (binder_transact_fn)dlsym(binder, SYM_BINDER_TRANSACT);
 }
 
 static uint32 u32_at(const unsigned char *p) {
@@ -333,11 +349,299 @@ static const unsigned char *name_after_token(const unsigned char *data, ulong si
     return 0;
 }
 
+/* ---- the broker's socket --------------------------------------------------
+ *
+ * The broker owns the name space that more than one process can see, so a
+ * service registered here is published to it, a name this process does not have
+ * is asked of it, and a transaction for an object in another process is sent to
+ * it. It also sends transactions the other way: the reader thread below serves
+ * them out of the local objects.
+ *
+ * The wire format is the broker's, and is fixed size and big-endian so this
+ * side can write it too:
+ *
+ *   0  u8   kind        4  u32 a      16 u64 node
+ *   1  u8   version     8  u32 b      24 u32 data length
+ *   2  u16  reserved    12 u32 c      28 u32 descriptor count
+ *
+ * A connection begins with the magic MSBD, which as a control-plane length
+ * prefix would be refused long before MAX_FRAME.
+ */
+
+#define MOSAIC_WIRE_MAGIC "MSBD"
+#define MOSAIC_WIRE_VERSION 1
+
+#define KIND_TRANSACTION 0
+#define KIND_REPLY 1
+#define KIND_ACQUIRE 2
+#define KIND_RELEASE 3
+#define KIND_INCREFS 4
+#define KIND_DECREFS 5
+#define KIND_DEAD 6
+#define KIND_INCOMING 7
+#define KIND_BYE 8
+#define KIND_EXPORT 9
+#define KIND_LOOKUP 10
+#define KIND_FOUND 11
+#define KIND_INCOMING_REPLY 12
+
+#define NO_HANDLE 0xffffffffu
+
+#define MAX_BROKER_FRAME (1024 * 1024)
+#define MAX_BROKER_FDS 8
+
+#define SYS_READ 0
+#define SYS_CLOSE 3
+#define SYS_SOCKET 41
+#define SYS_CONNECT 42
+#define SYS_NANOSLEEP 35
+#define SYS_GETPID 39
+
+extern long syscall(long, ...);
+extern char *getenv(const char *);
+extern int strcmp(const char *, const char *);
+extern char *strcpy(char *, const char *);
+extern char *strcat(char *, const char *);
+extern void *malloc(ulong);
+extern void free(void *);
+
+static int broker_fd = -1;
+static char broker_path[256];
+static int broker_lock = 0;
+static int broker_wanted = -1;
+
+/* Talking to the broker is off unless asked for.
+ *
+ * It is written and it builds, and it is not finished: the first run published
+ * nothing and the reason is not yet found. Because a lookup that misses locally
+ * would then wait on a socket for every service the framework does not have --
+ * hundreds of them, five seconds each -- leaving it on by default would turn an
+ * unverified path into a broken boot. MOSAIC_BINDER_BROKER=1 turns it on. */
+static int broker_enabled(void) {
+    if (broker_wanted < 0) {
+        const char *v = getenv("MOSAIC_BINDER_BROKER");
+        broker_wanted = (v && v[0] == '1') ? 1 : 0;
+    }
+    return broker_wanted;
+}
+
+static void lock_broker(void) {
+    while (__sync_lock_test_and_set(&broker_lock, 1)) {
+    }
+}
+
+static void unlock_broker(void) {
+    __sync_lock_release(&broker_lock);
+}
+
+/* Where the broker listens. The socket is a systemd user socket, so the runtime
+ * directory is where it is; MOSAIC_BINDER_SOCKET overrides it for a harness. */
+static const char *broker_socket_path(void) {
+    if (broker_path[0]) return broker_path;
+    const char *set = getenv("MOSAIC_BINDER_SOCKET");
+    if (set && set[0]) {
+        int i = 0;
+        while (set[i] && i < (int)sizeof(broker_path) - 1) {
+            broker_path[i] = set[i];
+            i++;
+        }
+        broker_path[i] = 0;
+        return broker_path;
+    }
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && runtime[0]) {
+        int i = 0;
+        const char *suffix = "/mosaic/broker.sock";
+        while (runtime[i] && i < (int)sizeof(broker_path) - 32) {
+            broker_path[i] = runtime[i];
+            i++;
+        }
+        for (int k = 0; suffix[k]; k++) broker_path[i++] = suffix[k];
+        broker_path[i] = 0;
+    }
+    return broker_path[0] ? broker_path : 0;
+}
+
+static int broker_connect(void) {
+    if (!broker_enabled()) return -1;
+    if (broker_fd >= 0) return broker_fd;
+    const char *path = broker_socket_path();
+    if (!path) return -1;
+
+    say("android-binder: broker path ");
+    say(path);
+    say("\n");
+    say_once();
+    int fd = (int)syscall(SYS_SOCKET, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0);
+    if (fd < 0) {
+        say("android-binder: no socket\n");
+        say_once();
+        return -1;
+    }
+
+    /* struct sockaddr_un: a family and a path, the path starting at offset 2. */
+    unsigned char addr[110];
+    for (int i = 0; i < 110; i++) addr[i] = 0;
+    addr[0] = 1; /* AF_UNIX */
+    addr[1] = 0;
+    int i = 0;
+    while (path[i] && i < 106) {
+        addr[2 + i] = (unsigned char)path[i];
+        i++;
+    }
+    long connected = syscall(SYS_CONNECT, fd, addr, 2 + i + 1);
+    if (connected != 0) {
+        say("android-binder: connect to the broker failed (");
+        say_dec(connected);
+        say(")\n");
+        say_once();
+        syscall(SYS_CLOSE, fd);
+        return -1;
+    }
+    if (write(fd, MOSAIC_WIRE_MAGIC, 4) != 4) {
+        syscall(SYS_CLOSE, fd);
+        return -1;
+    }
+    broker_fd = fd;
+    return fd;
+}
+
+static void put_u32(unsigned char *p, uint32 v) {
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+static uint32 get_u32(const unsigned char *p) {
+    return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+static void put_u64(unsigned char *p, ulong v) {
+    put_u32(p, (uint32)(v >> 32));
+    put_u32(p + 4, (uint32)v);
+}
+
+static ulong get_u64(const unsigned char *p) {
+    return ((ulong)get_u32(p) << 32) | (ulong)get_u32(p + 4);
+}
+
+/* Write every byte, whatever the kernel returns. */
+static int write_all(int fd, const unsigned char *data, ulong size) {
+    ulong done = 0;
+    while (done < size) {
+        long n = write(fd, data + done, size - done);
+        if (n <= 0) return -1;
+        done += (ulong)n;
+    }
+    return 0;
+}
+
+static int read_all(int fd, unsigned char *data, ulong size) {
+    ulong done = 0;
+    while (done < size) {
+        long n = syscall(SYS_READ, fd, data + done, size - done);
+        if (n <= 0) return -1;
+        done += (ulong)n;
+    }
+    return 0;
+}
+
+static int broker_send(uint32 kind, uint32 a, uint32 b, uint32 c, ulong node,
+                       const unsigned char *data, ulong size) {
+    int fd = broker_connect();
+    if (fd < 0) return -1;
+    if (size > MAX_BROKER_FRAME) return -1;
+
+    unsigned char header[32];
+    header[0] = (unsigned char)kind;
+    header[1] = MOSAIC_WIRE_VERSION;
+    header[2] = 0;
+    header[3] = 0;
+    put_u32(header + 4, a);
+    put_u32(header + 8, b);
+    put_u32(header + 12, c);
+    put_u64(header + 16, node);
+    put_u32(header + 24, (uint32)size);
+    put_u32(header + 28, 0);
+
+    lock_broker();
+    int result = write_all(fd, header, 32);
+    if (result == 0 && size > 0) result = write_all(fd, data, size);
+    unlock_broker();
+    return result;
+}
+
+/* Read one frame. `data` is the caller's buffer and `size` its capacity on the
+ * way in, the body's length on the way out. */
+static int broker_recv(uint32 *kind, uint32 *a, uint32 *b, uint32 *c, ulong *node,
+                       unsigned char *data, ulong *size) {
+    int fd = broker_fd;
+    if (fd < 0) return -1;
+    unsigned char header[32];
+    if (read_all(fd, header, 32) != 0) return -1;
+    if (header[1] != MOSAIC_WIRE_VERSION) return -1;
+
+    *kind = header[0];
+    *a = get_u32(header + 4);
+    *b = get_u32(header + 8);
+    *c = get_u32(header + 12);
+    *node = get_u64(header + 16);
+    ulong length = get_u32(header + 24);
+    if (get_u32(header + 28) != 0) return -1; /* descriptors are not used yet */
+    if (length > MAX_BROKER_FRAME || length > *size) return -1;
+    if (length > 0 && read_all(fd, data, length) != 0) return -1;
+    *size = length;
+    return 0;
+}
+
 static int service_name_of(const unsigned char *data, ulong size, char *out, int cap) {
     return name_after_token(data, size, out, cap) != 0;
 }
 
+/* Take the object argument with libbinder's own reader.
+ *
+ * The object table records where each object *ends*, and a binder object is 24
+ * bytes, so its start is 24 before the first recorded offset. Reading it through
+ * libbinder rather than out of the bytes means the type decides what the fields
+ * mean, and -- the point of doing it this way -- readStrongBinder takes a
+ * reference, which is left in place: the registry holds the service from here on.
+ * That is what stops a remembered object from going stale and taking the
+ * framework's getService down with it when it is handed back.
+ *
+ * This replaced a hand parse of the flat_binder_object whose pointer was stored
+ * with no reference at all.
+ *
+ * readStrongBinder returns an sp<IBinder> by value, and sp has a user-declared
+ * destructor, so the Itanium ABI returns it through a hidden first pointer:
+ * calling it as though it returned a pointer in rax is what made the first
+ * attempt at this crash. */
+static void *object_at(void *parcel) {
+    if (!parcel || !parcel_set_position || !parcel_read_strong) return 0;
+    if (!parcel_ipc_objects || !parcel_ipc_objects_count) return 0;
+    ulong count = parcel_ipc_objects_count(parcel);
+    if (count == 0) return 0;
+    const ulong *offsets = parcel_ipc_objects(parcel);
+    if (!offsets || offsets[0] < 24) return 0;
+
+    ulong saved = parcel_data_position ? parcel_data_position(parcel) : 0;
+    if (parcel_set_position(parcel, offsets[0] - 24) != 0) {
+        parcel_set_position(parcel, saved);
+        return 0;
+    }
+    /* The sp lands here and is deliberately not destroyed: its reference is the
+     * registry's. */
+    unsigned long held[2] = {0, 0};
+    parcel_read_strong(held, parcel);
+    parcel_set_position(parcel, saved);
+    return (void *)held[0];
+}
+
+static void broker_export(const char *name, ulong node);
+
 static void remember(const char *name, void *object, unsigned long cookie) {
+    ulong node = 0;
+    int listed = 0;
     if (!name || !object) return;
     lock_registry();
     for (int i = 0; i < service_count; i++) {
@@ -366,9 +670,15 @@ static void remember(const char *name, void *object, unsigned long cookie) {
         services[service_count].name[n] = 0;
         services[service_count].object = object;
         services[service_count].cookie = cookie;
+        /* A node id carries this process's pid in its high half, which is how
+         * the broker stops one process from publishing another's object. */
+        services[service_count].node = ((ulong)syscall(SYS_GETPID) << 32) | (ulong)(service_count + 1);
+        node = services[service_count].node;
         service_count++;
+        listed = 1;
     }
     unlock_registry();
+    if (listed) broker_export(name, node);
 }
 
 static void *lookup(const char *name) {
@@ -407,6 +717,227 @@ void mosaic_binder_remember(const char *name, void *object) {
 
 void *mosaic_binder_lookup(const char *name) {
     return lookup(name);
+}
+
+/* ---- using the socket ----------------------------------------------------- */
+
+#define SYS_GETPID 39
+
+struct timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+
+/* One request is outstanding at a time: this side makes them synchronously, and
+ * the reader thread below fills the slot when the answer arrives. */
+static int response_ready = 0;
+static uint32 response_kind = 0;
+static uint32 response_a = 0;
+static uint32 response_b = 0;
+static uint32 response_c = 0;
+static ulong response_length = 0;
+static ulong response_node = 0;
+static unsigned char *response_data = 0;
+static ulong response_capacity = 0;
+
+static int reader_started = 0;
+
+static void *broker_reader(void *arg);
+
+static void start_reader(void) {
+    if (reader_started) return;
+    if (broker_connect() < 0) return;
+    unsigned long thread = 0;
+    /* pthread_create comes from libc, which the process has even though this
+     * library was built without one. */
+    if (pthread_create(&thread, 0, broker_reader, 0) == 0) reader_started = 1;
+}
+
+/* Wait for the answer to whatever was just sent, and take it. */
+static int await_response(uint32 want_kind, unsigned char **data, ulong *size, uint32 *a, uint32 *b, uint32 *c) {
+    for (int i = 0; i < 5000; i++) { /* five seconds */
+        if (__sync_bool_compare_and_swap(&response_ready, 1, 0)) {
+            *data = response_data;
+            *size = response_length;
+            *a = response_a;
+            *b = response_b;
+            *c = response_c;
+            (void)want_kind;
+            return 0;
+        }
+        struct timespec step = {0, 1000000}; /* one millisecond */
+        syscall(SYS_NANOSLEEP, &step, 0);
+    }
+    return -1;
+}
+
+/* Publish a name for a node this process owns. */
+static void broker_export(const char *name, ulong node) {
+    if (!name) return;
+    start_reader();
+    if (broker_fd < 0) return;
+    lock_broker();
+    if (broker_send(KIND_EXPORT, 0, 0, 0, node, (const unsigned char *)name, length(name)) == 0) {
+        say("android-binder: published ");
+        say(name);
+        say("\n");
+        say_once();
+    }
+    unlock_broker();
+}
+
+/* Ask the broker for a name. Returns a handle in this process's table, or
+ * NO_HANDLE. */
+static uint32 broker_lookup(const char *name, ulong *node, uint32 *owner) {
+    if (!name) return NO_HANDLE;
+    start_reader();
+    if (broker_fd < 0) return NO_HANDLE;
+    lock_broker();
+    if (broker_send(KIND_LOOKUP, 0, 0, 0, 0, (const unsigned char *)name, length(name)) != 0) {
+        unlock_broker();
+        return NO_HANDLE;
+    }
+    unsigned char *data = 0;
+    ulong size = 0;
+    uint32 a = 0, b = 0, c = 0;
+    int waited = await_response(KIND_FOUND, &data, &size, &a, &b, &c);
+    unlock_broker();
+    if (waited != 0) return NO_HANDLE;
+    if (node) *node = response_node;
+    if (owner) *owner = b;
+    return a;
+}
+
+/* Send a transaction to an object another process owns and take its answer. */
+static int broker_transact(uint32 handle, uint32 code, uint32 flags, const unsigned char *data,
+                           ulong size, unsigned char **reply, ulong *reply_size, uint32 *status);
+
+/* Serve one transaction another process sent to an object here. */
+static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
+                         const unsigned char *data, ulong size);
+
+static void *broker_reader(void *arg) {
+    (void)arg;
+    if (!response_data) {
+        response_capacity = 64 * 1024;
+        response_data = (unsigned char *)malloc(response_capacity);
+    }
+    if (!response_data) return 0;
+    for (;;) {
+        uint32 kind = 0, a = 0, b = 0, c = 0;
+        ulong node = 0;
+        ulong size = response_capacity;
+        if (broker_recv(&kind, &a, &b, &c, &node, response_data, &size) != 0) break;
+        if (kind == KIND_INCOMING) {
+            broker_serve(a, node, b, c, response_data, size);
+            continue;
+        }
+        if (kind == KIND_DEAD) continue;
+        /* Anything else is an answer to something this side asked. */
+        response_kind = kind;
+        response_a = a;
+        response_b = b;
+        response_c = c;
+        response_node = node;
+        response_length = size;
+        __sync_lock_test_and_set(&response_ready, 1);
+    }
+    return 0;
+}
+
+/* The object a node names, if this process owns it. */
+static void *object_for_node(ulong node) {
+    lock_registry();
+    void *object = 0;
+    for (int i = 0; i < service_count; i++) {
+        if (services[i].node == node) {
+            object = services[i].object;
+            break;
+        }
+    }
+    unlock_registry();
+    return object;
+}
+
+/* Serve a transaction another process sent to an object here.
+ *
+ * The request arrives as the parcel bytes the sender wrote, so the object is
+ * called the way a local call would call it: a Parcel is built over those bytes
+ * and BBinder::transact is entered by symbol, which then dispatches to the
+ * object's own onTransact. The answer is read back out the same way it was
+ * written, objects and all. */
+static void broker_serve(uint32 from, ulong node, uint32 code, uint32 flags,
+                         const unsigned char *data, ulong size) {
+    (void)from;
+    void *object = object_for_node(node);
+    int status = -1;
+    unsigned char *out = 0;
+    ulong out_size = 0;
+
+    if (object && parcel_ctor && parcel_dtor && binder_transact) {
+        void *request = malloc(PARCEL_BYTES);
+        void *reply = malloc(PARCEL_BYTES);
+        if (request && reply) {
+            parcel_ctor(request);
+            if (parcel_set_reference) {
+                parcel_set_reference(request, data, size, 0, 0, 0);
+                parcel_ctor(reply);
+                status = binder_transact(object, code, request, reply, flags);
+                const unsigned char *bytes = parcel_ipc_data ? parcel_ipc_data(reply) : 0;
+                ulong length = parcel_ipc_data_size ? parcel_ipc_data_size(reply) : 0;
+                if (bytes && length) {
+                    out = (unsigned char *)malloc(length ? length : 8);
+                    if (out) {
+                        __builtin_memcpy(out, bytes, length);
+                        out_size = length;
+                    }
+                }
+                parcel_dtor(reply);
+            }
+            parcel_dtor(request);
+        }
+        free(reply);
+        free(request);
+    }
+    say("android-binder: served node ");
+    say_dec((long)node);
+    say(" code ");
+    say_dec((long)code);
+    say(status == 0 ? " ok\n" : " failed\n");
+    say_once();
+
+    lock_broker();
+    if (broker_fd >= 0) {
+        broker_send(KIND_INCOMING_REPLY, (uint32)status, 0, 0, node, out, out_size);
+    }
+    unlock_broker();
+    free(out);
+}
+
+/* Send a transaction to an object another process owns and wait for its answer. */
+static int broker_transact(uint32 handle, uint32 code, uint32 flags, const unsigned char *data,
+                           ulong size, unsigned char **reply, ulong *reply_size, uint32 *status) {
+    start_reader();
+    if (broker_fd < 0) return -1;
+    lock_broker();
+    if (broker_send(KIND_TRANSACTION, handle, code, flags, 0, data, size) != 0) {
+        unlock_broker();
+        return -1;
+    }
+    if ((flags & 1) != 0) { /* oneway owes no answer */
+        unlock_broker();
+        return 0;
+    }
+    unsigned char *answer = 0;
+    ulong answer_size = 0;
+    uint32 a = 0, b = 0, c = 0;
+    int waited = await_response(KIND_REPLY, &answer, &answer_size, &a, &b, &c);
+    unlock_broker();
+    if (waited != 0) return -1;
+    *status = (uint32)a;
+    *reply = answer;
+    *reply_size = answer_size;
+    return 0;
 }
 
 /* Run one IServiceManager transaction, writing the answer into `reply`.
@@ -468,33 +999,13 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
 
     if (code == TRANSACTION_ADD_SERVICE) {
         if (have_name) {
-            const unsigned char *end = data + size;
-            const unsigned char *p = name_after_token(data, size, name, NAME_MAX);
-            if (p && p + 24 <= end) {
-                uint32 type = u32_at(p);
-                ulong cookie = u64_at(p + 16);
-                if (type == BINDER_TYPE_BINDER) {
-                    /* For a local object the cookie is the IBinder itself; the
-                     * other field is its weak reference table, which is not one. */
-                    remember(name, (void *)cookie, cookie);
-                    say("android-binder: registered ");
-                    say(name);
-                    say("\n");
-                    say_once();
-                } else {
-                    say("android-binder: ");
-                    say(name);
-                    say(" is not a local binder (type 0x");
-                    for (int shift = 28; shift >= 0; shift -= 4) {
-                        static const char hex[] = "0123456789abcdef";
-                        char digit[2];
-                        digit[0] = hex[(type >> shift) & 0xf];
-                        digit[1] = 0;
-                        say(digit);
-                    }
-                    say(")\n");
-                    say_once();
-                }
+            void *object = object_at(request_parcel);
+            if (object) {
+                remember(name, object, 0);
+                say("android-binder: registered ");
+                say(name);
+                say("\n");
+                say_once();
             } else {
                 say("android-binder: addService ");
                 say(name);
@@ -508,6 +1019,22 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
 
     if (code == TRANSACTION_GET_SERVICE || code == TRANSACTION_CHECK_SERVICE) {
         void *object = have_name ? lookup(name) : 0;
+        if (!object && have_name) {
+            /* Not this process's: another one may have published it. Until the
+             * remote object can be handed back as a handle, this records what
+             * the broker said and reports the service absent. */
+            ulong node = 0;
+            uint32 owner = 0;
+            uint32 handle = broker_lookup(name, &node, &owner);
+            if (handle != NO_HANDLE) {
+                say("android-binder: ");
+                say(name);
+                say(" is in the broker (handle ");
+                say_dec((long)handle);
+                say(")\n");
+                say_once();
+            }
+        }
         /* A lookup that finds something is worth a line every time; one that
          * finds nothing is asked for every service the framework does not have,
          * over and over, and would bury everything else. */
@@ -520,27 +1047,12 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             say_once();
         }
         parcel_write_int32(reply, 0);
-        /* Two things are being avoided here.
-         *
-         * A null object is written by writing nothing: libbinder's own
+        /* A null object is written by writing nothing: libbinder's own
          * writeStrongBinder dereferences the pointer it is given, so handing it
          * null for a service that does not exist is a SIGSEGV inside the
-         * framework's getService.
-         *
-         * A remembered object may also be stale -- the registry stores a pointer
-         * without a reference of its own -- and handing libbinder one of those is
-         * the same SIGSEGV, from the vtable read. Its first word is the vtable
-         * pointer, so an object without one is treated as absent rather than
-         * passed on. The real fix is to hold a reference at registration; until
-         * then, an absent service is a better answer than a crash. */
-        int sane = object && *(const unsigned long *)object != 0;
-        if (!sane && object) {
-            say("android-binder: ");
-            say(have_name ? name : "(unnamed)");
-            say(" is no longer a live object; reporting it absent\n");
-            say_once();
-        }
-        if (sane && parcel_write_binder) {
+         * framework's getService. A remembered object is never null -- the
+         * registry holds a reference to it -- so this is only the absent case. */
+        if (object && parcel_write_binder) {
             unsigned long value[2] = {(unsigned long)object, 0};
             parcel_write_binder(reply, value);
         }
@@ -590,6 +1102,23 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
     }
     if (!parcel_data || !parcel_data_size || !parcel_write_int32) return 0;
     if (!service_manager(code, parcel_data(data), parcel_data_size(data), (void *)data, reply)) {
+        /* Not the service manager: an object reached through a handle. If it is
+         * one the broker gave this process, the broker carries the call to
+         * whoever owns it. */
+        if (parcel_write_bytes) {
+            unsigned char *answer = 0;
+            ulong answer_size = 0;
+            uint32 status = 0;
+            if (broker_transact((uint32)handle, code, flags, parcel_data(data),
+                                parcel_data_size(data), &answer, &answer_size, &status) == 0) {
+                if (answer && answer_size) parcel_write_bytes(reply, answer, answer_size);
+                say("android-binder: forwarded code ");
+                say_dec((long)code);
+                say(" to the broker\n");
+                say_once();
+                return 0;
+            }
+        }
         /* Either not the service manager, or a request whose interface token
          * could not be found. Answering an empty, successful reply is what this
          * did before, and failing instead stopped the framework earlier than it

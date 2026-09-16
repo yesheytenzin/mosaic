@@ -75,12 +75,17 @@ android-binder: checkService memtrack.proxy found
 `ActivityManagerService`'s constructor still does not complete. Two known reasons,
 in order:
 
-1. The registry stores a pointer without a reference, so a remembered object can
-   be freed before it is handed back. One of two registrations was stale in the
-   last run. The shim reports a stale object as absent instead of passing
-   libbinder a dangling pointer -- a missing service rather than a SIGSEGV -- and
-   holding a reference at registration is the fix.
-2. Then `installd`, which does not exist and which the framework waits for:
+1. ~~The registry stores a pointer without a reference.~~ Fixed: the object is
+   taken with `Parcel::readStrongBinder`, whose reference is left in place, so the
+   registry owns the service from registration on. Verified -- no SIGSEGV and no
+   staleness guard, with lookups still finding what is registered.
+2. The broker client is written but not verified, and is off by default:
+   publishing to the broker, asking it about a name this process does not have,
+   forwarding a transaction for a handle, and serving an `Incoming` by entering
+   `BBinder::transact` are all in `tools/binder-shim/android-binder.c`, with
+   `tools/two-process-call.py` as the second process to test them from. The first
+   run published nothing and the reason is not found yet.
+3. Then `installd`, which does not exist and which the framework waits for:
 
 ```
 Installer: installd not found; trying again

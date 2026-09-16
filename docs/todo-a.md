@@ -26,12 +26,21 @@ socket by `src/binder/transport.rs`.
       name, so the name parsed as empty and every service looked absent. Names
       are read correctly now, registrations are remembered, and lookups find them
       (`checkService memtrack.proxy found`).
-- [ ] A transaction for a *handle* -- an object in another process. The shim hands
-      back local objects, so nothing in this process needs it yet.
-- [ ] The shim forwards to the broker over the socket instead of answering locally
-- [ ] Hold a reference to a remembered object. The registry stores the pointer
-      without one, so a registration can go stale; the shim reports a stale object
-      as absent rather than handing libbinder a dangling pointer
+- [x] Hold a reference to a remembered object. It is taken by the reader that
+      takes the object -- `Parcel::readStrongBinder` -- and deliberately not
+      released, so the registry owns the service from registration on. The hand
+      parse of the flat_binder_object, which stored a bare pointer and let it go
+      stale under the framework's `getService`, is gone. Verified: no SIGSEGV, no
+      staleness guard, and lookups still find what is registered.
+- [~] A transaction for a *handle*, the shim forwarding to the broker, and the
+      shim as a client of the transport. Written and building: connect, `Export`
+      on registration, `Lookup` on a local miss, `Transaction` for an unknown
+      handle, a reader thread that serves an `Incoming` by building a Parcel over
+      the bytes and entering `BBinder::transact`, and `tools/two-process-call.py`
+      as the second process. **Not verified, and off by default.** The first run
+      published nothing and the reason is not yet found; since a local miss would
+      then wait on a socket for every service the framework does not have, it
+      stays off behind `MOSAIC_BINDER_BROKER=1` rather than turned on untested.
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
