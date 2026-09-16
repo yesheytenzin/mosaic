@@ -14,7 +14,18 @@ bundle.sh closure <image> <bundle>                  # fill in every missing depe
 bundle.sh stage   <image> <bundle> <inode> <name>   # extract one binary and chase its libraries
 bundle.sh jars    <image> <bundle>                  # boot classpath, ICU data, bootclasspath.txt
 bundle.sh run     <bundle> <binary> [args...]       # run it with the environment a Bionic process expects
+bundle.sh compile <bundle> <apk> [filter]           # dex2oat an app's bytecode
 ```
+
+`compile` is the closest thing to running a real app that the runtime alone can
+do, and it is a good end-to-end check of a bundle: it loads an app's DEX,
+verifies it against the boot classpath, and emits machine code. It needs no root
+and no namespace. Verified on Termux 0.118.3, which compiles to 9 MB of OAT with
+14,225 methods.
+
+Give it a small heap (`-Xmx256m`, which it sets): ART commits what `-Xmx` asks
+for, so a 1 GB heap fails the compiler's arena mapping on a busy host while
+plenty of memory is free.
 
 `build` is the one that matters, and it is the input to every later phase: the
 Android linker, the library closure, the boot classpath jars, ICU data, a linker

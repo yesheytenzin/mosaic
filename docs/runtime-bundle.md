@@ -189,6 +189,42 @@ also how the two remaining property gaps were found — `Build.VERSION`
 dereferences `ALL_CODENAMES[0]` before checking its length, so an empty list
 aborts the framework's static initialisation, and that is only visible in a log.
 
+## A real app's bytecode
+
+The strongest test the runtime alone can pass is compiling a real app. Termux
+0.118.3 from F-Droid, a 3.1 MB `classes.dex`:
+
+```
+tools/bundle/bundle.sh compile <bundle> termux.apk speed
+compiling 1 dex file(s) from termux.apk with filter speed
+produced 9006688 bytes of compiled output at .../termux.oat
+```
+
+That is our ART loading the app's DEX, verifying it against the boot classpath,
+and emitting machine code with the optimizing compiler. `--compiler-filter=verify`
+produces a 37 KB OAT; `speed` produces 9 MB, and `oatdump` from the same image
+reads it back:
+
+```
+OAT FILE STATS:
+  Code      14225   7366.098KB
+  CodeInfo  10652   1031.640KB
+  0x6e90: ArtMethod: void com.termux.app.TermuxActivity.lambda$onServiceConnected$1()
+  0x6e98: ArtMethod: void com.termux.app.TermuxActivity.reloadActivityStyling()
+```
+
+14,225 compiled methods, 12,029 of them under `com.termux`. This runs without
+root, without a namespace, and without the property area: `dex2oat` takes explicit
+paths and needs none of them. One caveat worth knowing, learned the hard way: ART
+commits what `-Xmx` asks for, so a 1 GB heap fails the compiler's arena mapping on
+a busy host with `Failed anonymous mmap(...): Out of memory` while 8 GB is free.
+256 MB is plenty.
+
+**Running Termux itself is a different matter**, and it is not close. `TermuxActivity`
+needs `ActivityManager`, an activity lifecycle, input, and a surface; Termux then
+executes a whole Linux userland out of its bootstrap payload. The runtime is no
+longer the obstacle — the framework services are, and those are phases 3 and 4.
+
 ## Next
 
 Phase 3, userspace Binder (ADR-0004). The boundary is exact:
