@@ -1,60 +1,43 @@
 <img align="left" src="data/AppIcon.png" width="64">
 
-# Mosaic (Rust)
+# Mosaic
 
-A Rust rewrite of [Waydroid](https://github.com/waydroid/waydroid). Mosaic
-boots a full Android system in an LXC container using Linux namespaces (user,
-pid, uts, net, mount, ipc) and runs Android applications on a regular
-GNU/Linux system.
+Mosaic runs Android apps as native Linux processes. There is no Android OS to
+boot, no container to manage, and no kernel binder driver to install. An
+installed app is an ordinary desktop application: it opens a real Wayland
+window, and its data lives under its own system user.
 
-The Android runtime ships a minimal LineageOS-based image, currently on
-Android 13.
+Installing an app allocates it a protected system user, the same isolation model
+Android itself uses, so one app cannot read another's files. The Android API
+surface, framework services, Binder and the hardware abstraction layer are
+translated to host equivalents, with AOSP's ART and Bionic reused as host-native
+libraries rather than reimplemented.
+
+Mosaic began as a Rust port of Waydroid's container model. That port is being
+retired, for the reasons in `docs/adr/0001`. Containers boot an entire Android
+system to run one app and depend on a kernel binder driver many hosts do not
+ship.
+
+## Status
+
+Design and scaffolding. The architecture is recorded in `CONTEXT.md` and
+`docs/adr/`. The first executable milestone is running a single DEX on a
+host-native ART and Bionic build with no Android OS, which is the gate for
+everything else.
 
 ## Build
 
-Requires a Rust toolchain (1.74 or newer) and a C toolchain for the XZ and TLS
-dependencies.
+Requires a Rust toolchain, 1.74 or newer.
 
 ```
+cargo test
 make build
 ```
 
-## Install
-
-```
-sudo make install
-```
-
-This installs the `mosaic` binary to `/usr/bin`, data files to
-`/usr/lib/mosaic`, plus the D-Bus, systemd, and polkit units. AppArmor
-profiles are installed separately:
-
-```
-sudo make install_apparmor
-```
-
-## Usage
-
-```
-mosaic init                    # set up configs and download images
-mosaic session start           # start a user session
-mosaic app launch <package>    # launch an installed app
-mosaic status                  # show session state
-```
-
-Run `mosaic --help` for the full command list. Runtime dependencies are
-`lxc`, `libgbinder` (AUR `libgbinder-git`, loaded at runtime), `dbus`, a polkit
-authority, a PulseAudio or PipeWire server, and `iptables`. The binder kernel
-driver is required and is not in the Arch mainline kernel; see
-`packaging/arch/setup-host.sh`.
-
 ## Documentation
 
-Upstream documentation is at [docs.waydro.id](https://docs.waydro.id).
-
-## Reporting bugs
-
-File issues at <https://github.com/yesheytenzin/mosaic/issues>.
+Start with [`CONTEXT.md`](CONTEXT.md) for the vocabulary and
+[`docs/adr/`](docs/adr/) for the decisions and their reasoning.
 
 ## License
 
