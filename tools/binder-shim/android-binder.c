@@ -629,25 +629,42 @@ static int service_name_of(const unsigned char *data, ulong size, char *out, int
  * destructor, so the Itanium ABI returns it through a hidden first pointer:
  * calling it as though it returned a pointer in rax is what made the first
  * attempt at this crash. */
-static void *object_at(void *parcel) {
+static void *object_at(void *parcel, const unsigned char *data, const unsigned char *after_name) {
     if (!parcel || !parcel_set_position || !parcel_read_strong) return 0;
-    if (!parcel_ipc_objects || !parcel_ipc_objects_count) return 0;
-    ulong count = parcel_ipc_objects_count(parcel);
-    if (count == 0) return 0;
-    const ulong *offsets = parcel_ipc_objects(parcel);
-    if (!offsets || offsets[0] < 24) return 0;
+
+    /* Where the object sits depends on which side wrote the request, and the
+     * object table's entries may be its start or its end. Rather than decide,
+     * try each position the formats allow and take the first that reads as an
+     * object -- a wrong one yields nothing rather than something wrong, because
+     * readStrongBinder validates against the table before it trusts the bytes.
+     *
+     * The Java side is the one that matters here: every service the framework
+     * registers goes through ServiceManager.addService, and all of those were
+     * coming out empty before this tried more than one position. */
+    ulong candidates[3];
+    int count = 0;
+    if (after_name) candidates[count++] = (ulong)(after_name - data);
+    if (parcel_ipc_objects && parcel_ipc_objects_count) {
+        const unsigned long *offsets = parcel_ipc_objects(parcel);
+        ulong objects_count = parcel_ipc_objects_count(parcel);
+        if (offsets && objects_count > 0) {
+            candidates[count++] = offsets[0] >= 24 ? offsets[0] - 24 : 0;
+            candidates[count++] = offsets[0];
+        }
+    }
 
     ulong saved = parcel_data_position ? parcel_data_position(parcel) : 0;
-    if (parcel_set_position(parcel, offsets[0] - 24) != 0) {
-        parcel_set_position(parcel, saved);
-        return 0;
+    void *object = 0;
+    for (int i = 0; i < count && !object; i++) {
+        if (parcel_set_position(parcel, candidates[i]) != 0) continue;
+        /* The sp lands here and is deliberately not destroyed: its reference is
+         * the registry's. */
+        unsigned long held[2] = {0, 0};
+        parcel_read_strong(held, parcel);
+        object = (void *)held[0];
     }
-    /* The sp lands here and is deliberately not destroyed: its reference is the
-     * registry's. */
-    unsigned long held[2] = {0, 0};
-    parcel_read_strong(held, parcel);
     parcel_set_position(parcel, saved);
-    return (void *)held[0];
+    return object;
 }
 
 static void broker_export(const char *name, ulong node);
@@ -817,13 +834,11 @@ static uint32 broker_lookup(const char *name, ulong *node, uint32 *owner) {
         unlock_broker();
         return NO_HANDLE;
     }
-    say("broker-self-check: asked\n");
     unsigned char *data = 0;
     ulong size = 0;
     uint32 a = 0, b = 0, c = 0;
     int waited = await_response(KIND_FOUND, &data, &size, &a, &b, &c);
     unlock_broker();
-    say("broker-self-check: the wait ended\n");
     if (waited != 0) return NO_HANDLE;
     if (node) *node = response_node;
     if (owner) *owner = b;
@@ -1042,7 +1057,8 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
 
     if (code == TRANSACTION_ADD_SERVICE) {
         if (have_name) {
-            void *object = object_at(request_parcel);
+            const unsigned char *after_name = name_after_token(data, size, name, NAME_MAX);
+            void *object = object_at(request_parcel, data, after_name);
             if (object) {
                 remember(name, object, 0);
                 say("android-binder: registered ");
