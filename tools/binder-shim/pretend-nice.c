@@ -80,6 +80,56 @@ int getpriority(int which, int who) {
     return 20;
 }
 
+/* setpriority is called for both positive and negative priorities on this path,
+ * and the caller turns any failure into a SecurityException. */
+int setpriority_always(int which, int who, int priority) {
+    (void)which;
+    (void)who;
+    (void)priority;
+    return 0;
+}
+
+/* The framework also sets scheduling parameters and affinity for its own
+ * threads, which a desktop process is not permitted to do either. */
+int pthread_setschedparam(void *thread, int policy, const void *param) {
+    (void)thread;
+    (void)policy;
+    (void)param;
+    return 0;
+}
+
+int sched_setaffinity(int pid, unsigned long cpusetsize, const void *mask) {
+    (void)pid;
+    (void)cpusetsize;
+    (void)mask;
+    return 0;
+}
+
+/* libcutils does the actual work, and does it in a way that a libc-level
+ * interceptor does not see -- its own setpriority is a direct syscall. These are
+ * the entry points libandroid_runtime calls, so they are the ones to answer. */
+int androidSetThreadPriority(int tid, int priority) {
+    (void)tid;
+    (void)priority;
+    return 0;
+}
+
+int set_sched_policy(int tid, int policy) {
+    (void)tid;
+    (void)policy;
+    return 0;
+}
+
+/* Process.setThreadGroup ends up here, in libprocessgroup, with a vector of
+ * profile names that needs a cgroup the desktop does not have. The arguments are
+ * not touched, only the answer. */
+int _ZN12TaskProfiles15SetTaskProfilesEiRKNSt3__16vectorINS0_12basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEENS5_IS7_EEEEb(int tid, const void *profiles, int use_fd_cache) {
+    (void)tid;
+    (void)profiles;
+    (void)use_fd_cache;
+    return 1 /* true */;
+}
+
 /* The framework also uses scheduler policies for its own threads. */
 int sched_setscheduler(int pid, int policy, const void *param) {
     (void)pid;
