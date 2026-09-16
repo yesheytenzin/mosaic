@@ -6,6 +6,10 @@ use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 
+/// Reports human readable progress while initializing, used by the remote
+/// initializer service to stream to clients.
+pub type Progress<'a> = Option<&'a (dyn Fn(&str) + Send + Sync)>;
+
 pub fn is_initialized(args: &MosaicArgs) -> bool {
     Path::new(&args.config).is_file() && Path::new(&format!("{}/rootfs", args.work)).is_dir()
 }
@@ -254,6 +258,7 @@ fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     args: &mut MosaicArgs,
     force: bool,
@@ -262,7 +267,14 @@ pub fn init(
     vendor_channel: Option<String>,
     rom_type: Option<String>,
     system_type: Option<String>,
+    progress: Progress<'_>,
 ) -> anyhow::Result<()> {
+    let report = |message: &str| {
+        if let Some(cb) = progress {
+            cb(message);
+        }
+    };
+
     if is_initialized(args) && !force {
         log::info!("Already initialized");
         return Ok(());
@@ -287,6 +299,7 @@ pub fn init(
         args.cache.insert("system_type".to_string(), p);
     }
 
+    report("Setting up config");
     if !setup_config(args)? {
         return Ok(());
     }
@@ -305,6 +318,7 @@ pub fn init(
             session = None;
             let _ = crate::actions::container_manager::stop(args, false, session.clone());
         } else {
+            report("Stopping container");
             log::info!("Stopping container");
             // Try D-Bus stop, fallback to lxc
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -330,6 +344,7 @@ pub fn init(
         .cloned()
         .unwrap_or_else(|| format!("{}/images", args.work));
     let preinstalled = Defaults::new().preinstalled_images_paths;
+    report("Downloading images");
     if !preinstalled.contains(&images_path) {
         // Download images (blocking)
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -340,6 +355,7 @@ pub fn init(
         crate::helpers::images::remove_overlay(args)?;
     }
 
+    report("Creating directories");
     for (dir, sub) in [
         (format!("{}/rootfs", args.work), None),
         (format!("{}/overlay", args.work), Some("vendor")),
@@ -361,6 +377,7 @@ pub fn init(
         std::fs::create_dir_all(&overlay_work)?;
     }
 
+    report("Configuring the container");
     crate::helpers::drivers::probe_ashmem_driver(args);
     crate::helpers::lxc::setup_host_perms(args).ok();
     crate::helpers::lxc::set_lxc_config(args).ok();
@@ -373,6 +390,7 @@ pub fn init(
                 let _ = crate::actions::container_manager::do_start(args, &sess);
             }
         } else {
+            report("Starting container");
             log::info!("Starting container");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -391,7 +409,11 @@ pub fn init(
     Ok(())
 }
 
-pub fn init_sync(args: &mut MosaicArgs, params: &HashMap<String, String>) -> anyhow::Result<()> {
+pub fn init_sync(
+    args: &mut MosaicArgs,
+    params: &HashMap<String, String>,
+    progress: Progress<'_>,
+) -> anyhow::Result<()> {
     let system_channel = params.get("system_channel").cloned();
     let vendor_channel = params.get("vendor_channel").cloned();
     let system_type = params.get("system_type").cloned();
@@ -405,9 +427,65 @@ pub fn init_sync(args: &mut MosaicArgs, params: &HashMap<String, String>) -> any
         vendor_channel,
         rom_type,
         system_type,
+        progress,
     )
 }
 
-pub fn remote_init_client(_args: &MosaicArgs) -> anyhow::Result<()> {
-    anyhow::bail!("GTK remote init client not yet implemented; use `mosaic init` CLI with --system_channel/--vendor_channel")
+/// Attach to the running Initializer service and stream its progress to
+/// stdout, replacing the GTK dialog the original used.
+pub fn remote_init_client(args: &MosaicArgs) -> anyhow::Result<()> {
+    use crate::helpers::ipc::InitializerProxy;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let connection = zbus::Connection::system().await?;
+        let proxy = InitializerProxy::new(&connection).await?;
+
+        let channels = crate::config::load_channels();
+        let mut params = HashMap::new();
+        for (key, value) in [
+            ("system_channel", "system_channel"),
+            ("vendor_channel", "vendor_channel"),
+            ("system_type", "system_type"),
+        ] {
+            params.insert(
+                key.to_string(),
+                channels.channels.get(value).cloned().unwrap_or_default(),
+            );
+        }
+
+        let mut progress = InitializerProxy::receive_progress_changed(&proxy).await?;
+        let mut finished = InitializerProxy::receive_finished(&proxy).await?;
+        let mut interrupted = InitializerProxy::receive_interrupted(&proxy).await?;
+
+        println!("Waiting for waydroid container service...");
+        proxy.init(params).await?;
+
+        use futures_util::StreamExt;
+        loop {
+            tokio::select! {
+                Some(signal) = progress.next() => {
+                    if let Ok(args) = signal.args() {
+                        print!("{}", args.message);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                Some(_) = finished.next() => {
+                    if is_initialized(args) {
+                        println!("\nDone");
+                    }
+                    break;
+                }
+                Some(_) = interrupted.next() => {
+                    println!("\nInterrupted");
+                    break;
+                }
+                else => break,
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
 }

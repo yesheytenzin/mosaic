@@ -648,14 +648,31 @@ impl InitializerService {
         let args_clone = self.args.clone();
         let params_clone = params.clone();
         let ctxt_owned = ctxt.to_owned();
+        // Stream progress out of the blocking init into ProgressChanged signals.
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let forward_ctxt = ctxt_owned.clone();
+        let forward = tokio::spawn(async move {
+            while let Some(message) = progress_rx.recv().await {
+                let _ = InitializerService::progress_changed(&forward_ctxt, &message).await;
+            }
+        });
+
         let handle = tokio::spawn(async move {
             let _ = InitializerService::progress_changed(&ctxt_owned, "Starting initialization...")
                 .await;
             let mut args_for_init = args_clone.clone();
             let res = tokio::task::spawn_blocking(move || {
-                crate::actions::initializer::init_sync(&mut args_for_init, &params_clone)
+                let report = move |message: &str| {
+                    let _ = progress_tx.send(format!("{}\n", message));
+                };
+                crate::actions::initializer::init_sync(
+                    &mut args_for_init,
+                    &params_clone,
+                    Some(&report),
+                )
             })
             .await;
+            let _ = forward.await;
 
             match res {
                 Ok(Ok(_)) => {

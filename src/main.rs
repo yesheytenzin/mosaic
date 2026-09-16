@@ -101,6 +101,7 @@ async fn run() -> i32 {
                     init_args.vendor_channel,
                     init_args.rom_type,
                     init_args.system_type,
+                    None,
                 )
             }
         }
