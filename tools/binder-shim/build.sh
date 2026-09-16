@@ -23,7 +23,10 @@ target="${MOSAIC_ANDROID_TARGET:-x86_64-linux-android21}"
 for source in "$here"/*.c; do
   [ -e "$source" ] || continue
   name=$(basename "$source" .c)
-  clang --target="$target" -shared -fPIC -nostdlib -O2 \
+  # -fno-emulated-tls: the default for Android is emulated thread-local storage,
+  # which needs a helper Bionic does not export. The real thing is available and
+  # is what a preload should use.
+  clang --target="$target" -shared -fPIC -nostdlib -O2 -fno-emulated-tls \
     -Wall -Wextra -Wno-unused-parameter \
     -o "$out/$name.so" "$source"
   echo "built $out/$name.so"

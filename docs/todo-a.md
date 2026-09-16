@@ -21,15 +21,20 @@ socket by `src/binder/transport.rs`.
 - [x] A name can only be registered once
 - [x] The NDK registration pair remembers the binder (it used to be discarded, so
       `memtrack.proxy` was registered and unreachable)
-- [ ] The Java path cannot reach any of it yet: `BinderProxy.transact` resolves
-      inside libbinder, where no preload can interpose, so those calls go to the
-      driver-level shim, whose command-stream framing is now settled but not
-      implemented. See `docs/binder.md`.
+- [x] The Java path reaches it. The request layout was the thing in the way: the
+      interface token has a twelve-byte prefix and an int32 between it and the
+      name, so the name parsed as empty and every service looked absent. Names
+      are read correctly now, registrations are remembered, and lookups find them
+      (`checkService memtrack.proxy found`).
+- [ ] A transaction for a *handle* -- an object in another process. The shim hands
+      back local objects, so nothing in this process needs it yet.
 - [ ] The shim forwards to the broker over the socket instead of answering locally
 
 *Gate:* a service registered by name is found by name and a transaction reaches
-it. Met by the broker's own tests and by `tools/binder-probe.py` against the
-shipped daemon; not yet met for a Java caller.
+it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
+daemon, and now by the framework itself: `AServiceManager_addService` and
+`ServiceManager.addService` both land, and `checkService` finds what they
+registered.
 
 ## A3. Reference counting and lifetime ✅
 
@@ -101,10 +106,15 @@ failing property was 34 characters against libc's 32-character limit.
 
 ## What is left of A
 
-One thing, and it is the reason the system server stops where it does: **answer the
-Java path.** Those transactions are `BinderProxy.transact`, which resolves inside
-libbinder and cannot be interposed; they land at `ioctl`, and the command stream
-there is now decoded (`_IOW('c', nr, size)`, self-describing). Implementing the
-reply is ordinary work: parse, dispatch `BC_TRANSACTION` for handle 0 through the
-registry the shim already has at the parcel level, and write `BR_REPLY` with a
-reply parcel this side allocates.
+The binder path is answered. The system server now stops on something that is not
+a binder problem: it waits for `installd`, a native daemon on a device, and
+
+```
+Installer: installd not found; trying again
+```
+
+repeats until the run ends. The service manager is telling the truth -- there is no
+installd -- and the fix is for one to exist. Two ways, and they are the same work
+seen from two sides: implement the AIDL service in Rust and host it in the broker,
+and have the shim forward a lookup it cannot answer to the broker over the socket.
+That is what `src/binder/transport.rs` was built for, and it is the next item.

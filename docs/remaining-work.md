@@ -58,41 +58,50 @@ registrars resolve; the shim presents Android's absolute paths.
 
 ### Where the system server is now
 
-`startBootstrapServices` starts `StartFileIntegrityService`, `StartInstaller`,
-`StartIStatsService`, `StartPowerStatsService`, `StartActivityManager`,
-`StartPowerManager`, `StartThermalManager`, `StartIncrementalService`,
-`StartDataLoaderManagerService` and `StartWatchdog`, and then stops:
+`startBootstrapServices` reaches `StartActivityManager` with real answers from the
+service manager:
 
 ```
-AppOps: AppOpsService published
-SystemServiceRegistry: No service published for: appops
-	at com.android.server.power.PowerManagerService$Injector.createAppOpsManager
-java.lang.NullPointerException: ... PowerManager.newWakeLock ... on a null object
-	at com.android.server.wm.ActivityTaskSupervisor.initPowerManagement
-System: ************ Failure starting system services
+SystemServerTiming: StartWatchdog ... StartInstaller ... UriGrantsManagerService
+SystemServerTiming: StartPowerStatsService
+SystemServerTiming: StartIStatsService          (no longer aborts)
+SystemServerTiming: MemtrackProxyService
+SystemServerTiming: StartActivityManager
+android-binder: AIDL register memtrack.proxy
+android-binder: checkService memtrack.proxy found
 ```
 
-`PowerManagerService`'s constructor asks for the app-ops service, does not get it,
-the service never registers, and `initPowerManagement` then dereferences a null
-power manager. The app-ops service *was* published a moment earlier: the call was
-made, and lost.
+and then it stops, waiting for a service that does not exist:
 
-### Why it was lost, and what to do about it
+```
+Installer: installd not found; trying again        (once a second, for good)
+```
 
-The Java path is `BinderProxy.transact` -> `IBinder::transact` ->
-`BpBinder::transact` -> `IPCThreadState::transact`, all inside libbinder, so every
-one of them is a local bind and no preload can interpose them. The API-level
-interposition that made the **AIDL** path work -- `AServiceManager_addService`, a
-plain C function exported for other libraries -- has no equivalent on the Java
-path. What the Java path does reach is `ioctl`, and there the shim answers a read
-with an empty parcel, which libbinder reads as a null binder. That is why every
-service looks absent, and it is not a registry problem at all.
+`installd` is a native daemon on a device, and the service manager is telling the
+truth. This is not a binder problem any more. Two things follow, and they are one
+piece of work:
 
-The command stream at that `ioctl` was the thing four attempts failed to decode.
-It is now decoded: the `BC_*`/`BR_*` constants are `_IOW('c', nr, size)`
-encodings, so each command word carries its own argument length and the stream is
-self-describing. `docs/binder.md` has the two observed streams decoded byte for
-byte and the shape of the reply.
+1. Implement the AIDL interface in Rust and host it in the broker, so the shim
+   hands back a handle to something that answers.
+2. Forward a lookup the shim cannot answer to the broker over its socket. That is
+   what `src/binder/transport.rs` already does between two connections; the shim
+   has to become a client of it.
+
+### Why it was lost, and what was done about it
+
+The Java path used to get nothing from the service manager, for two reasons that
+both looked like "the registry does not work":
+
+- **The interface token is not first in the request.** Twelve bytes precede it and
+  an int32 sits between it and the name, so the name came out empty and every
+  lookup was a lookup for `""`. Searching for the descriptor, and then for the
+  first printable string after it, is what fixed it. `docs/binder.md` has the
+  layout and the constants, read out of libbinder's machine code rather than
+  recalled.
+- **An empty answer to a waiting thread is not neutral.** libbinder reads the next
+  command out of the buffer it was handed, and an empty buffer reads as command 0:
+  `*** BAD COMMAND 0 received from Binder driver`. `BR_NOOP` is the reply that
+  means "nothing happened", and a waiting thread gets that.
 
 ## B. `system_server` to completion
 
