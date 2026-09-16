@@ -67,6 +67,9 @@ struct binder_write_read {
  * declared up here so they can use them. */
 static void emit(const char *s);
 static void emit_dec(long value);
+static void flush_log(void);
+static char log_buffer[16384];
+static long log_length = 0;
 
 /* Binder command numbers, from binder.h. Only the ones worth naming. */
 #define BC_TRANSACTION 0
@@ -122,7 +125,9 @@ static void dump_parcel_string(unsigned char *data, long size) {
         }
         char out[1];
         out[0] = (char)c;
-        syscall(SYS_write, 2, out, 1);
+        if (log_length + 1 < (long)sizeof(log_buffer)) {
+            log_buffer[log_length++] = out[0];
+        }
     }
     emit("\"");
 }
@@ -203,9 +208,23 @@ static size_t str_len(const char *s) {
     return n;
 }
 
+/* Diagnostics are accumulated and written once. Writing each piece separately
+ * interleaves with the process's own stderr, which produces output that looks
+ * like a corrupted buffer and sends you chasing a bug that is not there. */
+static void flush_log(void) {
+    if (log_length > 0) {
+        syscall(SYS_write, 2, log_buffer, log_length);
+        log_length = 0;
+    }
+}
+
 static void emit(const char *s) {
     if (!s) s = "(null)";
-    syscall(SYS_write, 2, s, str_len(s));
+    size_t n = str_len(s);
+    if (log_length + (long)n < (long)sizeof(log_buffer)) {
+        __builtin_memcpy(log_buffer + log_length, s, n);
+        log_length += (long)n;
+    }
 }
 
 static void emit_hex(unsigned long value, int digits) {
@@ -216,7 +235,10 @@ static void emit_hex(unsigned long value, int digits) {
         out[i] = digits_of[value & 0xf];
         value >>= 4;
     }
-    syscall(SYS_write, 2, out, digits);
+    if (log_length + digits < (long)sizeof(log_buffer)) {
+        __builtin_memcpy(log_buffer + log_length, out, digits);
+        log_length += digits;
+    }
 }
 
 static void emit_dec(long value) {
@@ -236,7 +258,10 @@ static void emit_dec(long value) {
         magnitude /= 10;
     } while (magnitude);
     while (n) out[i++] = tmp[--n];
-    syscall(SYS_write, 2, out, i);
+    if (log_length + i < (long)sizeof(log_buffer)) {
+        __builtin_memcpy(log_buffer + log_length, out, i);
+        log_length += i;
+    }
 }
 
 static void emit_prefixed(const char *prefix, const char *value) {
@@ -359,7 +384,15 @@ int ioctl(int fd, unsigned long request, ...) {
     }
     if (request == BINDER_WRITE_READ) {
         struct binder_write_read *bwr = (struct binder_write_read *)arg;
-        emit("BINDER_WRITE_READ write_size=");
+        emit("bwr=0x");
+        emit_hex((unsigned long)bwr, 12);
+        emit(" fields: ");
+        unsigned long *fields = (unsigned long *)bwr;
+        for (int fi = 0; fi < 6; fi++) {
+            emit_hex(fields[fi], 16);
+            emit(" ");
+        }
+        emit("| BINDER_WRITE_READ write_size=");
         emit_dec(bwr->write_size);
         emit(" read_size=");
         emit_dec(bwr->read_size);
@@ -406,9 +439,11 @@ int ioctl(int fd, unsigned long request, ...) {
             bwr->read_consumed = 0;
             if (saw_unknown_command) {
                 emit("binder-shim: unparsed command stream; failing fast\n");
+                flush_log();
                 return -1;
             }
         }
+        flush_log();
         return 0;
     }
     if (request == 0x40046210UL) {
@@ -441,6 +476,7 @@ int close(int fd) {
 
 static void probe_loaded(void) {
     emit("binder-shim: loaded\n");
+    flush_log();
 }
 
 /* Diagnostic: a preloaded library only helps if its symbols win the lookup, and
