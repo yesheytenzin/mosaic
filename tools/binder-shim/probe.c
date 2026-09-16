@@ -402,7 +402,7 @@ int ioctl(int fd, unsigned long request, ...) {
              * a command starts at offset 0 or after a header. */
             emit(" [");
             unsigned char *raw = (unsigned char *)bwr->write_buffer;
-            for (long i = 0; i < 24 && i < bwr->write_size; i++) {
+            for (long i = 0; i < 96 && i < bwr->write_size; i++) {
                 emit_hex(raw[i], 2);
                 emit(" ");
             }

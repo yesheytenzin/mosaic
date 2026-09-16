@@ -179,19 +179,29 @@ With the launcher, **SystemServer boots**:
 ```
 launcher: registered 150 native registrars
 launcher: running com.android.server.SystemServer
-SystemServerTiming: InitBeforeStartServices
-SystemServerTiming: InitBeforeStartServices took to complete: 1ms
+SystemServerTiming: InitBeforeStartServices took to complete: 0ms
+libc: Using old property service protocol ("ro.property_service.version" is not set)
 ```
 
 That is the real system server running its own boot sequence, with the
-framework's natives registered and no crash. It then stops at the next step,
-`StartServices`, which creates `ActivityManagerService` and friends — and that
-needs Binder transactions. With the binder shim also loaded it does not get
-further, because the shim refuses the command stream it cannot parse.
+framework's natives registered, no crash, and its first block completed. It then
+stops, and it stops **before reaching Binder at all** — no `BINDER_WRITE_READ`
+ever happens. The line about the old property service protocol is the clue: it
+comes from libc's property *write* path, and Mosaic implements property *reads*
+(the mapped area) without implementing the service properties are written to
+(`/dev/socket/property_service`, which ADR-0013 assigns to the broker).
 
-**So P4 now waits on P3's framing question, exactly as this plan predicted.** The
-measured state is: `SystemServer` reaches `InitBeforeStartServices` and stops at
-the first binder transaction.
+`SystemServer` writes properties in its very first block — `SYSPROP_START_COUNT`,
+`persist.sys.timezone` — and then does `RuntimeInit.setDefaultApplicationWtfHandler`
+before `StartServices`. That is where it stops.
+
+So the order of remaining work is now: the property service socket first, then
+the binder framing below, which gates `StartServices` and everything after it.
+
+A measurement was taken with a missing launcher and looked like a stall for a
+reason that did not exist; `tools/build-native.sh` now builds every Bionic
+artifact in one command, so a cleaned output directory cannot silently produce a
+wrong reading again.
 
 ### P5 — Windowing and graphics
 
