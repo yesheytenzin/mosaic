@@ -46,11 +46,28 @@ bundle/run.sh dalvikvm64 -Xbootclasspath:"$(cat $BUNDLE/bootclasspath.txt)" \
 The class path and boot class path come from the host's own arguments, so the
 invocation stays an ordinary `dalvikvm` one; only the class to run is ours.
 
-## Known wart
+## Registration order matters
 
-The launcher's own progress lines do not reach stderr from inside the interposed
-call, although the same raw-syscall logging works from the binder shim and worked
-from the launcher's constructor in an earlier design. Until that is fixed the
-launcher runs without reporting which registrars failed, which is what the
-ratchet wants to see. Writing to fd 1 as well, or through liblog's
-`__android_log_write`, are the two things to try.
+`registrars.inc` is ordered by `registrar_order.txt`, which is AOSP's own order
+from `AndroidRuntime.cpp`. Alphabetical order looks harmless and is not: it runs
+`register_android_os_Binder` before `register_android_util_Log`, and Binder's
+class initialisation touches `StrictMode`, which calls
+`android.util.Log.isLoggable` — so registration aborts on a native that would have
+been registered a few lines later. The message is worth recognising:
+
+```
+No implementation found for boolean android.util.Log.isLoggable(java.lang.String, int)
+  at android.os.StrictMode.<clinit>(StrictMode.java:155)
+```
+
+## What it reached
+
+With the framework's natives registered:
+
+```
+launcher: registered 150 native registrars
+launcher: running com.android.server.SystemServer
+SystemServerTiming: InitBeforeStartServices
+```
+
+and then it waits for the first Binder transaction, which is P3's work.
