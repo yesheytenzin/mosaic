@@ -142,6 +142,25 @@ do_closure() {
   echo "bundle holds $(find "$out/lib64" -name '*.so' | wc -l) libraries"
 }
 
+write_ld_android_stub() { # <bundle>
+  local out="$1"
+  local target="${MOSAIC_ANDROID_TARGET:-x86_64-linux-android21}"
+  local source
+  source=$(mktemp /tmp/mosaic-ld-android-XXXXXX.c)
+  cat >"$source" <<'EOF'
+/* The soname is the whole content. */
+EOF
+  if clang --target="$target" -shared -fPIC -nostdlib \
+      -Wl,-soname,ld-android.so -o "$out/lib64/ld-android.so" "$source" 2>/dev/null; then
+    rm -f "$source"
+    return 0
+  fi
+  rm -f "$source"
+  echo "warning: could not build the ld-android.so stub; a copy of the linker" >&2
+  echo "         here makes the process abort with 'linker cannot load itself'" >&2
+  return 1
+}
+
 write_linker_config() { # <bundle>
   local out="$1"
   cat > "$out/ld.config.txt" <<EOF
@@ -200,7 +219,20 @@ stage_payload() { # <image> <bundle> <inode> <name>
   fi
   debugfs -R "dump <$linker_inode> $out/linker64" "$img" 2>/dev/null >/dev/null
   chmod 755 "$out/linker64"
-  cp -f "$out/linker64" "$out/lib64/ld-android.so"
+
+  # libc and libdl_android have DT_NEEDED ld-android.so, and on a device that
+  # name is satisfied by the linker itself. Copying the linker binary here does
+  # *not* do the same thing: a copy is a second file, so the linker maps it as an
+  # ordinary library, runs its constructors out of order, and its own
+  # detect_self_exec aborts the process with
+  #
+  #   error: linker cannot load itself
+  #
+  # A symlink does not help either -- it is the same inode, and the same abort.
+  # What works, and what newer Android does, is a real stub with that soname: the
+  # namespace resolves the dependency to this file, nothing of the linker is
+  # mapped, and the linker's own symbols still come from the linker.
+  write_ld_android_stub "$out"
 
   [ -f "$out/ld.config.txt" ] || write_linker_config "$out"
 

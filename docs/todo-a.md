@@ -33,14 +33,16 @@ socket by `src/binder/transport.rs`.
       stale under the framework's `getService`, is gone. Verified: no SIGSEGV, no
       staleness guard, and lookups still find what is registered.
 - [~] A transaction for a *handle*, the shim forwarding to the broker, and the
-      shim as a client of the transport. Written and building: connect, `Export`
-      on registration, `Lookup` on a local miss, `Transaction` for an unknown
-      handle, a reader thread that serves an `Incoming` by building a Parcel over
-      the bytes and entering `BBinder::transact`, and `tools/two-process-call.py`
-      as the second process. **Not verified, and off by default.** The first run
-      published nothing and the reason is not yet found; since a local miss would
-      then wait on a socket for every service the framework does not have, it
-      stays off behind `MOSAIC_BINDER_BROKER=1` rather than turned on untested.
+      shim as a client of the transport. **Three of the four layers are verified**
+      against a running broker with the framework in one process and
+      `tools/two-process-call.py` in another: the shim publishes what it registers
+      (`published memtrack.proxy`), a second process resolves a name the first
+      published (`handle=1 node=0x8e3600000002 owner=1`), and the broker forwards
+      the call to the owner (`the broker sent a transaction`). The owner does not
+      *serve* it: `broker_serve` never completes, so the caller waits and the
+      broker drops the connection. Off by default until that works, because a
+      local miss would otherwise wait on a socket for every service the framework
+      does not have.
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
