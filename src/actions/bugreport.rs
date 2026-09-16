@@ -65,7 +65,7 @@ fn sleep_progress(seconds: u64) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-pub fn bugreport(_args: &MosaicArgs) -> anyhow::Result<()> {
+pub fn bugreport(args: &MosaicArgs) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path().to_string_lossy().to_string();
 
@@ -142,12 +142,13 @@ pub fn bugreport(_args: &MosaicArgs) -> anyhow::Result<()> {
 
     println!("Creating archive...");
 
+    let work = &args.work;
     let files = [
-        "/var/lib/mosaic/mosaic.log".to_string(),
-        "/var/lib/mosaic/mosaic.cfg".to_string(),
-        "/var/lib/mosaic/mosaic_base.prop".to_string(),
-        "/var/lib/mosaic/mosaic.prop".to_string(),
-        "/var/lib/mosaic/lxc".to_string(),
+        format!("{}/mosaic.log", work),
+        format!("{}/mosaic.cfg", work),
+        format!("{}/{}", work, crate::guest::BASE_PROP_FILE),
+        format!("{}/{}", work, crate::guest::PROP_FILE),
+        format!("{}/lxc", work),
     ];
 
     let tar_file = std::fs::File::create(TARBALL)?;

@@ -215,14 +215,14 @@ pub fn make_prop(
     session: &crate::config::SessionDefaults,
     full_props_path: &str,
 ) -> anyhow::Result<()> {
-    let base = std::fs::read_to_string(format!("{}/mosaic_base.prop", args.work))?;
+    let base = std::fs::read_to_string(format!("{}/{}", args.work, crate::guest::BASE_PROP_FILE))?;
     let mut props: Vec<String> = base
         .lines()
         .map(|l| l.to_string())
         .filter(|l| !l.is_empty())
         .collect();
     if props.is_empty() {
-        anyhow::bail!("mosaic_base.prop is broken!!?");
+        anyhow::bail!("{} is broken!!?", crate::guest::BASE_PROP_FILE);
     }
     let cfg = crate::config::load(&args.config);
     let mut add = |key: &str, cfg_key: &str| {
@@ -243,25 +243,29 @@ pub fn make_prop(
             props.push(format!("{}={}", key, value));
         }
     };
-    add("mosaic.host.user", "user_name");
-    add("mosaic.host.uid", "user_id");
-    add("mosaic.host.gid", "group_id");
-    add("mosaic.host_data_path", "mosaic_data");
-    add("mosaic.background_start", "background_start");
+    use crate::guest;
+    add(guest::PROP_HOST_USER, "user_name");
+    add(guest::PROP_HOST_UID, "user_id");
+    add(guest::PROP_HOST_GID, "group_id");
+    add(guest::PROP_HOST_DATA_PATH, "mosaic_data");
+    add(guest::PROP_BACKGROUND_START, "background_start");
     props.push(format!(
-        "mosaic.xdg_runtime_dir={}",
+        "{}={}",
+        guest::PROP_XDG_RUNTIME_DIR,
         crate::config::Defaults::new().container_xdg_runtime_dir
     ));
     props.push(format!(
-        "mosaic.pulse_runtime_path={}",
+        "{}={}",
+        guest::PROP_PULSE_RUNTIME_PATH,
         crate::config::Defaults::new().container_pulse_runtime_path
     ));
     props.push(format!(
-        "mosaic.wayland_display={}",
+        "{}={}",
+        guest::PROP_WAYLAND_DISPLAY,
         crate::config::Defaults::new().container_wayland_display
     ));
-    if which::which("mosaic-sensord").is_err() {
-        props.push("mosaic.stub_sensors_hal=1".to_string());
+    if which::which(guest::SENSORD_BIN).is_err() {
+        props.push(format!("{}=1", guest::PROP_STUB_SENSORS_HAL));
     }
     let dpi = session.lcd_density.clone();
     if dpi != "0" {
@@ -370,11 +374,12 @@ pub fn mount_rootfs(
             false,
         )?;
     }
-    make_prop(args, session, &format!("{}/mosaic.prop", args.work))?;
+    let prop_file = format!("{}/{}", args.work, crate::guest::PROP_FILE);
+    make_prop(args, session, &prop_file)?;
     crate::helpers::mount::bind_file(
         args,
-        &format!("{}/mosaic.prop", args.work),
-        &format!("{}/vendor/mosaic.prop", defaults.rootfs),
+        &prop_file,
+        &format!("{}{}", defaults.rootfs, crate::guest::GUEST_VENDOR_PROP),
         false,
     )?;
     Ok(())

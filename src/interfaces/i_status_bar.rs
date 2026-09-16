@@ -3,8 +3,8 @@
 use crate::args::MosaicArgs;
 use crate::interfaces::gbinder::{Client, RemoteObject, ServiceManager};
 
-const INTERFACE: &str = "mosaic.IStatusBarService";
-const SERVICE_NAME: &str = "mosaicstatusbar";
+const INTERFACE: &str = crate::guest::IFACE_STATUS_BAR;
+const SERVICE_NAME: &str = crate::guest::SVC_STATUS_BAR;
 
 pub struct IStatusBarService {
     client: Client,
