@@ -313,8 +313,7 @@ pub fn init(
     let mut session: Option<HashMap<String, String>> = None;
     if status != "STOPPED" {
         if args.cache.contains_key("running_init_in_service") {
-            // Try to get session from args cache? In Rust we don't store session in args
-            // For now, just stop container via lxc
+            // No session is tracked in the in-process path, so stop via lxc.
             session = None;
             let _ = crate::actions::container_manager::stop(args, false, session.clone());
         } else {
