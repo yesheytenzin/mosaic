@@ -60,6 +60,25 @@ if grep -qw binder /proc/filesystems; then
     echo "ok: binderfs is available"
 fi
 
+cat <<'NOTE'
+
+==> Binder health
+
+The nodes existing is not the same as the driver working. The out-of-tree
+anbox binder sometimes accepts requests and then never replies, leaving
+processes in uninterruptible sleep (D). Check for that after starting a
+container:
+
+    ps -eo stat,args | grep -E "^D"        # guest Android processes in D state
+    sudo dmesg | grep -iE "hung_task|blocked for more than" | tail
+
+If either shows up, the driver is at fault, not Mosaic. The reliable fix is a
+kernel that ships binder in-tree instead of the out-of-tree module:
+
+    yay -S linux-xanmod-anbox linux-xanmod-anbox-headers
+
+NOTE
+
 echo
 echo "Host prerequisites are ready. From the repo root, next:"
 echo "  sudo make install"
