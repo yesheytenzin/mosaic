@@ -9,14 +9,21 @@
 # waiting for the child. So run the probe in the background, poll for it, and
 # give up without waiting if it never finishes.
 #
+# On a kernel with binder built in (Arch's linux-zen), the device nodes do not
+# exist until binderfs is mounted and they are allocated. Run this with sudo in
+# that case and it will set them up first.
+#
 # Exit codes:
 #   0  the driver answered
 #   1  the driver did not answer (a probe process may be stuck in D)
-#   2  the check could not run (missing library, headers or compiler)
+#   2  the check could not run (no binder, missing library or compiler)
 #
-#   sh packaging/arch/binder-check.sh
+#   sh packaging/arch/binder-check.sh          # probe
+#   sudo sh packaging/arch/binder-check.sh     # also create the nodes if needed
 
 set -eu
+
+dir=$(mktemp -d)
 
 if ! command -v cc >/dev/null 2>&1; then
     echo "cc is required (install base-devel)." >&2
@@ -28,7 +35,70 @@ if ! pkg-config --exists libgbinder; then
     exit 2
 fi
 
-dir=$(mktemp -d)
+# --- device nodes ---------------------------------------------------------
+
+if [ ! -e /dev/binder ]; then
+    if ! grep -qw binder /proc/filesystems; then
+        echo "This kernel has no binder support and there is no /dev/binder." >&2
+        echo "Install a kernel with binder built in:" >&2
+        echo "  sudo pacman -S linux-zen linux-zen-headers" >&2
+        exit 2
+    fi
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "binder is available but the device nodes do not exist yet."
+        echo "Re-run with sudo so this script can mount binderfs and create them,"
+        echo "or just start Mosaic once, which does the same on first start."
+        exit 2
+    fi
+
+    echo "==> Mounting binderfs and creating the device nodes"
+    mkdir -p /dev/binderfs
+    mount -t binder binder /dev/binderfs 2>/dev/null || true
+
+    cat >"$dir/nodes.c" <<'C'
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/android/binderfs.h>
+
+int main(int argc, char **argv) {
+    int fd = open("/dev/binderfs/binder-control", O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/binderfs/binder-control");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        struct binderfs_device dev;
+        memset(&dev, 0, sizeof(dev));
+        strncpy(dev.name, argv[i], sizeof(dev.name) - 1);
+        /* EEXIST is fine, the node is already there. */
+        if (ioctl(fd, BINDER_CTL_ADD, &dev) < 0) {
+            perror(argv[i]);
+        }
+    }
+    return 0;
+}
+C
+
+    cc "$dir/nodes.c" -o "$dir/nodes"
+    "$dir/nodes" binder vndbinder hwbinder || true
+    for n in binder vndbinder hwbinder; do
+        if [ -e "/dev/binderfs/$n" ]; then
+            ln -sf "/dev/binderfs/$n" "/dev/$n"
+        fi
+    done
+fi
+
+if [ ! -e /dev/binder ]; then
+    echo "/dev/binder still does not exist; cannot probe." >&2
+    exit 2
+fi
+
+# --- probe ----------------------------------------------------------------
+
 out="$dir/out"
 
 cat >"$dir/check.c" <<'C'
