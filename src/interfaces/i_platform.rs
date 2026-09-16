@@ -403,6 +403,20 @@ impl IPlatform {
     }
 }
 
+/// Wait up to 60 seconds for the binder service manager, pumping the main
+/// context so presence notifications are delivered while we wait.
+fn wait_for_manager(sm: &ServiceManager) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if sm.is_present() {
+            return true;
+        }
+        crate::interfaces::gbinder::iterate_main_context(false);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    sm.is_present()
+}
+
 pub fn get_service(args: &MosaicArgs) -> Option<IPlatform> {
     let (binder, _, _) = crate::interfaces::gbinder::load_binder_nodes(args).ok()?;
     let cfg = crate::config::load(&args.config);
@@ -423,10 +437,7 @@ pub fn get_service(args: &MosaicArgs) -> Option<IPlatform> {
 
     if !sm.is_present() {
         log::info!("Waiting for binder Service Manager...");
-        // In real implementation, wait 60 seconds with GLib MainLoop
-        // For now, just sleep and check
-        std::thread::sleep(Duration::from_secs(1));
-        if !sm.is_present() {
+        if !wait_for_manager(&sm) {
             log::error!("Service Manager never appeared");
             return None;
         }

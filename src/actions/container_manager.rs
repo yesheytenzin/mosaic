@@ -100,8 +100,7 @@ fn prepare_drivers_once(args: &MosaicArgs) -> anyhow::Result<()> {
     }
     // Ensure args cache has binder nodes loaded
     let mut args_clone = args.clone();
-    // We can't mutate original args cache through &MosaicArgs, but we can load from config
-    // For now, just ensure binder nodes exist via load
+    // The args cache is read-only here, so load the binder node names from config.
     let _ = crate::helpers::drivers::load_binder_nodes(&mut args_clone);
     // Set permissions for binder nodes if available
     if let Some(binder) = cfg.mosaic.get("binder") {
