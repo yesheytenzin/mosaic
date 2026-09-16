@@ -32,8 +32,8 @@ if ! command -v yay >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "==> Installing lxc and binder_linux-dkms"
-yay -S --needed --noconfirm lxc binder_linux-dkms
+echo "==> Installing lxc, binder_linux-dkms and libgbinder"
+yay -S --needed --noconfirm lxc binder_linux-dkms libgbinder-git
 
 echo "==> Configuring the binder module"
 sudo install -Dm644 /dev/stdin /etc/modprobe.d/mosaic-binder.conf <<'EOF'
