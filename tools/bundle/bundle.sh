@@ -376,6 +376,27 @@ do_jars() { # <image> <bundle>
     dump_path "$img" "/system/framework/$res" "$out/framework/$res"
   done
 
+  # Configuration the framework reads by path: the font configuration is the
+  # first thing SystemFonts asks for, and it fails with a NullPointerException in
+  # FileInputStream when the file is absent, because the descriptor is null.
+  mkdir -p "$out/etc" "$out/fonts"
+  local conf
+  for conf in $(debugfs -R "ls -l /system/etc" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /^fonts.*\.xml$/ { print $NF }'); do
+    dump_path "$img" "/system/etc/$conf" "$out/etc/$conf"
+  done
+
+  # And the fonts those files name, which Typeface.create opens by path.
+  local font
+  for font in $(debugfs -R "ls -l /system/fonts" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF != "." && $NF != ".." { print $NF }'); do
+    inode=$(debugfs -R "ls -l /system/fonts" "$img" 2>/dev/null \
+      | awk -v n="$font" '$NF == n { print $1 }')
+    [ -n "$inode" ] || continue
+    debugfs -R "dump <$inode> $out/fonts/$font" "$img" 2>/dev/null >/dev/null
+  done
+  echo "  + $(ls "$out/fonts" | wc -l) font files"
+
   for entry in "${JARS_DATA[@]}"; do
     src="${entry%%:*}"
     rel="${entry##*:}"

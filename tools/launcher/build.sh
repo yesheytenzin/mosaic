@@ -42,6 +42,11 @@ while read -r name; do
   [ -n "$name" ] || continue
   case "$name" in \#*) continue ;; esac
   length=${#name}
+  # Three forms, because the declaration decides: a plain name when the registrar
+  # is extern "C" -- libhwui's register_android_graphics_classes is, and it is the
+  # one that registers android.graphics.Typeface -- and the two C++ manglings
+  # otherwise.
+  printf '  "%s",\n' "$name" >> "$here/registrars.inc"
   printf '  "_Z%s%sP7_JNIEnv",\n' "$length" "$name" >> "$here/registrars.inc"
   printf '  "_ZN7android%s%sEP7_JNIEnv",\n' "$length" "$name" >> "$here/registrars.inc"
 done < "$here/registrar_order.txt"
