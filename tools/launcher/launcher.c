@@ -224,24 +224,75 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
         exit(2);
     }
 
-    int registered = 0;
-    for (unsigned long i = 0; i < sizeof(kRegistrars) / sizeof(kRegistrars[0]); i++) {
-        /* libandroid_runtime's handle first, which is where most of them live,
-         * then the global scope, which is where the rest do: some registrars are
-         * defined in libraries libandroid_runtime merely needs, such as libhwui,
-         * which registers android.graphics.Typeface's natives. */
-        registrar_fn fn = (registrar_fn)dlsym(runtime, kRegistrars[i]);
-        if (!fn) fn = (registrar_fn)dlsym((void *)0 /* RTLD_DEFAULT */, kRegistrars[i]);
-        if (!fn) continue;
-        int result = fn(*env);
-        if (result != 0) {
-            say("launcher: ");
-            say(kRegistrars[i]);
-            say(" returned ");
+    /* The registrar has to come from the library Android would take it from, and
+     * that is not always libandroid_runtime: register_android_graphics_classes is
+     * exported by libhwui as well, and it is libhwui's version that registers
+     * android.graphics.Typeface. So every library that provides a registrar is
+     * asked, and each function is called once however many names it answers to.
+     * Registering the same natives twice would be harmless, but the pointer check
+     * keeps the count honest. */
+    void *libraries[8];
+    int library_count = 0;
+    libraries[library_count++] = runtime;
+    void *hwui = dlopen("libhwui.so", RTLD_NOW);
+    if (hwui) libraries[library_count++] = hwui;
+    const char *extra = getenv("MOSAIC_LAUNCH_LIBS");
+    if (extra) {
+        static char extra_copy[512];
+        long i = 0;
+        for (; extra[i] && i < (long)sizeof(extra_copy) - 1; i++) extra_copy[i] = extra[i];
+        extra_copy[i] = 0;
+        char *piece = extra_copy;
+        while (*piece && library_count < 8) {
+            while (*piece == ':') piece++;
+            if (!*piece) break;
+            char *end = piece;
+            while (*end && *end != ':') end++;
+            if (*end) *end++ = 0;
+            void *handle = dlopen(piece, RTLD_NOW);
+            if (handle) libraries[library_count++] = handle;
+            piece = end;
+        }
+    }
+
+    /* Say whether the library that registers Typeface was reachable at all. */
+    say("launcher: libhwui ");
+    say(hwui ? "loaded\n" : "NOT loaded\n");
+    if (hwui) {
+        registrar_fn graphics = (registrar_fn)dlsym(hwui, "_Z34register_android_graphics_classesP7_JNIEnv");
+        say("launcher: hwui register_android_graphics_classes ");
+        say(graphics ? "found\n" : "not found\n");
+        if (graphics) {
+            int result = graphics(*env);
+            say("launcher: called it, result ");
             say_dec(result);
             say("\n");
         }
-        registered++;
+    }
+
+    static registrar_fn called[512];
+    int called_count = 0;
+    int registered = 0;
+    for (unsigned long i = 0; i < sizeof(kRegistrars) / sizeof(kRegistrars[0]); i++) {
+        for (int l = 0; l < library_count; l++) {
+            registrar_fn fn = (registrar_fn)dlsym(libraries[l], kRegistrars[i]);
+            if (!fn) continue;
+            int seen = 0;
+            for (int c = 0; c < called_count; c++) {
+                if (called[c] == fn) { seen = 1; break; }
+            }
+            if (seen) continue;
+            if (called_count < 512) called[called_count++] = fn;
+            int result = fn(*env);
+            if (result != 0) {
+                say("launcher: ");
+                say(kRegistrars[i]);
+                say(" returned ");
+                say_dec(result);
+                say("\n");
+            }
+            registered++;
+        }
     }
     say("launcher: registered ");
     say_dec(registered);

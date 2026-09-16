@@ -232,6 +232,22 @@ needs `ActivityManager`, an activity lifecycle, input, and a surface; Termux the
 executes a whole Linux userland out of its bootstrap payload. The runtime is no
 longer the obstacle — the framework services are, and those are phases 3 and 4.
 
+## What the system server needs from the image
+
+Running `com.android.server.SystemServer` against a bundle is, in the end, a
+sequence of files it opens by path. Each one announced itself:
+
+| What it asked for | Why |
+| --- | --- |
+| every `*-res.apk` in `/system/framework` | `AssetManager` loads the platform resources and fails to start without them |
+| `/system/etc/fonts.xml` | `SystemFonts` reads the font configuration; absent, `FileInputStream` throws a NullPointerException on a null descriptor |
+| `/system/fonts/*` | `Typeface.create` opens the fonts the configuration names |
+
+All three are collected from the image by `bundle.sh build` rather than listed,
+because a LineageOS image has its own set. The opens are redirected from
+`/system` to the bundle root by the shim, since the framework names those paths in
+places that cannot be configured.
+
 ## Next
 
 Phase 3, userspace Binder (ADR-0004). The boundary is exact:
