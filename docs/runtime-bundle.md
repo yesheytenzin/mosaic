@@ -248,6 +248,25 @@ because a LineageOS image has its own set. The opens are redirected from
 `/system` to the bundle root by the shim, since the framework names those paths in
 places that cannot be configured.
 
+## What the system server has needed, in the order it asked
+
+Each row is a run where it stopped, and each was answered before it moved on.
+
+| It stopped at | Cause | Answer |
+| --- | --- | --- |
+| `AssetManager` | the `*-res.apk` packages | collected from the image |
+| `FileInputStream` on a null descriptor | `/system/etc/fonts.xml` | collected |
+| `Typeface.create` on a null default | fonts invisible to `File.exists` | **the shim redirected `open` but not `stat`/`access`** |
+| `SecurityException` setting thread priority | `androidSetThreadPriority`, whose own `setpriority` is a raw syscall | answered in the harness |
+| `SecurityException` on the thread group | `TaskProfiles::SetTaskProfiles` | answered in the harness |
+
+With those, `SystemServer` reports `PlatformCompat`, `ReadingSystemConfig`,
+`startBootstrapServices`, and `StartWatchdog` complete -- it is booting.
+
+The `stat`/`access` gap is worth remembering: redirecting `open` alone is not
+enough for a filesystem the framework thinks it can see, because code that asks
+whether a file exists never opens it.
+
 ## Next
 
 Phase 3, userspace Binder (ADR-0004). The boundary is exact:

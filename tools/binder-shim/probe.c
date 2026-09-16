@@ -74,6 +74,8 @@ extern int strcmp(const char *, const char *);
 extern char *strcpy(char *, const char *);
 extern char *strcat(char *, const char *);
 extern char *getenv(const char *);
+extern void *dlsym(void *, const char *);
+#define RTLD_NEXT ((void *)-1L)
 extern char *strstr(const char *, const char *);
 
 /* Report each rewritten path once, so a run stays readable. */
@@ -401,6 +403,65 @@ int __open_2(const char *path, int flags) {
 
 int __openat_2(int dirfd, const char *path, int flags) {
     return __openat(dirfd, path, flags, 0);
+}
+
+/* Redirecting opens is not enough: code that asks whether a file exists uses
+ * stat or access, and the font parser filters out fonts whose files it cannot
+ * see. The structures are opaque here -- only the path is rewritten, and the same
+ * pointer is passed on for the kernel to fill. */
+#define REDIRECT_PASSTHROUGH(name, ...)                                        \
+    int name(__VA_ARGS__);                                                     \
+    int name(__VA_ARGS__)
+
+extern int __statx(int, const char *, int, unsigned int, void *);
+
+int stat(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "stat");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int lstat(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "lstat");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int stat64(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "stat64");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int lstat64(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "lstat64");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf) {
+    typedef int (*real_fn)(int, const char *, int, unsigned int, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statx");
+    return real ? real(dirfd, redirect(path), flags, mask, buf) : -1;
+}
+
+int access(const char *path, int mode) {
+    typedef int (*real_fn)(const char *, int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "access");
+    return real ? real(redirect(path), mode) : -1;
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+    typedef int (*real_fn)(int, const char *, int, int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "faccessat");
+    return real ? real(dirfd, redirect(path), mode, flags) : -1;
 }
 
 int open(const char *path, int flags, ...) {
