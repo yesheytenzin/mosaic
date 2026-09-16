@@ -28,6 +28,18 @@ exec unshare -rm --propagation private bash -c '
   mount -t tmpfs none /dev || exit 1
   mkdir -p /dev/socket || exit 1
 
+  # A Bionic process reads system properties from /dev/__properties__, which
+  # libc hardcodes. Point MOSAIC_PROPERTY_DIR at a directory built by
+  # make-property-area.py to have it appear there. Inside the namespace we are
+  # uid 0, which is what libc requires of the mapped files.
+  if [ -n "${MOSAIC_PROPERTY_DIR:-}" ]; then
+    mkdir -p /dev/__properties__
+    cp -f "$MOSAIC_PROPERTY_DIR"/* /dev/__properties__/ || exit 1
+    chown 0:0 /dev/__properties__/* || exit 1
+    chmod 0644 /dev/__properties__/*
+    echo "properties: $(ls /dev/__properties__ | wc -l) files in /dev/__properties__" >&2
+  fi
+
   python3 "$1" >&2 &
   logd_pid=$!
   for _ in $(seq 1 200); do

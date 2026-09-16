@@ -29,16 +29,47 @@ reports what is missing before the linker does.
 ## with-logd.sh
 
 ```
-with-logd.sh <command> [args...]
+MOSAIC_PROPERTY_DIR=<dir> with-logd.sh <command> [args...]
 ```
 
-Runs a Bionic process with a working logd. liblog sends to `/dev/socket/logdw`
-and drops messages when nothing is listening, so without this an Android process
-aborts silently. It sets up a private `/dev` with `unshare -rm` and runs
-`android-logd.py` as a minimal listener. Output goes to stderr.
+Runs a Bionic process with the `/dev` entries it expects, which a host does not
+have and which need root to create for real:
+
+- a working **logd**. liblog sends to `/dev/socket/logdw` and drops messages when
+  nothing is listening, so without this an Android process aborts silently.
+- an optional **property area**. Point `MOSAIC_PROPERTY_DIR` at a directory built
+  by `make-property-area.py` and it appears at `/dev/__properties__`. This is
+  where libc reads system properties, hardcoded, and ART and `app_process` will
+  not start without it.
+
+It sets up a private `/dev` with `unshare -rm`, where the files it creates are
+owned by uid 0 as libc requires. Output goes to stderr.
 
 This is a debugging aid. The product runs app processes in the host's own
 namespace (ADR-0001); it does not wrap them in one.
+
+## make-property-area.py
+
+```
+make-property-area.py <dir> [--build-prop FILE] [--set NAME=VALUE ...]
+```
+
+Generates the Android property area: the `property_info` trie that maps a
+property name to a context, the `properties_serial` area libc requires, and one
+`prop_area` per context holding the values. Both formats are implemented from
+AOSP (`prop_area.h`, `prop_info.h`, `property_info_parser.h` and their
+implementations), because there is no library in the bundle that can generate
+them: on a device `init` does, at boot.
+
+`bundle.sh build` runs it into `<bundle>/properties`, seeded from the image's
+`build.prop`, for the privileged provisioning step to install.
+
+Values come from three places, in order of precedence: `--set`, the Mosaic
+defaults in the script (notably `dalvik.vm.*`, which is the runtime's to choose),
+and the image's `build.prop` where it defines a property Mosaic also defines.
+Only those keys are taken; a whole `build.prop` does not fit in one area, and a
+property with no value reads as unset anyway.
+
 
 ## Things that are easy to get wrong
 

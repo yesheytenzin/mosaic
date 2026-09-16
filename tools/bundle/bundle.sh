@@ -173,6 +173,20 @@ stage_payload() { # <image> <bundle> <inode> <name>
   local img="$1" out="$2" inode="$3" name="$4"
 
   debugfs -R "dump <$inode> $out/bin/$name" "$img" 2>/dev/null >/dev/null
+  # Most of /system/bin is symlinks into the apexes, and dumping one yields the
+  # link target rather than a program. The index knows which entries are real
+  # files, so a non-ELF dump is re-resolved by name.
+  if [ "$(head -c 4 "$out/bin/$name" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+    local real_inode
+    real_inode=$(find_real "$out" "$name")
+    if [ -n "$real_inode" ]; then
+      debugfs -R "dump <$real_inode> $out/bin/$name" "$img" 2>/dev/null >/dev/null
+    fi
+  fi
+  if [ "$(head -c 4 "$out/bin/$name" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+    echo "$name is not an ELF file in this image" >&2
+    return 1
+  fi
   chmod 755 "$out/bin/$name"
 
   # The linker is libc's NEEDED "ld-android.so" as well as a program, so the
@@ -356,6 +370,9 @@ SEED
   echo "staging the boot classpath and data files..."
   do_jars "$img" "$out"
 
+  echo "building the property area..."
+  do_properties "$img" "$out"
+
   echo "writing the linker configuration and environment..."
   write_linker_config "$out"
   do_env "$out"
@@ -410,6 +427,37 @@ exec "$here/bin/$1" "${@:2}"
 EOF
   chmod +x "$out/run.sh"
   echo "  + env.sh, run.sh"
+}
+
+# The property area a Bionic process reads at startup. libc looks in
+# /dev/__properties__, which needs root to provision (ADR-0013), so the bundle
+# carries the generated files for the privileged step to install rather than
+# writing them itself.
+do_properties() { # <image> <bundle>
+  local img="$1" out="$2" gen build_prop
+  gen="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/make-property-area.py"
+  if [ ! -f "$gen" ]; then
+    echo "no make-property-area.py next to bundle.sh; skipping" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null || {
+    echo "python3 not found; skipping the property area" >&2
+    return 0
+  }
+
+  # The image's build.prop is the authority on product identity and SDK level,
+  # so the generator seeds from it and adds the dalvik.vm.* values Mosaic picks.
+  mkdir -p "$out/etc"
+  build_prop=""
+  if dump_path "$img" /system/build.prop "$out/etc/build.prop" >/dev/null 2>&1; then
+    build_prop="$out/etc/build.prop"
+  fi
+  if [ -n "$build_prop" ]; then
+    python3 "$gen" "$out/properties" --build-prop "$build_prop" >/dev/null
+  else
+    python3 "$gen" "$out/properties" >/dev/null
+  fi
+  echo "  + properties/ ($(ls "$out/properties" | tr '\n' ' '))"
 }
 
 do_run() { # <bundle> <binary> [args...]
