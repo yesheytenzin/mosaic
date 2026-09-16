@@ -164,15 +164,23 @@ Run through `app_process` instead and the flow proceeds past that point to
 So the gap is a list of natives plus the device layer, not a wall — the assumption
 this phase rests on now has evidence rather than optimism. Two consequences:
 
-- **The launcher matters.** `dalvikvm` cannot register the framework's natives,
-  and `app_process` cannot be told to run an arbitrary class on an arbitrary class
-  path (it reports `NoClassDefFoundError` for a class that is on the boot
-  classpath and that `dalvikvm` finds without trouble). A launcher of our own —
-  a small Bionic binary built with the clang toolchain, which dlopens
-  `libandroid_runtime.so`, calls its `JNI_OnLoad`, and then starts the class —
-  replaces both, and is the piece P4 should build first.
+- **The launcher matters, and now exists.** `dalvikvm` cannot register the
+  framework's natives, and `app_process` cannot be told to run an arbitrary class
+  on an arbitrary class path. `tools/launcher/` is a Bionic shared object that
+  interposes `JNI_CreateJavaVM`, calls the 150 exported `register_*` functions
+  that `AndroidRuntime::startReg` calls internally, and then runs a class. With it,
+  `SystemServer` gets **further than before**: the first failure moves from
+  `Binder.getNativeBBinderHolder` to `android.util.Log.isLoggable`, and the stack
+  shows the launcher executing SystemServer.
 - **`services.jar` belongs in the bundle**, next to the other boot classpath jars.
   It is not there yet.
+
+The next gap is the interesting one: `register_android_util_Log` is in the list
+that gets called, so either it returned an error or its `RegisterNatives` landed
+on a different class than the one `StrictMode` initialises. The launcher currently
+cannot say which, because its own progress output does not reach stderr from
+inside the interposed call — that is the first thing to fix, since the ratchet
+depends on seeing it.
 
 ### P5 — Windowing and graphics
 
@@ -326,9 +334,10 @@ cheap test:
 1. Fix `BINDER_WRITE_READ`'s framing from the parcel side, and reply to handle 0.
 2. Stand up the service registry so a registered service can be found by name.
 3. ~~Run the P4 spike.~~ **Done** — `SystemServer` runs and stops on one native.
-   Next: build the launcher it needs (dlopen `libandroid_runtime.so`, call
-   `JNI_OnLoad`, start a class), which replaces both `dalvikvm` and
-   `app_process` for this purpose.
+   ~~Build the launcher.~~ **Done** — `tools/launcher/` registers the framework's
+   natives and runs a class; `SystemServer` now stops one gap further on. Next:
+   make the launcher report which registrars fail, then close the
+   `register_android_util_Log` gap.
 4. Build the hello-world fixture APK (via `d8` on our own ART) and add it to the
    verification set.
 5. Add the compatibility matrix skeleton and run the first three Tier 1 apps.
