@@ -17,6 +17,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 logd="$here/android-logd.py"
+properties="$here/android-property-service.py"
 
 if [ $# -lt 1 ]; then
   sed -n '2,14p' "$0"
@@ -29,15 +30,23 @@ exec unshare -rm --propagation private bash -c '
   mkdir -p /dev/socket || exit 1
 
   # A Bionic process reads system properties from /dev/__properties__, which
-  # libc hardcodes. Point MOSAIC_PROPERTY_DIR at a directory built by
-  # make-property-area.py to have it appear there. Inside the namespace we are
-  # uid 0, which is what libc requires of the mapped files.
+  # libc hardcodes, and writes them over a socket at /dev/socket/property_service.
+  # Point MOSAIC_PROPERTY_DIR at a directory built by make-property-area.py to
+  # have both appear. Inside the namespace we are uid 0, which is what libc
+  # requires of the mapped files.
   if [ -n "${MOSAIC_PROPERTY_DIR:-}" ]; then
     mkdir -p /dev/__properties__
     cp -f "$MOSAIC_PROPERTY_DIR"/* /dev/__properties__/ || exit 1
     chown 0:0 /dev/__properties__/* || exit 1
     chmod 0644 /dev/__properties__/*
     echo "properties: $(ls /dev/__properties__ | wc -l) files in /dev/__properties__" >&2
+
+    ANDROID_PROPERTY_DIR=/dev/__properties__ python3 "$2" >&2 &
+    properties_pid=$!
+    for _ in $(seq 1 200); do
+      [ -S /dev/socket/property_service ] && break
+      sleep 0.02
+    done
   fi
 
   python3 "$1" >&2 &
@@ -47,7 +56,7 @@ exec unshare -rm --propagation private bash -c '
     sleep 0.02
   done
 
-  shift
+  shift 2
   # A process that spins on a malformed driver reply fills a disk with log
   # output, so runs are bounded and their output is capped.
   timeout "${MOSAIC_TIMEOUT:-120}" "$@"
@@ -57,5 +66,6 @@ exec unshare -rm --propagation private bash -c '
   fi
 
   kill "$logd_pid" 2>/dev/null || true
+  [ -n "${properties_pid:-}" ] && kill "$properties_pid" 2>/dev/null
   exit "$status"
-' _ "$logd" "$@"
+' _ "$logd" "$properties" "$@"

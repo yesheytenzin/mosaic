@@ -69,6 +69,9 @@ NO_INDEX = 0xFFFFFFFF
 # has to be a plain string; nothing in the read path interprets it.
 DEFAULT_CONTEXT = "u:object_r:default_prop:s0"
 
+# Where the generator records each property's offset, for the writer.
+INDEX_FILE = "index.tsv"
+
 # Enough for app_process and ART to start. ART reads dalvik.vm.* and the SDK
 # level, app_process reads the ABI list and ro.zygote, and framework code reads
 # the product identity.
@@ -122,8 +125,17 @@ DEFAULT_PROPERTIES = {
     "dalvik.vm.image-dex2oat-filter": "verify",
     "dalvik.vm.heapsize": "512m",
     "dalvik.vm.heapgrowthlimit": "256m",
+    # Properties the system server writes during boot. A write to a property the
+    # area does not define is dropped (see android-property-service.py), so the
+    # ones it writes early have to be here.
     "persist.sys.language": "en",
     "persist.sys.country": "US",
+    "persist.sys.locale": "en-US",
+    "persist.sys.localevar": "",
+    "persist.sys.timezone": "UTC",
+    "sys.system_server.start_count": "1",
+    "sys.system_server.start_elapsed": "0",
+    "sys.system_server.start_uptime": "0",
 }
 
 
@@ -160,6 +172,8 @@ class PropArea:
 
     def __init__(self) -> None:
         self.buf = bytearray(PROP_AREA_SIZE)
+        # name -> offset of its prop_info, for the writer.
+        self.index = {}
         # prop_area's constructor allocates the root node and then a dirty
         # backup area the size of one value.
         self.used = PROP_BT_SIZE + align(PROP_VALUE_MAX)
@@ -275,7 +289,9 @@ class PropArea:
                 break
             remaining = remaining[sep + 1 :]
 
-        self._set_u32(current + 4, self._new_prop_info(name, value))
+        info_offset = self._new_prop_info(name, value)
+        self._set_u32(current + 4, info_offset)
+        self.index[name] = info_offset
 
     def finish(self) -> bytes:
         struct.pack_into("<I", self.buf, 0, self.used)  # bytes_used_
@@ -385,6 +401,12 @@ def build(directory: str, properties, context: str = DEFAULT_CONTEXT) -> None:
     for name, value in sorted(properties.items()):
         area.add(name, value)
     write_file(os.path.join(directory, context), area.finish())
+
+    # Where each value lives, for android-property-service.py. Not part of the
+    # area format, and ignored by libc, which opens only the files it knows.
+    with open(os.path.join(directory, INDEX_FILE), "w") as index:
+        for name, offset in sorted(area.index.items()):
+            index.write(f"{name}\t{context}\t{offset}\n")
 
     # libc maps this one unconditionally and fails initialisation without it.
     write_file(os.path.join(directory, "properties_serial"), PropArea().finish())
