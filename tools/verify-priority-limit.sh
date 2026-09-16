@@ -159,14 +159,24 @@ if [ -n "$bundle" ]; then
         "$root/tools/bundle/with-logd.sh"
     ) >"$log" 2>&1 || true
 
-    reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1)
+    # Both of these are pipelines that legitimately find nothing, so both need
+    # their status dropped: with `set -o pipefail` a no-match grep is a non-zero
+    # status, and `set -e` then aborts the script before it can report anything,
+    # which is exactly what a first run of this did.
+    reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1 || true)
     refused=$(grep -ac 'SecurityException' "$log" || true)
     if [ -n "$reached" ]; then
       ok "reached StartActivityManager with no priority stand-ins"
       say "        pretend-nice.c can be deleted; remove it from MOSAIC_PRELOAD"
       say "        (log: $log)"
+    elif [ "${refused:-0}" != "0" ]; then
+      bad "stopped with a SecurityException, so a priority call was still refused"
+      say "        (log: $log)"
     else
-      bad "did not reach StartActivityManager ($refused SecurityException in $log)"
+      bad "did not reach StartActivityManager, and not with a SecurityException"
+      say "        the log will say which call stopped it: (log: $log)"
+      grep -aoE '(Failed to read task profiles[^|]{0,40}|set_sched_policy[^|]{0,30}|SetTaskProfiles[^|]{0,30}|SecurityException[^|]{0,40})' "$log" |
+        sort -u | head -4 | sed 's/^/        /' || true
     fi
   fi
   say ""
