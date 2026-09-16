@@ -74,6 +74,30 @@ to prove interposition worked at all.
 `libbinder` imports `open@LIBC`, `ioctl@LIBC`, and `mmap@LIBC`; an unversioned
 definition in a preloaded library still wins.
 
+## The framing, as far as it goes
+
+Two attempts to find the command stream in `write_buffer` have now failed, and
+the failures are more informative than the guesses:
+
+- Following every plausible pointer in the first 64 bytes, with a
+  `/proc/self/maps` readability check so it cannot crash, finds **no pointer at
+  all**.
+- Searching the whole buffer for the transaction this call must be — `BC_TRANSACTION`,
+  a null target (handle 0, the service manager) and an AIDL code in 1..8 — finds
+  **nothing**.
+
+So the problem is not the offset. `write_buffer` is a real heap address, the
+`binder_write_read` fields read correctly (sizes 68/76 and 256, two plausible
+pointers), and yet the bytes there are mostly zeros with a few odd values. That is
+not a Parcel's data and not a command stream, which means the assumption to
+question is `write_buffer == mOut.data()`. The next attempt should instrument the
+*sender*: log `IPCThreadState::mOut`'s size and data pointer from inside
+`IPCThreadState::talkWithDriver`, or read that function again with this evidence in
+hand, rather than reading more bytes at the receiving end.
+
+A segfault was caused along the way by following a pointer without checking it was
+mapped, so the safety check is worth keeping in whatever diagnostic comes next.
+
 ## Where it stands
 
 The shim answers the version, threads, spam-detection and mapping calls, so
