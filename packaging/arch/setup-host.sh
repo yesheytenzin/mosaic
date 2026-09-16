@@ -44,6 +44,8 @@ if grep -qw binder /proc/filesystems; then
     sudo install -Dm644 /dev/stdin /etc/modprobe.d/mosaic-binder-dkms.conf <<'EOF'
 blacklist binder_linux
 EOF
+    # And make sure nothing asks for it at boot either.
+    sudo rm -f /etc/modules-load.d/mosaic-binder.conf
     echo "    binderfs is available. Mosaic creates the device nodes on first start."
 else
     echo "==> Kernel has no binder; installing the out-of-tree module"
