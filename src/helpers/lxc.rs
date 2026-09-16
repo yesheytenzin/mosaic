@@ -1112,3 +1112,212 @@ pub fn unfreeze(args: &MosaicArgs) -> anyhow::Result<()> {
     )?;
     Ok(())
 }
+
+/// LXC container name. Host-side only, so it keeps the Mosaic spelling.
+pub const CONTAINER_NAME: &str = "mosaic";
+
+/// Environment the guest tools expect. The CLASSPATH and SYSTEMSERVER entries
+/// are appended from `/data/system/environ/classpath` at attach time.
+const ANDROID_ENV: [(&str, &str); 9] = [
+    (
+        "PATH",
+        "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin",
+    ),
+    ("ANDROID_ROOT", "/system"),
+    ("ANDROID_DATA", "/data"),
+    ("ANDROID_STORAGE", "/storage"),
+    ("ANDROID_ART_ROOT", "/apex/com.android.art"),
+    ("ANDROID_I18N_ROOT", "/apex/com.android.i18n"),
+    ("ANDROID_TZDATA_ROOT", "/apex/com.android.tzdata"),
+    ("ANDROID_RUNTIME_ROOT", "/apex/com.android.runtime"),
+    (
+        "BOOTCLASSPATH",
+        "/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/core-icu4j.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/framework-atb-backward-compatibility.jar:/apex/com.android.conscrypt/javalib/conscrypt.jar:/apex/com.android.media/javalib/updatable-media.jar:/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar:/apex/com.android.os.statsd/javalib/framework-statsd.jar:/apex/com.android.permission/javalib/framework-permission.jar:/apex/com.android.sdkext/javalib/framework-sdkextensions.jar:/apex/com.android.wifi/javalib/framework-wifi.jar:/apex/com.android.tethering/javalib/framework-tethering.jar",
+    ),
+];
+
+/// Build the `--set-var` pairs for lxc-attach, folding in the CLASSPATH and
+/// SYSTEMSERVER vars Android generated at boot.
+pub fn android_env_attach_options(args: &MosaicArgs) -> Vec<String> {
+    let mut env: Vec<(String, String)> = ANDROID_ENV
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let command = [
+        "lxc-attach",
+        "-P",
+        &format!("{}/lxc", args.work),
+        "-n",
+        CONTAINER_NAME,
+        "--clear-env",
+        "--",
+        "/system/bin/cat",
+        "/data/system/environ/classpath",
+    ];
+    let output = std::process::Command::new(command[0])
+        .args(&command[1..])
+        .stderr(std::process::Stdio::null())
+        .output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+                let key = parts[1];
+                if !(key.contains("CLASSPATH") || key.contains("SYSTEMSERVER")) {
+                    continue;
+                }
+                match env.iter_mut().find(|(k, _)| k == key) {
+                    Some(entry) => entry.1 = parts[2].to_string(),
+                    None => env.push((key.to_string(), parts[2].to_string())),
+                }
+            }
+        }
+    }
+
+    let mut options = Vec::new();
+    for (k, v) in env {
+        options.push("--set-var".to_string());
+        options.push(format!("{}={}", k, v));
+    }
+    options
+}
+
+fn stdout_mode() -> Option<libc::mode_t> {
+    // SAFETY: fstat on fd 1 writes into a zeroed stat we own.
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(1, &mut stat) == 0 {
+            Some(stat.st_mode & 0o7777)
+        } else {
+            None
+        }
+    }
+}
+
+fn set_stdout_mode(mode: libc::mode_t) {
+    // SAFETY: fchmod on fd 1 with a mode we just read back.
+    unsafe {
+        libc::fchmod(1, mode);
+    }
+}
+
+/// Attach an interactive shell to the container, mirroring the original's
+/// environment, privilege and signal handling.
+#[allow(clippy::too_many_arguments)]
+pub fn shell(
+    args: &MosaicArgs,
+    uid: Option<&str>,
+    gid: Option<&str>,
+    context: Option<&str>,
+    nolsm: bool,
+    allcaps: bool,
+    nocgroup: bool,
+    command: &[String],
+) -> anyhow::Result<()> {
+    let state = status(args);
+    if state == "FROZEN" {
+        unfreeze(args)?;
+    } else if state != "RUNNING" {
+        log::error!("WayDroid container is {}", state);
+        return Ok(());
+    }
+
+    let mut cmd: Vec<String> = vec![
+        "lxc-attach".to_string(),
+        "-P".to_string(),
+        format!("{}/lxc", args.work),
+        "-n".to_string(),
+        CONTAINER_NAME.to_string(),
+        "--clear-env".to_string(),
+    ];
+    cmd.extend(android_env_attach_options(args));
+
+    if let Some(uid) = uid {
+        cmd.push(format!("--uid={}", uid));
+    }
+    if let Some(gid) = gid {
+        cmd.push(format!("--gid={}", gid));
+    } else if let Some(uid) = uid {
+        cmd.push(format!("--gid={}", uid));
+    }
+
+    let mut elevated = Vec::new();
+    if nolsm {
+        elevated.push("LSM");
+    }
+    if allcaps {
+        elevated.push("CAP");
+    }
+    if nocgroup {
+        elevated.push("CGROUP");
+    }
+    if !elevated.is_empty() {
+        cmd.push(format!("--elevated-privileges={}", elevated.join("|")));
+    }
+    if let Some(context) = context {
+        if !nolsm {
+            cmd.push(format!("--context={}", context));
+        }
+    }
+
+    cmd.push("--".to_string());
+    if command.is_empty() {
+        cmd.push("/system/bin/sh".to_string());
+    } else {
+        cmd.extend_from_slice(command);
+    }
+
+    // Do not die on SIGTERM or SIGHUP while the shell is attached.
+    use nix::sys::signal::{signal, SigHandler, SIGHUP, SIGTERM};
+    // SAFETY: the handler is a simple SIG_IGN and the previous handlers are
+    // restored before returning.
+    let prev_term = unsafe { signal(SIGTERM, SigHandler::SigIgn) }.ok();
+    let prev_hup = unsafe { signal(SIGHUP, SigHandler::SigIgn) }.ok();
+
+    let perms = stdout_mode();
+    let result = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+    if let Some(mode) = perms {
+        set_stdout_mode(mode);
+    }
+
+    if let Some(prev) = prev_term {
+        // SAFETY: restoring the handler saved above.
+        unsafe { signal(SIGTERM, prev) }.ok();
+    }
+    if let Some(prev) = prev_hup {
+        // SAFETY: restoring the handler saved above.
+        unsafe { signal(SIGHUP, prev) }.ok();
+    }
+
+    result?;
+
+    if state == "FROZEN" {
+        freeze(args)?;
+    }
+    Ok(())
+}
+
+/// Run logcat inside the container.
+pub fn logcat(args: &MosaicArgs, extra: &[String]) -> anyhow::Result<()> {
+    let mut command = vec!["/system/bin/logcat".to_string()];
+    command.extend_from_slice(extra);
+    shell(args, None, None, None, false, false, false, &command)
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn android_env_has_the_expected_keys() {
+        let keys: Vec<&str> = ANDROID_ENV.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"PATH"));
+        assert!(keys.contains(&"ANDROID_ROOT"));
+        assert!(keys.contains(&"BOOTCLASSPATH"));
+        assert_eq!(keys.len(), 9);
+    }
+}

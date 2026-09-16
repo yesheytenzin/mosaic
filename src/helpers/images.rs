@@ -14,7 +14,7 @@ pub fn sha256sum(path: &str) -> anyhow::Result<String> {
 pub async fn get(args: &MosaicArgs) -> anyhow::Result<()> {
     let cfg = crate::config::load(&args.config);
     let system_ota = cfg.mosaic.get("system_ota").cloned().unwrap_or_default();
-    let (status, body) = crate::helpers::http::retrieve(&system_ota).await?;
+    let (status, body) = crate::helpers::http::retrieve(&system_ota, None).await;
     if status != 200 {
         anyhow::bail!(
             "Failed to get system OTA channel: {}, error: {}",
@@ -43,7 +43,9 @@ pub async fn get(args: &MosaicArgs) -> anyhow::Result<()> {
                 .get("images_path")
                 .cloned()
                 .unwrap_or_else(|| format!("{}/images", args.work));
-            let dest = crate::helpers::http::download(url, filename, false, &args.work).await?;
+            let dest = crate::helpers::http::download(args, url, filename, false, false)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("file not found: {}", url))?;
             log::info!("Validating system image");
             let sum = sha256sum(&dest)?;
             if sum != expected_id {
@@ -68,7 +70,7 @@ pub async fn get(args: &MosaicArgs) -> anyhow::Result<()> {
 
     let cfg2 = crate::config::load(&args.config);
     let vendor_ota = cfg2.mosaic.get("vendor_ota").cloned().unwrap_or_default();
-    let (status, body) = crate::helpers::http::retrieve(&vendor_ota).await?;
+    let (status, body) = crate::helpers::http::retrieve(&vendor_ota, None).await;
     if status != 200 {
         anyhow::bail!(
             "Failed to get vendor OTA channel: {}, error: {}",
@@ -97,7 +99,9 @@ pub async fn get(args: &MosaicArgs) -> anyhow::Result<()> {
                 .get("images_path")
                 .cloned()
                 .unwrap_or_else(|| format!("{}/images", args.work));
-            let dest = crate::helpers::http::download(url, filename, false, &args.work).await?;
+            let dest = crate::helpers::http::download(args, url, filename, false, false)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("file not found: {}", url))?;
             log::info!("Validating vendor image");
             let sum = sha256sum(&dest)?;
             if sum != expected_id {
@@ -131,24 +135,23 @@ pub fn validate(args: &MosaicArgs, channel: &str, path: &str) -> bool {
         .enable_all()
         .build();
     if let Ok(rt) = rt {
-        if let Ok((status, body)) = rt.block_on(crate::helpers::http::retrieve(&channel_url)) {
-            if status != 200 {
-                return false;
-            }
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Some(arr) = json["response"].as_array() {
-                    if let Ok(sum) = sha256sum(path) {
-                        for build in arr {
-                            if build["id"].as_str() == Some(&sum) {
-                                return true;
-                            }
+        let (status, body) = rt.block_on(crate::helpers::http::retrieve(&channel_url, None));
+        if status != 200 {
+            return false;
+        }
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(arr) = json["response"].as_array() {
+                if let Ok(sum) = sha256sum(path) {
+                    for build in arr {
+                        if build["id"].as_str() == Some(&sum) {
+                            return true;
                         }
-                        log::warn!(
-                            "Could not verify the image {} against {}",
-                            path,
-                            channel_url
-                        );
                     }
+                    log::warn!(
+                        "Could not verify the image {} against {}",
+                        path,
+                        channel_url
+                    );
                 }
             }
         }
