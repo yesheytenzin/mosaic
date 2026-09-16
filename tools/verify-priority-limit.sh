@@ -103,37 +103,45 @@ fi
 say "4. can a child of the broker lower its niceness?"
 # setpriority wants root or CAP_SYS_NICE for a *negative* nice, so the check runs
 # as the user the broker runs as, and asks for what the framework asks for.
-# Exit codes: 0 the call works, 2 the session still has the old hard limit (a new
-# session fixes that), 1 the call was refused for another reason.
-runuser -u "$user" -- python3 - "$reported" <<'PY'
-import os
-import resource
-import sys
+# Read the limit from a process that has it, rather than probing with runuser or
+# sudo -u: both reset resource limits to the target user's defaults, which is the
+# very thing being measured. That trap is documented for `setpriv` above and this
+# check walked into it anyway, reporting "the session's hard limit is 0" for a
+# session whose manager had 40 the whole time.
+#
+# The authoritative process is the session's user manager: it is what a user
+# service inherits from, so if it has the limit, the broker does too.
+nice_limit_of() { # <pid> -> the soft Max nice priority, or empty
+  awk -F' ' '/Max nice priority/ {print $4}' "/proc/$1/limits" 2>/dev/null
+}
 
-wanted = int(sys.argv[1] or 0)
-soft, hard = resource.getrlimit(resource.RLIMIT_NICE)
-if hard < wanted:
-    print(f"this session's hard limit is {hard}, not {wanted}")
-    sys.exit(2)
-if soft < wanted:
-    resource.setrlimit(resource.RLIMIT_NICE, (wanted, hard))
-try:
-    os.setpriority(os.PRIO_PROCESS, 0, -10)
-except OSError:
-    sys.exit(1)
-sys.exit(0)
-PY
-case $? in
-  0) ok "a child of the broker can set nice -10" ;;
-  2)
-    bad "the session still has the old hard limit; the drop-in needs a new session"
-    say "        the unit says $reported, which is what a *new* session will get"
-    say "        log out and back in, then run this again"
-    ;;
-  *)
-    bad "nice -10 was refused; androidSetThreadPriority would fail the same way"
-    ;;
-esac
+manager_pid=$(systemctl show -p MainPID "user@$(id -u "$user").service" 2>/dev/null |
+  sed 's/^MainPID=//')
+manager_nice=$(nice_limit_of "${manager_pid:-0}")
+if [ -n "$manager_nice" ] && [ "$manager_nice" != "0" ] 2>/dev/null; then
+  ok "the user manager runs with Max nice $manager_nice"
+elif [ -z "$manager_nice" ]; then
+  bad "cannot read the user manager's limits (/proc/${manager_pid:-?}/limits)"
+else
+  bad "the user manager still runs with Max nice $manager_nice, not $reported"
+  say "        it started before the drop-in; log out and back in (or reboot)"
+fi
+
+# And the broker, if one is up: that is the process the framework's services
+# inherit from, and a broker started before the drop-in keeps the old limit until
+# its socket unit restarts it.
+broker_pid=$(pgrep -u "$user" -f 'mosaic daemon' 2>/dev/null | head -1 || true)
+if [ -n "$broker_pid" ]; then
+  broker_nice=$(nice_limit_of "$broker_pid")
+  if [ -n "$broker_nice" ] && [ "$broker_nice" != "0" ] 2>/dev/null; then
+    ok "the broker (pid $broker_pid) runs with Max nice $broker_nice"
+  else
+    bad "the broker (pid $broker_pid) runs with Max nice ${broker_nice:-unknown}"
+    say "        it started before the drop-in; systemctl --user restart mosaic-broker.socket"
+  fi
+else
+  say "  --    no broker is running, so there is nothing to ask about it"
+fi
 
 bundle=${1:-}
 if [ -n "$bundle" ]; then
