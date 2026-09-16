@@ -13,8 +13,4 @@ override_dh_auto_test:
 	# tests run in the check workflow
 
 override_dh_auto_install:
-	$(MAKE) install DESTDIR=$(CURDIR)/debian/mosaic SYSD_DIR=/lib/systemd/system
-	$(MAKE) install_apparmor DESTDIR=$(CURDIR)/debian/mosaic
-	dh_apparmor --profile-name=adbd
-	dh_apparmor --profile-name=android_app
-	dh_apparmor --profile-name=lxc\\/lxc-mosaic
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/mosaic

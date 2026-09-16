@@ -35,7 +35,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             debhelper \
-            dh-apparmor \
             pkg-config \
             liblzma-dev \
             cargo \

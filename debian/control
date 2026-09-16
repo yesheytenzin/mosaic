@@ -6,8 +6,7 @@ Build-Depends: debhelper (>= 13),
                cargo,
                rustc,
                pkg-config,
-               liblzma-dev,
-               dh-apparmor
+               liblzma-dev
 Standards-Version: 4.5.0.3
 Vcs-Browser: https://github.com/yesheytenzin/mosaic
 Vcs-Git: https://github.com/yesheytenzin/mosaic.git
@@ -16,12 +15,12 @@ Package: mosaic
 Architecture: any
 Depends: ${misc:Depends},
          ${shlibs:Depends},
-         lxc,
-         dbus,
-         polkitd | policykit-1,
-         pipewire-pulse | pulseaudio,
-	 iptables
-Recommends: ca-certificates,
-Description: Android™ application support
- mosaic allows running a separate Android™ environment
- confined to a LXC container.
+         polkitd | policykit-1
+Recommends: ca-certificates
+Description: Run Android apps as native Linux processes
+ Mosaic runs an Android app as an ordinary host process instead of booting a
+ whole Android system in a container. An installed app is a desktop
+ application: it opens a real Wayland window and its data lives under its own
+ system user. AOSP's ART and Bionic are reused as host-native libraries, and
+ the Android API surface, framework services, Binder and the hardware
+ abstraction layer are translated to host equivalents.

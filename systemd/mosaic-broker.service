@@ -1,0 +1,23 @@
+[Unit]
+Description=Mosaic broker
+Documentation=man:mosaic(1)
+Requires=mosaic-broker.socket
+After=mosaic-broker.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mosaic daemon
+# The broker exits when idle (ADR-0005) and the socket unit starts it again on
+# the next connection, so a clean exit is expected, not a failure.
+Restart=no
+# Nothing else may be running when the broker exits, and there is no session to
+# prompt on: polkit authorization for UID allocation belongs to the terminal
+# that ran `mosaic install`, not to the daemon. See ADR-0008.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/mosaic
+
+[Install]
+WantedBy=default.target
