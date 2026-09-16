@@ -75,29 +75,50 @@ socket by `src/binder/transport.rs`.
       window, and it then reports that nothing was published. The manual sequence
       is the one that is verified.
 
-*Known defect, found while running the framework end to end:* the framework's own
-services do not reach the registry. Every `ServiceManager.addService` from Java
-logs
+*The defect, with the measurements.* The framework's own services do not reach the
+registry: every Java `ServiceManager.addService` logs
 
 ```
 android-binder: addService platform_compat carried no readable binder object
 ```
 
-and only the AIDL registrations land -- `memtrack.proxy` and
-`android.frameworks.stats.IStats/default`, both of which go through
-`AServiceManager_addService` rather than through a Parcel. The name parses in both
-cases; it is the object that cannot be read, with `Parcel::readStrongBinder` at
-each of the three positions the two formats allow, so the Java side's request does
-not carry its object where this looks for it. It does not block the boot -- a
-lookup for one of those names answers "not found", and the framework holds its own
-services locally -- but it is a real gap: a second process cannot reach a service
-the framework registered.
+while the AIDL registrations land. It is not the request format and not the object
+table being empty. Three of them, dumped as they arrive:
+
+| service | request size | name ends at | object table | first offset |
+| --- | --- | --- | --- | --- |
+| `system_server_dumper` | 156 | 116 | 1 entry | 120 |
+| `platform_compat` | 144 | 108 | 1 entry | 108 |
+| `platform_compat_native` | 160 | 120 | 1 entry | 124 |
+
+and `Parcel::unflattenBinder`'s own code, read out of libbinder, says an object is
+`type @ 0`, `cookie @ 16`, 24 bytes -- which is what a hand parse at the name's end
+already reads correctly, `0x73622a85` every time. So the bytes are where this thinks
+they are, and the table says there is one object, and `readStrongBinder` still
+returns nothing at the name's end, at `first`, and at `first - 24`.
+
+Two things to try next, in order:
+
+1. Watch what the *writer* records. `Parcel::writeObject` in libbinder appends
+   `mDataPos` to `mObjects` **after** writing the object, so the table's entry is the
+   object's *end* -- which would make the start `first - 24`, and 116 vs 120 and
+   120 vs 124 say the name's end is four bytes short of whichever it is for the
+   even-length names. That four-byte discrepancy is the thing to explain first.
+2. Failing that, take the object with the hand parse at the name's end -- which
+   reads the type correctly -- and hold its reference some other way than
+   `readStrongBinder`, since that is the only reason the hand parse was abandoned.
 
 *Gate:* a service registered by name is found by name and a transaction reaches
-it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
-daemon, and now by the framework itself: `AServiceManager_addService` and
-`ServiceManager.addService` both land, and `checkService` finds what they
-registered.
+it. **Met for the AIDL path only, and the box is open because of it.** The broker's
+own tests and `tools/binder-probe.py` pass, and the framework's
+`AServiceManager_addService` registrations land and are found -- `memtrack.proxy`
+and `android.frameworks.stats.IStats/default`. The framework's *Java*
+registrations do not land at all, which is the defect below: `activity_task`,
+`platform_compat`, `file_integrity`, `uri_grants`, `powerstats` and every other
+`ServiceManager.addService` are read as having no binder object, so a second
+process cannot reach them. This box was marked done on the strength of the AIDL
+half and the defect was recorded underneath rather than reopening it, which was the
+wrong way round.
 
 ## A3. Reference counting and lifetime ✅
 

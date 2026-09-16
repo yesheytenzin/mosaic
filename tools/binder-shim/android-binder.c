@@ -1061,6 +1061,37 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
                 say(name);
                 say(" carried no readable binder object\n");
                 say_once();
+                /* Where is the object, then? The bytes after the name, the object
+                 * table, and what each candidate position holds. Bounded to the
+                 * first three so a boot does not fill with this. */
+                static int dumped = 0;
+                if (dumped < 3) {
+                    dumped++;
+                    const unsigned char *end = data + size;
+                    ulong count = parcel_ipc_objects_count ? parcel_ipc_objects_count(request_parcel) : 0;
+                    const unsigned long *offsets = parcel_ipc_objects ? parcel_ipc_objects(request_parcel) : 0;
+                    say("android-binder:   size=");
+                    say_dec((long)size);
+                    say(" after-name at ");
+                    say_dec(after_name ? (long)(after_name - data) : -1);
+                    say(" objects=");
+                    say_dec((long)count);
+                    if (offsets && count) {
+                        say(" first=");
+                        say_dec((long)offsets[0]);
+                    }
+                    say(" bytes:");
+                    for (const unsigned char *q = after_name; q && q < end && q < after_name + 40; q++) {
+                        static const char hex[] = "0123456789abcdef";
+                        char pair[3];
+                        pair[0] = hex[(*q >> 4) & 0xf];
+                        pair[1] = hex[*q & 0xf];
+                        pair[2] = ' ';
+                        write(2, pair, 3);
+                    }
+                    say("\n");
+                    say_once();
+                }
             }
         }
         parcel_write_int32(reply, 0);
