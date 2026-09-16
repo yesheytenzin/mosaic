@@ -55,6 +55,7 @@ type LocalTransactFunc = unsafe extern "C" fn(
 ) -> *mut c_void;
 
 type PresenceFunc = unsafe extern "C" fn(user_data: *mut c_void);
+type DeathFunc = unsafe extern "C" fn(user_data: *mut c_void);
 
 type FnServicemanagerNew = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type FnServicemanagerNew2 =
@@ -76,10 +77,17 @@ type FnClientNewRequest = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type FnClientTransactSyncReply =
     unsafe extern "C" fn(*mut c_void, c_uint, *mut c_void, *mut c_int) -> *mut c_void;
 type FnClientUnref = unsafe extern "C" fn(*mut c_void);
+type FnClientTransactSyncOneway = unsafe extern "C" fn(*mut c_void, c_uint, *mut c_void) -> c_int;
+type FnRemoteObjectAddDeathHandler =
+    unsafe extern "C" fn(*mut c_void, DeathFunc, *mut c_void) -> c_ulong;
+type FnRemoteObjectRemoveHandler = unsafe extern "C" fn(*mut c_void, c_ulong);
+type FnMainContextDefault = unsafe extern "C" fn() -> *mut c_void;
+type FnMainContextIteration = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type FnLocalRequestInitWriter = unsafe extern "C" fn(*mut c_void, *mut GBinderWriter);
 type FnLocalRequestUnref = unsafe extern "C" fn(*mut c_void);
 type FnLocalObjectNewReply = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type FnLocalReplyInitWriter = unsafe extern "C" fn(*mut c_void, *mut GBinderWriter);
+type FnLocalReplyUnref = unsafe extern "C" fn(*mut c_void);
 type FnRemoteReplyInitReader = unsafe extern "C" fn(*mut c_void, *mut GBinderReader);
 type FnRemoteReplyUnref = unsafe extern "C" fn(*mut c_void);
 type FnRemoteRequestInitReader = unsafe extern "C" fn(*mut c_void, *mut GBinderReader);
@@ -121,14 +129,20 @@ struct Api {
     client_new_request: FnClientNewRequest,
     client_transact_sync_reply: FnClientTransactSyncReply,
     client_unref: FnClientUnref,
+    client_transact_sync_oneway: FnClientTransactSyncOneway,
     local_request_init_writer: FnLocalRequestInitWriter,
     local_request_unref: FnLocalRequestUnref,
     local_object_new_reply: FnLocalObjectNewReply,
     local_reply_init_writer: FnLocalReplyInitWriter,
+    local_reply_unref: FnLocalReplyUnref,
     remote_reply_init_reader: FnRemoteReplyInitReader,
     remote_reply_unref: FnRemoteReplyUnref,
     remote_request_init_reader: FnRemoteRequestInitReader,
     remote_object_unref: FnRemoteObjectUnref,
+    remote_object_add_death_handler: FnRemoteObjectAddDeathHandler,
+    remote_object_remove_handler: FnRemoteObjectRemoveHandler,
+    main_context_default: FnMainContextDefault,
+    main_context_iteration: FnMainContextIteration,
     reader_read_int32: FnReaderReadInt32,
     reader_read_int64: FnReaderReadInt64,
     reader_read_string16: FnReaderReadString16,
@@ -201,6 +215,10 @@ impl Api {
                 FnClientTransactSyncReply
             ),
             client_unref: gb!("gbinder_client_unref", FnClientUnref),
+            client_transact_sync_oneway: gb!(
+                "gbinder_client_transact_sync_oneway",
+                FnClientTransactSyncOneway
+            ),
             local_request_init_writer: gb!(
                 "gbinder_local_request_init_writer",
                 FnLocalRequestInitWriter
@@ -208,6 +226,7 @@ impl Api {
             local_request_unref: gb!("gbinder_local_request_unref", FnLocalRequestUnref),
             local_object_new_reply: gb!("gbinder_local_object_new_reply", FnLocalObjectNewReply),
             local_reply_init_writer: gb!("gbinder_local_reply_init_writer", FnLocalReplyInitWriter),
+            local_reply_unref: gb!("gbinder_local_reply_unref", FnLocalReplyUnref),
             remote_reply_init_reader: gb!(
                 "gbinder_remote_reply_init_reader",
                 FnRemoteReplyInitReader
@@ -218,6 +237,17 @@ impl Api {
                 FnRemoteRequestInitReader
             ),
             remote_object_unref: gb!("gbinder_remote_object_unref", FnRemoteObjectUnref),
+            remote_object_add_death_handler: gb!(
+                "gbinder_remote_object_add_death_handler",
+                FnRemoteObjectAddDeathHandler
+            ),
+            remote_object_remove_handler: gb!(
+                "gbinder_remote_object_remove_handler",
+                FnRemoteObjectRemoveHandler
+            ),
+            main_context_default: *glib.get::<FnMainContextDefault>(b"g_main_context_default\0")?,
+            main_context_iteration: *glib
+                .get::<FnMainContextIteration>(b"g_main_context_iteration\0")?,
             reader_read_int32: gb!("gbinder_reader_read_int32", FnReaderReadInt32),
             reader_read_int64: gb!("gbinder_reader_read_int64", FnReaderReadInt64),
             reader_read_string16: gb!("gbinder_reader_read_string16", FnReaderReadString16),
@@ -272,6 +302,22 @@ pub fn available() -> bool {
     api().is_some()
 }
 
+/// Run one iteration of the GLib default main context, which is where
+/// libgbinder delivers presence and death notifications. Returns false when
+/// no source was ready and `may_block` was false.
+pub fn iterate_main_context(may_block: bool) -> bool {
+    let Some(api) = api() else {
+        // Without libgbinder there is nothing to pump; avoid a busy spin.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        return false;
+    };
+    // SAFETY: both calls are safe on the default context.
+    unsafe {
+        let context = (api.main_context_default)();
+        (api.main_context_iteration)(context, may_block as c_int) != 0
+    }
+}
+
 fn cstring(value: &str) -> anyhow::Result<CString> {
     CString::new(value).map_err(|_| anyhow::anyhow!("interior nul in {:?}", value))
 }
@@ -287,10 +333,9 @@ fn take_string(api: &Api, ptr: *mut c_char) -> String {
     s
 }
 
-/// Reply returned by a local-object transaction handler.
-type ReplyBytes = Vec<u8>;
-/// A transaction handler: `(reader, code, flags) -> (reply bytes, status)`.
-type TransactHandler = Box<dyn Fn(Reader, u32, u32) -> (ReplyBytes, i32) + Send>;
+/// A transaction handler. It reads the request and fills the reply writer,
+/// returning the binder status (0 on success).
+type TransactHandler = Box<dyn Fn(Reader, u32, u32, &mut Writer) -> i32 + Send>;
 
 /// A registered local-object handler, boxed and handed to libgbinder as
 /// user_data. Reclaimed when the object is dropped.
@@ -319,31 +364,32 @@ unsafe extern "C" fn transact_trampoline(
     // SAFETY: req is a valid GBinderRemoteRequest for this transaction.
     unsafe { (api.remote_request_init_reader)(req, &mut reader) };
 
-    let (bytes, tx_status) = (handler.callback)(Reader { reader }, code, flags);
-
-    if !status.is_null() {
-        unsafe { *status = tx_status };
-    }
-    if tx_status != 0 {
-        return std::ptr::null_mut();
-    }
-
     // SAFETY: obj is the GBinderLocalObject that received the transaction.
     let reply = unsafe { (api.local_object_new_reply)(obj) };
     if reply.is_null() {
+        if !status.is_null() {
+            unsafe { *status = -1 };
+        }
         return std::ptr::null_mut();
     }
-    let mut writer = GBinderWriter::zeroed();
+    let mut gb_writer = GBinderWriter::zeroed();
     // SAFETY: reply is a fresh local reply.
-    unsafe { (api.local_reply_init_writer)(reply, &mut writer) };
-    // SAFETY: appending a byte array to the reply writer.
-    unsafe {
-        (api.writer_append_byte_array)(
-            &mut writer,
-            bytes.as_ptr() as *const c_void,
-            bytes.len() as i32,
-        )
-    };
+    unsafe { (api.local_reply_init_writer)(reply, &mut gb_writer) };
+
+    let mut writer = Writer::for_reply(gb_writer);
+    let tx_status = (handler.callback)(Reader { reader }, code, flags, &mut writer);
+
+    if tx_status != 0 {
+        if !status.is_null() {
+            unsafe { *status = tx_status };
+        }
+        // SAFETY: reply is the object we created above.
+        unsafe { (api.local_reply_unref)(reply) };
+        return std::ptr::null_mut();
+    }
+    if !status.is_null() {
+        unsafe { *status = 0 };
+    }
     reply
 }
 
@@ -418,6 +464,7 @@ impl ServiceManager {
         }
         Ok(Some(RemoteObject {
             object: obj as usize,
+            handlers: Vec::new(),
         }))
     }
 
@@ -465,7 +512,7 @@ impl ServiceManager {
     pub fn new_local_object(
         &self,
         interface: &str,
-        handler: impl Fn(Reader, u32, u32) -> (Vec<u8>, i32) + Send + 'static,
+        handler: impl Fn(Reader, u32, u32, &mut Writer) -> i32 + Send + 'static,
     ) -> LocalObject {
         let Some(api) = api() else {
             return LocalObject { object: 0 };
@@ -546,10 +593,54 @@ impl Drop for ServiceManager {
 
 pub struct RemoteObject {
     object: usize,
+    /// Boxed death handlers, kept alive for as long as the object.
+    handlers: Vec<Box<dyn Fn() + Send>>,
 }
 
 unsafe impl Send for RemoteObject {}
 unsafe impl Sync for RemoteObject {}
+
+impl RemoteObject {
+    /// Register a death notification. The handler is kept alive with the
+    /// object, mirroring the reference the bindings held.
+    pub fn add_death_handler(&mut self, handler: impl Fn() + Send + 'static) -> u32 {
+        let boxed: Box<Box<dyn Fn() + Send>> = Box::new(Box::new(handler));
+        let ptr = Box::into_raw(boxed);
+
+        unsafe extern "C" fn trampoline(user_data: *mut c_void) {
+            // SAFETY: user_data is the boxed closure from add_death_handler.
+            let f = unsafe { &*(user_data as *const Box<dyn Fn() + Send>) };
+            f();
+        }
+
+        let mut id = 0u32;
+        if let Some(api) = api() {
+            // SAFETY: valid remote object and our trampoline.
+            unsafe {
+                id = (api.remote_object_add_death_handler)(
+                    self.object as *mut c_void,
+                    trampoline,
+                    ptr as *mut c_void,
+                ) as u32;
+            }
+        }
+        // SAFETY: reclaim the Box<Box<..>> wrapper, keeping the inner closure
+        // alive in `handlers`.
+        let reclaimed = unsafe { *Box::from_raw(ptr) };
+        self.handlers.push(reclaimed);
+        id
+    }
+
+    /// Remove a death handler registered with `add_death_handler`.
+    pub fn remove_death_handler(&self, id: u32) {
+        if let Some(api) = api() {
+            // SAFETY: valid remote object and handler id.
+            unsafe {
+                (api.remote_object_remove_handler)(self.object as *mut c_void, id as c_ulong);
+            }
+        }
+    }
+}
 
 impl Drop for RemoteObject {
     fn drop(&mut self) {
@@ -616,6 +707,7 @@ impl Client {
             request,
             writer,
             api: resolved,
+            valid: request != 0,
         }
     }
 
@@ -650,6 +742,24 @@ impl Client {
         Ok((Reader { reader }, status))
     }
 
+    /// Fire a oneway transaction: no reply, returns the binder status.
+    pub fn transact_sync_oneway(&self, code: u32, request: Writer) -> i32 {
+        let (Some(api), Some(client)) = (api(), self.client) else {
+            return -1;
+        };
+        if request.request == 0 {
+            return -1;
+        }
+        // SAFETY: valid client, code, and request.
+        unsafe {
+            (api.client_transact_sync_oneway)(
+                client as *mut c_void,
+                code,
+                request.request as *mut c_void,
+            )
+        }
+    }
+
     pub fn interface(&self) -> &str {
         &self.interface
     }
@@ -668,6 +778,8 @@ pub struct Writer {
     request: usize,
     writer: GBinderWriter,
     api: Option<&'static Api>,
+    /// True once the writer has been initialised against a request or reply.
+    valid: bool,
 }
 
 impl Drop for Writer {
@@ -680,6 +792,17 @@ impl Drop for Writer {
 }
 
 impl Writer {
+    /// Wrap a writer initialised on a local reply. Replies are owned by the
+    /// trampoline, so there is nothing to unref here.
+    pub(crate) fn for_reply(writer: GBinderWriter) -> Self {
+        Self {
+            request: 0,
+            writer,
+            api: api(),
+            valid: true,
+        }
+    }
+
     fn writer_ptr(&mut self) -> *mut GBinderWriter {
         &mut self.writer
     }
@@ -688,7 +811,7 @@ impl Writer {
         let (Some(api), Ok(s)) = (self.api, cstring(s)) else {
             return;
         };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -698,7 +821,7 @@ impl Writer {
 
     pub fn append_int32(&mut self, v: i32) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -708,7 +831,7 @@ impl Writer {
 
     pub fn append_int64(&mut self, v: i64) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -718,7 +841,7 @@ impl Writer {
 
     pub fn append_bool(&mut self, v: bool) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -728,7 +851,7 @@ impl Writer {
 
     pub fn append_byte(&mut self, v: u8) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -738,7 +861,7 @@ impl Writer {
 
     pub fn append_byte_array(&mut self, data: &[u8]) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let writer = self.writer_ptr();
@@ -755,7 +878,7 @@ impl Writer {
 
     pub fn append_object(&mut self, object: Option<&RemoteObject>) {
         let Some(api) = self.api else { return };
-        if self.request == 0 {
+        if !self.valid {
             return;
         }
         let ptr = object
@@ -862,7 +985,61 @@ impl Reader {
         }
         Ok(Some(RemoteObject {
             object: ptr as usize,
+            handlers: Vec::new(),
         }))
+    }
+}
+
+/// Publish a binder service and keep it registered while `stop` is false,
+/// pumping the GLib main context so presence notifications are delivered.
+///
+/// This is the shared body of every `add_service` in the interfaces.
+pub fn serve(
+    args: &crate::args::MosaicArgs,
+    interface: &str,
+    service_name: &str,
+    handler: impl Fn(Reader, u32, u32, &mut Writer) -> i32 + Send + 'static,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let Ok((binder, _, _)) = load_binder_nodes(args) else {
+        return;
+    };
+    let cfg = crate::config::load(&args.config);
+    let sm_protocol = cfg.mosaic.get("service_manager_protocol").cloned();
+    let binder_protocol = cfg.mosaic.get("binder_protocol").cloned();
+    let device = format!("/dev/{}", binder);
+    let Ok(sm) = ServiceManager::new(&device, sm_protocol.as_deref(), binder_protocol.as_deref())
+    else {
+        log::debug!("Failed to create ServiceManager for {}", device);
+        return;
+    };
+
+    let object = sm.new_local_object(interface, handler);
+    let registration = (service_name.to_string(), object);
+
+    if sm.is_present() {
+        if let Err(e) = sm.add_service_sync(&registration.0, registration.1) {
+            log::error!("Failed to add service {}: {}", registration.0, e);
+        }
+    }
+
+    // The presence handler outlives this call, so the manager needs a static
+    // home. Services run for the process lifetime.
+    let sm: &'static ServiceManager = Box::leak(Box::new(sm));
+    let _handler = sm.add_presence_handler(move || {
+        if !sm.is_present() {
+            return;
+        }
+        if let Err(e) = sm.add_service_sync(&registration.0, registration.1) {
+            log::error!("Failed to add service {}: {}", registration.0, e);
+        }
+    });
+    let _ = _handler;
+
+    while !stop.load(Ordering::SeqCst) {
+        iterate_main_context(true);
     }
 }
 

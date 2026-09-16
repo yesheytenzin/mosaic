@@ -1,39 +1,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::args::MosaicArgs;
-use crate::interfaces::gbinder::ServiceManager;
+use crate::interfaces::gbinder::{serve, Reader, Writer};
+use std::sync::atomic::AtomicBool;
 
+const INTERFACE: &str = crate::guest::IFACE_CLIPBOARD;
 const SERVICE_NAME: &str = crate::guest::SVC_CLIPBOARD;
 
-pub fn add_service<F1, F2>(args: &MosaicArgs, _send_clipboard: F1, _get_clipboard: F2)
-where
-    F1: Fn(String) + Send + Sync + 'static,
-    F2: Fn() -> String + Send + Sync + 'static,
+const TRANSACTION_SEND_CLIPBOARD_DATA: u32 = 1;
+const TRANSACTION_GET_CLIPBOARD_DATA: u32 = 2;
+
+pub fn add_service<F1, F2>(
+    args: &MosaicArgs,
+    send_clipboard: F1,
+    get_clipboard: F2,
+    stop: &AtomicBool,
+) where
+    F1: Fn(String) + Send + 'static,
+    F2: Fn() -> String + Send + 'static,
 {
-    let (binder, _, _) = match crate::interfaces::gbinder::load_binder_nodes(args) {
-        Ok(v) => v,
-        Err(e) => {
-            log::debug!("Failed to load binder nodes: {}", e);
-            return;
+    let handler = move |mut reader: Reader, code: u32, _flags: u32, reply: &mut Writer| -> i32 {
+        log::debug!("{}: Received transaction: {}", SERVICE_NAME, code);
+        match code {
+            TRANSACTION_SEND_CLIPBOARD_DATA => {
+                match reader.read_string16() {
+                    Ok(arg1) => send_clipboard(arg1),
+                    Err(e) => log::debug!("Failed to read clipboard data: {}", e),
+                }
+                reply.append_int32(0);
+                0
+            }
+            TRANSACTION_GET_CLIPBOARD_DATA => {
+                let data = get_clipboard();
+                reply.append_int32(0);
+                reply.append_string16(&data);
+                0
+            }
+            _ => -99999,
         }
     };
-    let cfg = crate::config::load(&args.config);
-    let binder_protocol = cfg.mosaic.get("binder_protocol").cloned();
-    let service_protocol = cfg.mosaic.get("service_manager_protocol").cloned();
-    let device = format!("/dev/{}", binder);
-    let sm = match ServiceManager::new(
-        &device,
-        service_protocol.as_deref(),
-        binder_protocol.as_deref(),
-    ) {
-        Ok(sm) => sm,
-        Err(e) => {
-            log::debug!("Failed to create ServiceManager: {}", e);
-            return;
-        }
-    };
-    if sm.is_present() {
-        log::debug!("Clipboard service would be registered as {}", SERVICE_NAME);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    serve(args, INTERFACE, SERVICE_NAME, handler, stop);
 }
