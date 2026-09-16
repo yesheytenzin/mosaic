@@ -2,7 +2,13 @@
 # Verify A6's gate: that the priority limit the framework needs is granted, and
 # that a Bionic process then works without the harness stand-ins.
 #
-#   sudo tools/verify-priority-limit.sh
+#   sudo tools/verify-priority-limit.sh [bundle]
+#
+# With a runtime bundle, it also runs the framework *without* pretend-nice.so and
+# checks that SystemServer still reaches StartActivityManager. That is the gate
+# itself rather than the setting behind it, and root can raise the limit for that
+# run even when the session's own limit is still 0 -- so it does not need a
+# re-login, which the session-wide setting does.
 #
 # Why this needs root: the framework raises thread priorities with setpriority,
 # and RLIMIT_NICE caps how far. The hard limit is 0 on a desktop session, and a
@@ -57,19 +63,30 @@ ok() { printf '  ok    %s\n' "$*"; }
 bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
 
 say "1. system-side grant for the user manager"
-dropin=/etc/systemd/system/user@.service.d/mosaic.conf
-if [ -f "$dropin" ]; then
-  ok "$dropin"
+# systemd reads both the vendor directory and /etc; the package installs into the
+# vendor one and this checks either, because which is used is a packaging choice.
+dropin=
+for candidate in /usr/lib/systemd/system/user@.service.d/mosaic.conf \
+                 /etc/systemd/system/user@.service.d/mosaic.conf; do
+  [ -f "$candidate" ] && dropin=$candidate && break
+done
+if [ -n "$dropin" ] && grep -q '^LimitNICE=' "$dropin"; then
+  ok "$dropin ($(grep '^LimitNICE=' "$dropin"))"
 else
-  bad "$dropin is missing; install it with: make install"
+  bad "no user@.service drop-in grants LimitNICE; install one with: make install"
 fi
 
 say "2. the broker's own unit"
 unit=/usr/lib/systemd/user/mosaic-broker.service
-if [ -f "$unit" ] && grep -q '^LimitNICE=' "$unit"; then
-  ok "$(grep '^LimitNICE=' "$unit") in $unit"
+installed=$(grep '^LimitNICE=' "$unit" 2>/dev/null || true)
+packaged=$(grep '^LimitNICE=' "$root/systemd/mosaic-broker.service" 2>/dev/null || true)
+if [ -n "$installed" ]; then
+  ok "$installed in $unit"
+elif [ -n "$packaged" ]; then
+  bad "$unit is installed but without LimitNICE; the packaged unit has $packaged"
+  say "        this is a stale install: reinstall with: sudo make install"
 else
-  bad "$unit does not set LimitNICE; expected the packaged unit"
+  bad "$unit is missing; install it with: sudo make install"
 fi
 
 say "3. what the user manager reports"
@@ -108,7 +125,53 @@ else
   bad "nice -10 was refused; androidSetThreadPriority would fail the same way"
 fi
 
-say ""
+bundle=${1:-}
+if [ -n "$bundle" ]; then
+  say "5. the framework, without the priority stand-ins"
+  if [ ! -x "$bundle/run.sh" ]; then
+    bad "$bundle does not look like a runtime bundle (no run.sh)"
+  else
+    # The stand-ins are the one thing being removed here. Everything else is what
+    # the harness normally preloads.
+    preload="$root/tools/launcher/out/launcher.so"
+    for library in probe android-binder android-properties; do
+      preload="$preload $root/tools/binder-shim/out/$library.so"
+    done
+    # If a preload is missing the harness builds it, which is why this does not
+    # refuse on that: the artifacts are gitignored, so cleaning the tree deletes
+    # them.
+
+    log=$(mktemp)
+    # Root raises the limit here and hands the process to the invoking user with
+    # setpriv, rather than sudo -u: sudo resets resource limits to the target
+    # user's defaults, which would undo exactly the thing under test.
+    (
+      ulimit -e 40
+      exec setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --init-groups \
+        env "HOME=$(getent passwd "$user" | cut -d: -f6)" \
+        "MOSAIC_TIMEOUT=${MOSAIC_TIMEOUT:-90}" "MOSAIC_MAX_OUTPUT=900000" \
+        "MOSAIC_ANDROID_ROOT=$bundle" "MOSAIC_PROPERTY_DIR=$bundle/properties" \
+        "MOSAIC_BINDER_BROKER=0" "MOSAIC_PRELOAD=$preload" \
+        "MOSAIC_LAUNCH_CLASS=com.android.server.SystemServer" \
+        "MOSAIC_LAUNCH_RUNTIME=$bundle/lib64/libandroid_runtime.so" \
+        sh -c 'cd "$MOSAIC_ANDROID_ROOT" && exec "$0" "$MOSAIC_ANDROID_ROOT/run.sh" dalvikvm64 \
+                 -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)"' \
+        "$root/tools/bundle/with-logd.sh"
+    ) >"$log" 2>&1 || true
+
+    reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1)
+    refused=$(grep -ac 'SecurityException' "$log" || true)
+    if [ -n "$reached" ]; then
+      ok "reached StartActivityManager with no priority stand-ins"
+      say "        pretend-nice.c can be deleted; remove it from MOSAIC_PRELOAD"
+      say "        (log: $log)"
+    else
+      bad "did not reach StartActivityManager ($refused SecurityException in $log)"
+    fi
+  fi
+  say ""
+fi
+
 if [ "$fail" -eq 0 ]; then
   say "the limit is in place. The priority stand-ins in tools/binder-shim/pretend-nice.c"
   say "can go: rerun the framework with pretend-nice.so removed from MOSAIC_PRELOAD and"
@@ -116,7 +179,11 @@ if [ "$fail" -eq 0 ]; then
   exit 0
 fi
 
-say "the limit is not in place, so the stand-ins are still load-bearing: without them"
-say "the run stops at InitBeforeStartServices with a SecurityException from"
-say "setThreadPriority. Install the package (or restart the user session) and rerun."
+say "something above is not in place."
+say ""
+say "With a bundle as an argument, checks 1-3 are about the session's own limit and"
+say "need the package installed and a new session; check 4 and 5 are about the"
+say "mechanism and are what root can prove right now. The stand-ins are load-bearing"
+say "exactly as long as the limit is missing: without them the run stops at"
+say "InitBeforeStartServices with a SecurityException from setThreadPriority."
 exit 1
