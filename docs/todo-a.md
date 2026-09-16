@@ -54,6 +54,27 @@ socket by `src/binder/transport.rs`.
       arguments, which the copy does not preserve -- nothing in the boot path
       sends one.
 
+      The sequence, to reproduce it by hand:
+
+      ```
+      MOSAIC_SOCKET=/tmp/mosaic-broker.sock target/debug/mosaic daemon &
+      cd <bundle> && MOSAIC_BINDER_BROKER=1 MOSAIC_BINDER_SOCKET=/tmp/mosaic-broker.sock \
+        MOSAIC_ANDROID_ROOT=$PWD MOSAIC_PROPERTY_DIR=$PWD/properties MOSAIC_TIMEOUT=150 \
+        MOSAIC_PRELOAD="<repo>/tools/launcher/out/launcher.so \
+          <repo>/tools/binder-shim/out/{probe,pretend-nice,android-binder,android-properties}.so" \
+        MOSAIC_LAUNCH_CLASS=com.android.server.SystemServer \
+        MOSAIC_LAUNCH_RUNTIME=$PWD/lib64/libandroid_runtime.so \
+        <repo>/tools/bundle/with-logd.sh $PWD/run.sh dalvikvm64 \
+          -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)"
+      # in another shell, once the broker's log says a name was exported:
+      tools/two-process-call.py /tmp/mosaic-broker.sock <that name> 1
+      ```
+
+      `tools/verify-two-process-call.sh` wraps this, and its automatic form is not
+      reliable yet: the registrations do not always reach the broker inside its
+      window, and it then reports that nothing was published. The manual sequence
+      is the one that is verified.
+
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. Met by the broker's own tests, by `tools/binder-probe.py` against the shipped
 daemon, and now by the framework itself: `AServiceManager_addService` and
