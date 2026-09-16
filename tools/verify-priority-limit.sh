@@ -141,7 +141,11 @@ if [ -n "$bundle" ]; then
     # refuse on that: the artifacts are gitignored, so cleaning the tree deletes
     # them.
 
-    log=$(mktemp)
+    # Created as root by this script, so the framework's output lands here through
+    # an inherited descriptor, and handed to the invoking user afterwards: a log
+    # nobody but root can read is not much use to the person reading the verdict,
+    # which a first run of this made clear.
+    log=$(mktemp /tmp/mosaic-priority-XXXXXX.log)
     # Root raises the limit here and hands the process to the invoking user with
     # setpriv, rather than sudo -u: sudo resets resource limits to the target
     # user's defaults, which would undo exactly the thing under test.
@@ -163,6 +167,7 @@ if [ -n "$bundle" ]; then
     # their status dropped: with `set -o pipefail` a no-match grep is a non-zero
     # status, and `set -e` then aborts the script before it can report anything,
     # which is exactly what a first run of this did.
+    chown "$(id -u "$user"):$(id -g "$user")" "$log" 2>/dev/null || true
     reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1 || true)
     refused=$(grep -ac 'SecurityException' "$log" || true)
     if [ -n "$reached" ]; then
@@ -172,6 +177,8 @@ if [ -n "$bundle" ]; then
     elif [ "${refused:-0}" != "0" ]; then
       bad "stopped with a SecurityException, so a priority call was still refused"
       say "        (log: $log)"
+      say "        the call, as the framework reported it:"
+      grep -a -A6 'SecurityException' "$log" | head -8 | cut -c1-140 | sed 's/^/        /' || true
     else
       bad "did not reach StartActivityManager, and not with a SecurityException"
       say "        the log will say which call stopped it: (log: $log)"
