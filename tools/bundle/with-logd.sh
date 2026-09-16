@@ -28,10 +28,20 @@ fi
 # like the program stopping for its own reasons. That cost two wrong readings, so
 # it is checked here rather than noticed later.
 if [ -n "${MOSAIC_PRELOAD:-}" ]; then
+  missing_preload=0
+  for library in $MOSAIC_PRELOAD; do
+    [ -f "$library" ] || missing_preload=1
+  done
+  # Build them rather than refusing to start: the artifacts are gitignored, so
+  # cleaning the tree deletes them, and three runs were wasted discovering that.
+  if [ "$missing_preload" = 1 ] && [ -n "${MOSAIC_ANDROID_ROOT:-}" ]; then
+    echo "with-logd: preload libraries are missing; building them" >&2
+    "$here/../build-native.sh" "$MOSAIC_ANDROID_ROOT" >&2 || exit 2
+  fi
   for library in $MOSAIC_PRELOAD; do
     if [ ! -f "$library" ]; then
       echo "with-logd: MOSAIC_PRELOAD names $library, which does not exist." >&2
-      echo "           Build the native artifacts first: tools/build-native.sh <bundle>" >&2
+      echo "           Build them with: tools/build-native.sh <bundle>" >&2
       exit 2
     fi
   done
