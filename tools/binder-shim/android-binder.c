@@ -569,6 +569,12 @@ static int broker_send(uint32 kind, uint32 a, uint32 b, uint32 c, ulong node,
     int result = write_all(fd, header, 32);
     if (result == 0 && size > 0) result = write_all(fd, data, size);
     unlock_broker();
+    if (result != 0) {
+        say("android-binder: sending to the broker failed (kind ");
+        say_dec((long)kind);
+        say(")\n");
+        say_once();
+    }
     return result;
 }
 
@@ -750,7 +756,12 @@ static void start_reader(void) {
     unsigned long thread = 0;
     /* pthread_create comes from libc, which the process has even though this
      * library was built without one. */
-    if (pthread_create(&thread, 0, broker_reader, 0) == 0) reader_started = 1;
+    if (pthread_create(&thread, 0, broker_reader, 0) == 0) {
+        reader_started = 1;
+    } else {
+        say("android-binder: the reader thread would not start\n");
+        say_once();
+    }
 }
 
 /* Wait for the answer to whatever was just sent, and take it. */
