@@ -1364,6 +1364,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "fern",
+ "futures-util",
  "glob",
  "hex",
  "libc",

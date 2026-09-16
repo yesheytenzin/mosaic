@@ -188,7 +188,7 @@ fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
         .insert("system_ota".to_string(), system_ota.clone());
 
     // Validate system OTA via HTTP blocking
-    let (status, _) = crate::helpers::http::retrieve_blocking(&system_ota).unwrap_or((0, vec![]));
+    let (status, _) = crate::helpers::http::retrieve_blocking(&system_ota, None);
     if status != 200 {
         anyhow::bail!(
             "Failed to get system OTA channel: {}, error: {}",
@@ -212,8 +212,7 @@ fn setup_config(args: &mut MosaicArgs) -> anyhow::Result<bool> {
             arch,
             vendor.replace(' ', "_")
         );
-        let (status, _) =
-            crate::helpers::http::retrieve_blocking(&vendor_ota).unwrap_or((0, vec![]));
+        let (status, _) = crate::helpers::http::retrieve_blocking(&vendor_ota, None);
         if status == 200 {
             found_vendor = true;
             vendor_ota_final = vendor_ota.clone();

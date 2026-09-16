@@ -185,54 +185,23 @@ async fn run() -> i32 {
                 eprintln!("ERROR: Action \"shell\" needs root access");
                 return 1;
             }
-            let mut cmd = vec![
-                "lxc-attach".to_string(),
-                "-P".to_string(),
-                format!("{}/lxc", args.work),
-                "-n".to_string(),
-                "mosaic".to_string(),
-                "--clear-env".to_string(),
-            ];
-            if let Some(uid) = shell_args.uid {
-                cmd.push(format!("--uid={}", uid));
-            }
-            if let Some(gid) = shell_args.gid {
-                cmd.push(format!("--gid={}", gid));
-            }
-            if shell_args.nolsm {
-                cmd.push("--elevated-privileges=LSM".to_string());
-            }
-            cmd.push("--".to_string());
-            if shell_args.command.is_empty() {
-                cmd.push("/system/bin/sh".to_string());
-            } else {
-                cmd.extend(shell_args.command);
-            }
-            match std::process::Command::new(&cmd[0]).args(&cmd[1..]).status() {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            mosaic_lib::helpers::lxc::shell(
+                &args,
+                shell_args.uid.as_deref(),
+                shell_args.gid.as_deref(),
+                shell_args.context.as_deref(),
+                shell_args.nolsm,
+                shell_args.allcaps,
+                shell_args.nocgroup,
+                &shell_args.command,
+            )
         }
         Action::Logcat(logcat_args) => {
             if nix::unistd::getuid().as_raw() != 0 {
                 eprintln!("ERROR: Action \"logcat\" needs root access");
                 return 1;
             }
-            let mut cmd = vec![
-                "lxc-attach".to_string(),
-                "-P".to_string(),
-                format!("{}/lxc", args.work),
-                "-n".to_string(),
-                "mosaic".to_string(),
-                "--clear-env".to_string(),
-                "--".to_string(),
-                "/system/bin/logcat".to_string(),
-            ];
-            cmd.extend(logcat_args.args);
-            match std::process::Command::new(&cmd[0]).args(&cmd[1..]).status() {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
+            mosaic_lib::helpers::lxc::logcat(&args, &logcat_args.args)
         }
         Action::ShowFullUi => mosaic_lib::actions::app_manager::show_full_ui(&args).await,
         Action::FirstLaunch => {
