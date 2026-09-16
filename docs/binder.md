@@ -103,6 +103,32 @@ it filled a 5 GB log, because libbinder waits for a reply that never comes.
 `with-logd.sh` now bounds every run with `MOSAIC_TIMEOUT` (120 seconds by
 default), and the shim refuses an unparsed stream instead of staying silent.
 
+The probe's own output was also lying at first: it wrote each byte with its own
+`write(2)`, so its dumps interleaved with the process's own stderr and the result
+looked like a corrupted buffer. It now buffers a line and writes it once. The
+bytes below survive that fix, so they are real.
+
+The struct itself reads correctly, which is what makes the framing puzzling:
+
+```
+write_size=68  write_consumed=0  write_buffer=0x7f931680ab10
+read_size=256  read_consumed=0  read_buffer=0x7f931680bad0
+```
+
+`IPCThreadState::writeTransactionData` writes `BC_TRANSACTION` and then the
+64-byte `binder_transaction_data`, and `talkWithDriver` sets
+`write_buffer = mOut.data()`, so the first four bytes should be `0` and the whole
+call should be 68 bytes. The bytes are not that, and the sizes do not decompose
+consistently: 68 and 76 differ by 8, and neither `[cmd][tr]` nor
+`[prefix][cmd][tr]` accounts for both.
+
+The next attempt should stop reading bytes and check the parcel side instead:
+what `Parcel::data()` and `Parcel::ipcData()` return relative to each other, and
+whether the outgoing parcel for this call has been through `remove()` or
+`setDataSize()` first. Both files are a short fetch away
+(`platform/frameworks/native`, `libs/binder/{IPCThreadState,Parcel}.cpp`) and were
+read once already without settling it.
+
 ## What is left for Phase 3
 
 1. Settle the write-stream framing, then reply to `BINDER_WRITE_READ`: for a
