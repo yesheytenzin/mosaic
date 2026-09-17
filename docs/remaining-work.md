@@ -118,6 +118,33 @@ registration was ever kept), the string16 padding (two bytes for an odd count, n
 four), and writing a null strong binder by writing nothing (handing libbinder null
 is a SIGSEGV inside the framework's `getService`).
 
+### More than one user
+
+The package is per machine: one `sudo make install`, and every user gets the command,
+the socket unit and the polkit action. What is per user is the work directory --
+`~/.local/share/mosaic` with its registry, its apps and its app data -- so each
+person installs their own apps with their own `mosaic install`.
+
+The runtime is per machine as well, because it is read-only and identical for
+everyone. `sudo mosaic runtime install` builds it once under
+`/var/lib/mosaic/runtime` (root's own work directory is the machine's) and every
+user's launch finds it: the lookup is this user's runtime first, then the machine's.
+Verified by simulating a second user -- a work directory holding only a registry, and
+no runtime of its own:
+
+```
+runtime status → Runtime bundle shared (x86_64, the machine's) at /var/lib/mosaic/runtime/...
+```
+
+`MOSAIC_SHARED_RUNTIME` moves that directory, which is what makes it testable without
+a second account.
+
+Two things this does not settle. The UID an app is given comes from its own user's
+registry, so two people installing the same APK each reserve one -- they collide, and
+the helper sees a system user that already exists. And an app's data directory is per
+user while its UID is machine-wide, which is the wrong way round for what Android
+does with per-user apps.
+
 ### Installing works end to end
 
 `mosaic install <apk>` on the packaged stack now does the whole transaction: the
