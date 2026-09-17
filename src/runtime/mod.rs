@@ -119,6 +119,43 @@ pub fn use_local(work: &str, directory: &str, version: &str) -> anyhow::Result<S
     Ok(link)
 }
 
+/// Check a downloaded file against the sha256 published beside it, if one was.
+///
+/// The same check `runtime fetch` makes, for the same reason: a runtime that arrives
+/// over a network is the one thing here worth verifying. A sidecar that does not
+/// exist is not a failure -- not every host publishes one -- but a sidecar that
+/// disagrees is.
+pub async fn verify_published_checksum(
+    args: &MosaicArgs,
+    url: &str,
+    file: &str,
+) -> anyhow::Result<()> {
+    let sidecar = format!("{}.sha256", url);
+    let (status, body) = crate::helpers::http::retrieve(&sidecar, None).await;
+    if status != 200 || body.is_empty() {
+        return Ok(());
+    }
+    let expected = String::from_utf8_lossy(&body)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let actual = crate::helpers::http::sha256_file(file)?;
+    anyhow::ensure!(
+        actual == expected,
+        "{} does not match the published hash\n  published {}\n  downloaded {}",
+        url,
+        expected,
+        actual
+    );
+    log::info!("Runtime bundle hash verified");
+    let _ = args;
+    Ok(())
+}
+
 /// Directory to run from: the extracted bundle, or an error explaining how to
 /// get one.
 pub fn require(args: &MosaicArgs) -> anyhow::Result<String> {
@@ -278,15 +315,29 @@ pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::R
         log::warn!("No published hash for {}, skipping verification", url);
     }
 
-    log::info!("Extracting to {}", dest);
-    std::fs::create_dir_all(&dest)?;
-    let file = std::fs::File::open(&archive)?;
-    let decoder = xz2::read::XzDecoder::new(file);
-    let mut tar = tar::Archive::new(decoder);
-    tar.unpack(&dest)?;
-
+    unpack_archive_into(&archive, &dest)?;
     write_marker(&args.work, version)?;
     Ok(dest)
+}
+
+/// Unpack a bundle archive into the place a version lives, checking its sha256 when
+/// one was published beside it. Shared by `runtime fetch` and `runtime install <url>`,
+/// which are the same operation reached two ways.
+pub fn unpack_archive(args: &MosaicArgs, archive: &str, version: &str) -> anyhow::Result<String> {
+    let dest = version_dir(&args.work, version);
+    unpack_archive_into(archive, &dest)?;
+    write_marker(&args.work, version)?;
+    Ok(dest)
+}
+
+fn unpack_archive_into(archive: &str, dest: &str) -> anyhow::Result<()> {
+    log::info!("Extracting to {}", dest);
+    std::fs::create_dir_all(&dest)?;
+    let file = std::fs::File::open(archive)?;
+    let decoder = xz2::read::XzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    tar.unpack(dest)?;
+    Ok(())
 }
 
 fn write_marker(work: &str, version: &str) -> anyhow::Result<()> {

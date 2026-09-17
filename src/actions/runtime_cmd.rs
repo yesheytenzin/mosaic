@@ -12,7 +12,9 @@ pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow
     match subaction {
         RuntimeSubaction::Fetch => fetch(args).await,
         RuntimeSubaction::Status => status(args),
-        RuntimeSubaction::Install { path, version } => install(args, path.as_deref(), version),
+        RuntimeSubaction::Install { path, version } => {
+            install(args, path.as_deref(), version).await
+        }
         RuntimeSubaction::Verify => verify(args),
     }
 }
@@ -37,43 +39,102 @@ pub async fn fetch(args: &MosaicArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Install a runtime bundle, from whatever was pointed at.
+/// Install a runtime, from whatever was pointed at.
 ///
-/// A bundle directory is linked as it is. A system image is built into a bundle
-/// first, which is what a machine with an image and no published bundle needs --
-/// and that needs the builder, which lives in a checkout rather than in the package.
-pub fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> anyhow::Result<()> {
-    let path = match path {
+/// A directory is linked as it is. A bundle archive is unpacked, and its sha256 is
+/// checked when one is published beside it. A system image is built into a bundle
+/// first. Any of those may be an http(s) URL, which is the point: a machine with no
+/// checkout and no image can still get a runtime with one command.
+pub async fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> anyhow::Result<()> {
+    let given = match path {
         Some(path) => path.to_string(),
         None => {
-            // The image a Mosaic build leaves behind, so that the common case is
-            // one word: `mosaic runtime install`.
+            // The image a Mosaic build leaves behind, so that the common case is one
+            // word: `mosaic runtime install`.
             let image = std::env::var("MOSAIC_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
             anyhow::ensure!(
                 std::path::Path::new(&image).exists(),
-                "no system image at {}. Pass one: mosaic runtime install <bundle directory | image>",
+                "no system image at {}. Pass one: mosaic runtime install <bundle | image | url>",
                 image
             );
             image
         }
     };
-    let source =
-        std::fs::canonicalize(&path).map_err(|e| anyhow::anyhow!("cannot read {}: {}", path, e))?;
 
-    let directory = if source.is_dir() {
-        source.to_string_lossy().to_string()
+    // A URL is fetched first; what comes back is a file on disk, like any other.
+    let local = if given.starts_with("http://") || given.starts_with("https://") {
+        let name = given.rsplit('/').next().unwrap_or("runtime").to_string();
+        if version_name(&name).is_some() && version == "local" {
+            // Nothing to do here: the archive's own name carries the version.
+        }
+        log::info!("Fetching {}", given);
+        crate::helpers::http::download(args, &given, "runtime-install", true, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{} could not be fetched", given))?
     } else {
-        build_from_image(args, &source)?
+        std::fs::canonicalize(&given)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {}", given, e))?
+            .to_string_lossy()
+            .to_string()
     };
 
-    let link = crate::runtime::use_local(&args.work, &directory, version)?;
+    let version = if version != "local" {
+        version.to_string()
+    } else {
+        std::path::Path::new(&local)
+            .file_name()
+            .and_then(|name| version_name(&name.to_string_lossy()))
+            .unwrap_or_else(|| "local".to_string())
+    };
+
+    // A fetched archive is checked against the hash published beside it, the same as
+    // `runtime fetch` does: what arrives over a network is what is worth verifying.
+    if given.starts_with("http://") || given.starts_with("https://") {
+        crate::runtime::verify_published_checksum(args, &given, &local).await?;
+    }
+
+    if std::path::Path::new(&local).is_dir() {
+        let link = crate::runtime::use_local(&args.work, &local, &version)?;
+        println!("Runtime bundle {} installed", version);
+        println!("  from    {}", local);
+        println!("  linked  {}", link);
+        return Ok(());
+    }
+
+    // Classified by what was given, not by where the download landed: the cache path
+    // has no extension, so an archive fetched by URL looked like an image and the
+    // builder was handed a tar file to read as a filesystem.
+    if is_archive(&given) || is_archive(&local) {
+        let dir = crate::runtime::unpack_archive(args, &local, &version)?;
+        println!("Runtime bundle {} installed", version);
+        println!("  from    {}", given);
+        println!("  at      {}", dir);
+        return Ok(());
+    }
+
+    let directory = build_from_image(args, std::path::Path::new(&local))?;
+    let link = crate::runtime::use_local(&args.work, &directory, &version)?;
     println!("Runtime bundle {} installed", version);
-    println!("  from    {}", directory);
-    println!("  linked  {}", link);
+    println!("  built from {}", given);
+    println!("  linked     {}", link);
     Ok(())
 }
 
-/// Where the bundle builder is, if this machine has one.
+/// Whether a file is an unpackable bundle rather than a system image.
+fn is_archive(path: &str) -> bool {
+    path.ends_with(".tar.xz") || path.ends_with(".tar.zst") || path.ends_with(".tar.gz")
+}
+
+/// The version in a bundle archive's name, if it is named the way `pack` names it:
+/// `runtime-<version>-<arch>.tar.xz`.
+fn version_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("runtime-")?;
+    let rest = rest.split(".tar.").next()?;
+    let (version, _arch) = rest.rsplit_once('-')?;
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Where the bundle builder is, if this machine has one./// Where the bundle builder is, if this machine has one.
 ///
 /// Three places, in order: what the environment says, where the package puts it, and
 /// where a source checkout keeps it. The package one is why this exists at all --
@@ -208,6 +269,32 @@ pub fn verify(args: &MosaicArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An archive's own name carries its version, which is how a URL installs under
+    /// the same version whichever machine fetched it.
+    #[test]
+    fn a_bundle_archive_names_its_version() {
+        assert_eq!(
+            version_name("runtime-local-x86_64.tar.xz"),
+            Some("local".to_string())
+        );
+        assert_eq!(
+            version_name("runtime-lineage-20-x86_64.tar.zst"),
+            Some("lineage-20".to_string()),
+            "a version with a dash in it survives"
+        );
+        assert_eq!(version_name("system.img"), None);
+        assert_eq!(version_name("runtime-.tar.xz"), None);
+    }
+
+    /// An image is not an archive: one is built into a bundle, the other unpacked.
+    #[test]
+    fn an_image_is_not_an_archive() {
+        assert!(is_archive("/x/runtime-local-x86_64.tar.xz"));
+        assert!(is_archive("/x/thing.tar.zst"));
+        assert!(!is_archive("/var/lib/mosaic/images/system.img"));
+        assert!(!is_archive("/x/vendor.img"));
+    }
 
     /// The builder is looked for in three places, and the package's is the one that
     /// matters for a user whose machine has an installed Mosaic: without it nobody
