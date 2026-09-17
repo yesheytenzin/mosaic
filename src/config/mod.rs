@@ -40,12 +40,29 @@ fn default_work() -> String {
         return work;
     }
     let system = "/var/lib/mosaic";
-    let usable = nix::unistd::access(system, nix::unistd::AccessFlags::W_OK).is_ok()
-        && nix::unistd::access(system, nix::unistd::AccessFlags::X_OK).is_ok();
-    if usable {
+    if writable(system) {
         return system.to_string();
     }
     format!("{}/mosaic", data_home())
+}
+
+/// Whether a directory can actually be written in.
+///
+/// Not `access(W_OK)`: inside a systemd sandbox with `ProtectSystem=strict` the
+/// mount is read-only and `access` still succeeds on it, because it checks
+/// permissions and not the mount. The broker is a user service, so it runs inside
+/// exactly that sandbox, picks `/var/lib/mosaic` on the strength of the check, and
+/// then fails to write the registry with `EROFS`. Creating a file is the only
+/// question worth asking.
+fn writable(dir: &str) -> bool {
+    let probe = format!("{}/.mosaic-write-probe", dir);
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn data_home() -> String {
