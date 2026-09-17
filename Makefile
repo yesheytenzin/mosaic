@@ -84,6 +84,21 @@ install:
 	install -Dm644 packaging/arch/user@.service.d/mosaic.conf $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	install -Dm644 packaging/arch/mosaic.tmpfiles $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
+# Install this checkout on this machine, in the order the two halves require:
+# build as the user, install as root, tell the user manager the unit changed. One
+# command because doing it by hand has gone wrong every way it can -- a stale
+# binary, a build as root, a forgotten daemon-reload.
+setup:
+	cargo build --release
+	sudo $(MAKE) install
+	systemctl --user daemon-reload
+	systemctl --user restart mosaic-broker.socket
+	@echo
+	@echo "mosaic is installed. The runtime is next:"
+	@echo "    mosaic runtime install <bundle directory | system image>"
+	@echo "then:"
+	@echo "    mosaic install <app.apk>"
+
 # A6's gate is a system setting, so checking it needs root. This is the one
 # command that does it, and it says exactly what is missing when it is not.
 verify-priority:
@@ -103,4 +118,4 @@ uninstall:
 	rm -f $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	rm -f $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
-.PHONY: build check install uninstall verify-priority
+.PHONY: build check install uninstall setup verify-priority
