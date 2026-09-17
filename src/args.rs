@@ -104,6 +104,14 @@ pub enum RuntimeSubaction {
     Status,
     /// Check that the installed bundle runs: start ART from it and report back
     Verify,
+    /// Use a bundle built locally instead of downloading one
+    Use {
+        /// Directory holding a bundle, as tools/bundle/bundle.sh build produces
+        directory: String,
+        /// Version to record it under
+        #[arg(long, default_value = "local")]
+        version: String,
+    },
 }
 
 #[derive(ClapArgs, Debug, Clone)]
