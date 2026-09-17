@@ -79,6 +79,13 @@ android-binder: checkService memtrack.proxy found
 `ActivityManagerService`'s constructor still does not complete. Two known reasons,
 in order:
 
+0. **A2's Java registration path works**, verified by the framework using it:
+   `PowerManagerService` constructs, which requires `appops` from the service
+   manager. `startBootstrapServices` now reaches `StartPowerManager`,
+   `StartThermalManager`, `StartHintManager` and `InitPowerManagement`. Three
+   findings on the way -- the object found by its type word rather than a computed
+   position, the cookie at offset 16 as the IBinder, and `sp<IBinder>` being sixteen
+   bytes with the pointer in the *second* word -- are in `docs/todo-a.md`.
 1. ~~The registry stores a pointer without a reference.~~ Fixed: the object is
    taken with `Parcel::readStrongBinder`, whose reference is left in place, so the
    registry owns the service from registration on. Verified -- no SIGSEGV and no
