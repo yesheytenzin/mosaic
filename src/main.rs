@@ -113,16 +113,26 @@ async fn dispatch(args: &MosaicArgs, action: Action) -> anyhow::Result<()> {
                 other => render(other),
             }
         }
-        Action::Launch(launch) => render(
-            broker::request(
-                args,
-                &Request::Launch {
-                    package: launch.package,
-                    args: launch.args,
-                },
+        Action::Launch(launch) => {
+            // An APK path is accepted as well as an installed name, because the name
+            // of an installed package is derived from the file and is not something a
+            // person would type. `mosaic launch app.apk` finds the package `mosaic
+            // install app.apk` created.
+            let package = match std::fs::canonicalize(&launch.package) {
+                Ok(path) => mosaic_lib::broker::apk_package_name(&path)?,
+                Err(_) => launch.package,
+            };
+            render(
+                broker::request(
+                    args,
+                    &Request::Launch {
+                        package,
+                        args: launch.args,
+                    },
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         Action::Query(query) => {
             let package = query.package;
             let response = broker::request(

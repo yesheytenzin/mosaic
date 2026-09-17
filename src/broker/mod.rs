@@ -259,9 +259,24 @@ fn uninstall(args: &MosaicArgs, name: &str) -> anyhow::Result<Package> {
 
 async fn launch(args: &MosaicArgs, name: &str, extra: Vec<String>) -> anyhow::Result<()> {
     let registry = Registry::load(&args.work);
-    let package = registry
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("{} is not installed", name))?;
+    let package = registry.get(name).ok_or_else(|| {
+        // Say what is installed: the name of an installed package is derived from
+        // its file, so "not installed" on its own leaves nothing to try next.
+        let installed = registry.list();
+        if installed.is_empty() {
+            anyhow::anyhow!("{} is not installed, and nothing is", name)
+        } else {
+            anyhow::anyhow!(
+                "{} is not installed. Installed: {}",
+                name,
+                installed
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    })?;
     let _runtime = crate::runtime::require(args)?;
 
     crate::binder::launch_app(args, package, &extra)
@@ -375,6 +390,35 @@ mod tests {
             candidates.contains(&"/var/lib/mosaic/broker.sock".to_string()),
             "got {:?}",
             candidates
+        );
+    }
+
+    /// "not installed" on its own leaves nothing to try, because the name of an
+    /// installed package is derived from its file and is not something a person
+    /// would type. The message has to name what is there.
+    #[tokio::test]
+    async fn launching_something_absent_names_what_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_str().unwrap();
+        let args = test_args(work);
+
+        let err = launch(&args, "nope", Vec::new()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("nothing is"),
+            "an empty registry should say so: {}",
+            err
+        );
+
+        let apk = dir.path().join("org.example.hello.apk");
+        std::fs::write(&apk, b"not a real apk").unwrap();
+        let (planned, _) = plan(&args, apk.to_str().unwrap()).unwrap();
+        commit(&args, planned.clone()).unwrap();
+
+        let err = launch(&args, "nope", Vec::new()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("org.example.hello"),
+            "the message should name the installed package: {}",
+            err
         );
     }
 
