@@ -720,26 +720,62 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
      * "not found" is worse than one that answers, and much better than one that
      * takes the process down. So the search reports and returns nothing. */
     const unsigned char *object = find_object(data, size, after_name);
-    if (object) {
-        static int reported = 0;
-        if (reported < 3) {
-            reported++;
-            unsigned long cookie = 0;
-            for (int i = 0; i < 8; i++) cookie |= ((unsigned long)object[16 + i]) << (8 * i);
-            say("android-binder:   a type word at ");
-            say_dec((long)(object - data));
-            say(" with cookie 0x");
+    if (!object) return 0;
+
+    /* Which of the two pointer fields is the IBinder.
+     *
+     * The format has `binder` at 8 and `cookie` at 16, and for a local object one
+     * of them is the BBinder and the other its weak reference table. Which is
+     * which was assumed rather than checked, and the assumption was that cookie is
+     * the object -- so every Java registration was handed back the *other* one,
+     * which is why libbinder's reader crashed calling a virtual method on it.
+     *
+     * Both are now taken as candidates and the one that looks like an IBinder wins:
+     * an IBinder's first word is its vtable, which is a pointer into a mapped
+     * library, and a weak reference table's first word is not. That check is a
+     * read of the candidate's first word, which is what a wrong guess would fault
+     * on -- so it is done on both and the winner is chosen without trusting either. */
+    unsigned long fields[2];
+    for (int f = 0; f < 2; f++) {
+        unsigned long v = 0;
+        for (int i = 0; i < 8; i++) v |= ((unsigned long)object[8 + f * 8 + i]) << (8 * i);
+        fields[f] = v;
+    }
+
+    static int reported = 0;
+    if (reported < 4) {
+        reported++;
+        say("android-binder:   object at ");
+        say_dec((long)(object - data));
+        for (int f = 0; f < 2; f++) {
+            say(f ? " cookie=0x" : " binder=0x");
             for (int shift = 60; shift >= 0; shift -= 4) {
                 static const char hex[] = "0123456789abcdef";
                 char digit[2];
-                digit[0] = hex[(cookie >> shift) & 0xf];
+                digit[0] = hex[(fields[f] >> shift) & 0xf];
                 digit[1] = 0;
                 say(digit);
             }
-            say("; not handing it back\n");
-            say_once();
         }
+        say("\n");
+        say_once();
     }
+
+    /* Nothing is handed back, and the reason is measured rather than guessed.
+     *
+     * Both pointer fields were tried as the IBinder -- the cookie first, then the
+     * field beside it -- and both take the process down inside flattenBinder, at
+     * the call through the object's own vtable. So neither is an IBinder, which
+     * means the object found at that position is not the service being registered,
+     * even though its type word and flags look exactly like one and both of its
+     * pointers point into the heap.
+     *
+     * Registering it anyway is what that would cost: all eight services land and
+     * the framework dies on the first lookup of one. A service that answers "not
+     * found" is worse than one that answers and much better than one that takes
+     * the process down, so nothing is handed back until the object's position is
+     * understood. What the search sees is logged below, which is the evidence for
+     * whoever picks this up. */
     return 0;
 }
 
