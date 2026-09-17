@@ -38,10 +38,10 @@ check:
 # needs, which only the user manager can grant, and the tmpfiles entry for the
 # paths Bionic hardcodes.
 install:
-	@if [ ! -f target/release/mosaic ]; then \
-		echo "Rust binary not found, building..."; \
-		cargo build --release; \
-	fi
+	@# Always build: cargo is incremental, so this is cheap, and installing a
+	@# binary that happens to already be there is how a fix that is in the tree
+	@# gets tested against an install that does not have it.
+	cargo build --release
 	install -d $(INSTALL_BIN_DIR)
 	install -d $(INSTALL_APPS_DIR)
 	install -d $(INSTALL_APPS_DIRECTORY_DIR)
