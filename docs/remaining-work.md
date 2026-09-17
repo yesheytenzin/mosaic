@@ -118,6 +118,31 @@ registration was ever kept), the string16 padding (two bytes for an odd count, n
 four), and writing a null strong binder by writing nothing (handing libbinder null
 is a SIGSEGV inside the framework's `getService`).
 
+### Installing works end to end
+
+`mosaic install <apk>` on the packaged stack now does the whole transaction: the
+broker reserves a UID and a data directory, the privileged step allocates the system
+user and the directory, and the broker commits. Verified with the real Termux APK:
+
+```
+Installed termux.app.v0.119.0.beta.3... (uid 5000, data ~/.local/share/mosaic/apps/...)
+mosaic-termux-app-v0-119-0-beta:x:5000:934::/home/mosaic-termux-app-v0-119-0-beta:/usr/bin/bash
+drwx------ mosaic-termux-app-v0-119-0-beta 5000 .../apps/termux.app...
+```
+
+Two bugs were in the way, both of them this project's own. `default_work` chose
+`/var/lib/mosaic` on the strength of `access(W_OK)`, which succeeds inside a
+`ProtectSystem=strict` sandbox on a read-only mount, so the broker picked a
+directory it could not write and failed with `EROFS` instead of falling back; the
+check creates a file now, and the unit names the directory it will actually use. And
+the APK path was sent to the broker as given, so a relative path was resolved in the
+broker's working directory rather than the user's, which is why
+`mosaic install app.apk` in the directory holding it reported "No such file or
+directory"; the caller resolves it now.
+
+What installing does *not* mean: `mosaic launch` is still a stub that says so, and
+the package name still comes from the file name rather than the manifest.
+
 ## B. `system_server` to completion
 
 9. Every service after `PackageManagerService`: AMS, WMS, ATMS, `StorageManager`,
