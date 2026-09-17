@@ -118,6 +118,42 @@ registration was ever kept), the string16 padding (two bytes for an odd count, n
 four), and writing a null strong binder by writing nothing (handing libbinder null
 is a SIGSEGV inside the framework's `getService`).
 
+### Another device
+
+`mosaic` itself is the package: build the checkout and `sudo make install`, or build
+the PKGBUILD. Nothing per machine is baked in.
+
+The runtime is the part that has to travel, and it now can. Pack it where it exists:
+
+```
+tools/bundle/bundle.sh pack ~/.local/share/mosaic/bundle /tmp/packs
+  -> runtime-local-x86_64.tar.xz         (309 MB to 126 MB in 5 seconds)
+  -> runtime-local-x86_64.tar.xz.sha256
+```
+
+Serve those two files from anywhere -- a release, a mirror, a directory on a local
+network -- and another machine installs the runtime with
+
+```
+MOSAIC_BUNDLE_CHANNEL=https://that.host/somewhere \
+MOSAIC_BUNDLE_VERSION=local \
+  mosaic runtime fetch
+```
+
+Verified as a round trip: packed the real bundle, served it over HTTP, fetched it into
+a work directory that had never seen it, and the status and launch paths found it.
+What the fetch does: downloads, verifies the sha256, unpacks to
+`<work>/runtime/<version>-<arch>` and records the version. Three things were wrong on
+the way and are fixed: `bundle_url` named a `.tar.zst` while the unpacker was xz;
+the channel was a constant, so a self-hosted artifact could not be pointed at; and the
+version marker was written to the *default* work directory rather than the one given,
+so `runtime fetch -w somewhere` put the bundle in one place and the marker in another.
+
+Two things remain. A bundle carries the image's ART and Bionic, so it is specific to
+an architecture: an aarch64 machine needs an aarch64 image and its own bundle. And
+`runtime fetch` needs the artifact to exist -- ADR-0010's publication step is now a
+command, but nobody has published one yet.
+
 ### More than one user
 
 The package is per machine: one `sudo make install`, and every user gets the command,

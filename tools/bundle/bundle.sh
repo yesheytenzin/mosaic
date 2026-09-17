@@ -634,6 +634,49 @@ do_properties() { # <image> <bundle>
   echo "  + properties/ ($(ls "$out/properties" | tr '\n' ' '))"
 }
 
+# Pack a bundle into the artifact `mosaic runtime fetch` expects, next to the
+# checksum it verifies:
+#
+#   bundle.sh pack <bundle> [outdir]
+#
+#   runtime-<version>-<arch>.tar.xz
+#   runtime-<version>-<arch>.tar.xz.sha256
+#
+# The version comes from the bundle's own `version` marker if it has one, so that a
+# bundle packed for publishing keeps the name it was installed under. Put both files
+# on any host and a different machine installs the runtime with
+#
+#   MOSAIC_BUNDLE_CHANNEL=https://that.host/somewhere mosaic runtime fetch
+#
+# Compression is xz because that is what the fetch side decodes; the level is 1 so
+# that packing a few hundred megabytes takes a minute rather than ten.
+do_pack() { # <bundle> [outdir]
+  local bundle="$1" out="${2:-$PWD}"
+  [ -d "$bundle" ] || { echo "no such bundle: $bundle" >&2; return 2; }
+  [ -f "$bundle/run.sh" ] || { echo "$bundle does not look like a bundle" >&2; return 2; }
+
+  local version="local" arch
+  [ -f "$bundle/version" ] && version=$(tr -d '\n' < "$bundle/version")
+  arch=$(uname -m)
+  case "$arch" in
+    aarch64|arm64) arch=aarch64 ;;
+    *) arch=x86_64 ;;
+  esac
+
+  mkdir -p "$out"
+  local name="runtime-${version}-${arch}"
+  echo "packing $bundle as $name.tar.xz"
+  # From inside the bundle, so the archive holds the bundle's contents and unpacking
+  # it into <work>/runtime/<version>-<arch> gives that directory the bundle's files.
+  ( cd "$bundle" && tar -c . ) | xz -1 -T0 > "$out/$name.tar.xz" || return 1
+  sha256sum "$out/$name.tar.xz" | awk '{print $1}' > "$out/$name.tar.xz.sha256"
+  echo "  $out/$name.tar.xz ($(du -h "$out/$name.tar.xz" | cut -f1))"
+  echo "  $out/$name.tar.xz.sha256"
+  echo
+  echo "A different machine installs it with:"
+  echo "  MOSAIC_BUNDLE_CHANNEL=<the directory it is served from> mosaic runtime fetch"
+}
+
 # Compile an installed app's bytecode with the bundle's ART. This is the closest
 # thing to running a real app that the runtime alone can do: dex2oat loads the
 # app's DEX, verifies it against the boot classpath, and with the optimizing
@@ -726,5 +769,6 @@ case "$cmd" in
   compile) do_compile "${2:?bundle}" "${3:?apk}" "${4:-speed}" ;;
   env)     write_linker_config "${2:?bundle}"; do_env "${2:?bundle}" ;;
   run)     do_run "${2:?bundle}" "${3:?binary}" "${@:4}" ;;
+  pack)    do_pack "${2:?bundle}" "${3:-$PWD}" ;;
   *)       sed -n '2,8p' "$0"; exit 2 ;;
 esac

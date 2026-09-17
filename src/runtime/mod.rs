@@ -8,7 +8,6 @@
 //! cheap to introduce.
 
 use crate::args::MosaicArgs;
-use crate::config::Defaults;
 use crate::helpers::http;
 use std::path::Path;
 
@@ -166,7 +165,7 @@ pub fn require_in(work: &str, shared: &str) -> anyhow::Result<String> {
 
 pub fn bundle_url(channel: &str, version: &str) -> String {
     format!(
-        "{}/runtime-{}-{}.tar.zst",
+        "{}/runtime-{}-{}.tar.xz",
         channel.trim_end_matches('/'),
         version,
         host_arch()
@@ -238,7 +237,6 @@ pub fn dalvikvm_path(dir: &str) -> String {
 
 /// Download, verify and extract the bundle for `version`.
 pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::Result<String> {
-    let defaults = Defaults::new();
     std::fs::create_dir_all(runtime_dir(&args.work))?;
 
     let dest = version_dir(&args.work, version);
@@ -248,7 +246,7 @@ pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::R
             version,
             host_arch()
         );
-        write_marker(&defaults.work, version)?;
+        write_marker(&args.work, version)?;
         return Ok(dest);
     }
 
@@ -287,7 +285,7 @@ pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::R
     let mut tar = tar::Archive::new(decoder);
     tar.unpack(&dest)?;
 
-    write_marker(&defaults.work, version)?;
+    write_marker(&args.work, version)?;
     Ok(dest)
 }
 
@@ -370,7 +368,10 @@ mod tests {
     fn url_layout_is_stable() {
         let url = bundle_url("https://example.com/mosaic/", "3");
         assert!(url.starts_with("https://example.com/mosaic/runtime-3-"));
-        assert!(url.ends_with(".tar.zst"));
+        assert!(
+            url.ends_with(".tar.xz"),
+            "the name has to match the decoder"
+        );
     }
 
     #[test]

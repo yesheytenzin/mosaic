@@ -81,7 +81,11 @@ impl Defaults {
         Self {
             apps_dir: format!("{}/apps", work),
             runtime_dir: format!("{}/runtime", work),
-            bundle_channel: "https://ota.waydro.id/mosaic".to_string(),
+            // Overridable, because the published artifact is per release and may be
+            // hosted anywhere -- a release, a mirror, or a directory on a local
+            // network while an image is being moved between machines.
+            bundle_channel: std::env::var("MOSAIC_BUNDLE_CHANNEL")
+                .unwrap_or_else(|_| "https://ota.waydro.id/mosaic".to_string()),
             bundle_version: "0".to_string(),
             uid_range_start: 5000,
             uid_range_end: 5999,

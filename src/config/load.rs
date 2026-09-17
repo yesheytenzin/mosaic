@@ -15,6 +15,14 @@ impl MosaicConfig {
     }
 
     pub fn bundle_version(&self) -> String {
+        // Overridable like the channel, for the same reason: a bundle packed on one
+        // machine has the version it was installed under, and the machine fetching it
+        // has to ask for that name.
+        if let Ok(version) = std::env::var("MOSAIC_BUNDLE_VERSION") {
+            if !version.is_empty() {
+                return version;
+            }
+        }
         self.mosaic
             .get("bundle_version")
             .cloned()
