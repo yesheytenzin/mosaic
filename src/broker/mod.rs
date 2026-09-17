@@ -381,6 +381,33 @@ mod tests {
         );
     }
 
+    /// Every user-facing command that names a package takes a selector, not only
+    /// the exact derived name: launch, query and uninstall go through the same
+    /// resolution, and `install` does not, because it is given a file.
+    #[test]
+    fn query_and_uninstall_take_a_selector_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().to_str().unwrap();
+        let args = test_args(work);
+        let apk = dir.path().join("org.example.hello.apk");
+        std::fs::write(&apk, b"not a real apk").unwrap();
+        let (planned, _) = plan(&args, apk.to_str().unwrap()).unwrap();
+        commit(&args, planned).unwrap();
+
+        let registry = Registry::load(work);
+        assert!(registry.resolve("org.example").is_ok(), "a prefix");
+        assert!(registry.resolve("hello").is_ok(), "a substring");
+        assert!(
+            registry.resolve("ORG.EXAMPLE").is_ok(),
+            "case does not matter"
+        );
+
+        // Uninstalling by prefix removes the package it resolved to.
+        let removed = uninstall(&args, "org.ex").unwrap();
+        assert_eq!(removed.name, "org.example.hello");
+        assert!(Registry::load(work).list().is_empty());
+    }
+
     /// "not installed" on its own leaves nothing to try, because the name of an
     /// installed package is derived from its file and is not something a person
     /// would type. The message has to name what is there.
