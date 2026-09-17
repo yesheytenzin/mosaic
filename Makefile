@@ -6,6 +6,7 @@ APPS_DIR := $(PREFIX)/share/applications
 APPS_DIRECTORY_DIR := $(PREFIX)/share/desktop-directories
 APPS_MENU_DIR := $(SYSCONFDIR)/xdg/menus/applications-merged
 METAINFO_DIR := $(PREFIX)/share/metainfo
+LIBEXEC_DIR := $(PREFIX)/lib/mosaic
 ICONS_DIR := $(PREFIX)/share/icons
 USER_UNIT_DIR := $(PREFIX)/lib/systemd/user
 SYSTEM_UNIT_DIR := $(PREFIX)/lib/systemd/system
@@ -17,6 +18,7 @@ INSTALL_APPS_DIR := $(DESTDIR)$(APPS_DIR)
 INSTALL_APPS_DIRECTORY_DIR := $(DESTDIR)$(APPS_DIRECTORY_DIR)
 INSTALL_APPS_MENU_DIR := $(DESTDIR)$(APPS_MENU_DIR)
 INSTALL_METAINFO_DIR := $(DESTDIR)$(METAINFO_DIR)
+INSTALL_LIBEXEC_DIR := $(DESTDIR)$(LIBEXEC_DIR)
 INSTALL_ICONS_DIR := $(DESTDIR)$(ICONS_DIR)
 INSTALL_USER_UNIT_DIR := $(DESTDIR)$(USER_UNIT_DIR)
 INSTALL_SYSTEM_UNIT_DIR := $(DESTDIR)$(SYSTEM_UNIT_DIR)
@@ -68,6 +70,7 @@ install:
 	install -d $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d
 	install -d $(INSTALL_TMPFILES_DIR)
 	install -d $(INSTALL_POLKIT_DIR)
+	install -d $(INSTALL_LIBEXEC_DIR)
 
 	install -Dm755 target/release/mosaic $(INSTALL_BIN_DIR)/mosaic
 
@@ -81,6 +84,11 @@ install:
 	install -Dm644 systemd/mosaic-broker.socket $(INSTALL_USER_UNIT_DIR)/mosaic-broker.socket
 	install -Dm644 systemd/mosaic-broker.service $(INSTALL_USER_UNIT_DIR)/mosaic-broker.service
 	install -Dm644 polkit/id.mosaic.allocate-uid.policy $(INSTALL_POLKIT_DIR)/id.mosaic.allocate-uid.policy
+	@# The bundle builder ships with the package so that a user can build a runtime
+	@# from the machine's image without a checkout. It needs the build tools, which
+	@# is why it is used rather than depended on.
+	install -Dm755 tools/bundle/bundle.sh $(INSTALL_LIBEXEC_DIR)/bundle.sh
+	install -Dm644 tools/bundle/make-property-area.py $(INSTALL_LIBEXEC_DIR)/make-property-area.py
 	install -Dm644 packaging/arch/user@.service.d/mosaic.conf $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	install -Dm644 packaging/arch/mosaic.tmpfiles $(INSTALL_TMPFILES_DIR)/mosaic.conf
 
@@ -117,5 +125,7 @@ uninstall:
 	rm -f $(INSTALL_POLKIT_DIR)/id.mosaic.allocate-uid.policy
 	rm -f $(INSTALL_SYSTEM_UNIT_DIR)/user@.service.d/mosaic.conf
 	rm -f $(INSTALL_TMPFILES_DIR)/mosaic.conf
+	rm -f $(INSTALL_LIBEXEC_DIR)/bundle.sh $(INSTALL_LIBEXEC_DIR)/make-property-area.py
+	rmdir $(INSTALL_LIBEXEC_DIR) 2>/dev/null || true
 
 .PHONY: build check install uninstall setup verify-priority

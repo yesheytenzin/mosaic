@@ -149,6 +149,27 @@ the channel was a constant, so a self-hosted artifact could not be pointed at; a
 version marker was written to the *default* work directory rather than the one given,
 so `runtime fetch -w somewhere` put the bundle in one place and the marker in another.
 
+### A user who has no runtime
+
+Three ways, and the first is the one to prefer because it costs nothing per person:
+
+1. **The machine-wide one.** An administrator runs `sudo mosaic runtime install` once
+   -- root's work directory is `/var/lib/mosaic` -- and every user's launch finds it.
+   Nothing is copied per user.
+2. **Their own, built from the machine's image.** `mosaic runtime install` builds into
+   `~/.local/share/mosaic/runtime` (309 MB, about 25 seconds). The image at
+   `/var/lib/mosaic/images/system.img` is world-readable, and the builder now ships
+   with the package at `/usr/lib/mosaic/bundle.sh` -- it used to live only in a
+   checkout, which meant a user with an installed Mosaic could not build one at all.
+   It needs `debugfs`, `python3`, `clang`, `tar` and `xz`; when one is missing the
+   builder says so.
+3. **A published bundle.** `MOSAIC_BUNDLE_CHANNEL=<where it is served>
+   MOSAIC_BUNDLE_VERSION=<version> mosaic runtime fetch` needs no image and no build
+   tools, which is the right shape for an end user -- once somebody publishes one.
+
+When none of the three is available the error names all three, rather than leaving
+someone to guess.
+
 Two things remain. A bundle carries the image's ART and Bionic, so it is specific to
 an architecture: an aarch64 machine needs an aarch64 image and its own bundle. And
 `runtime fetch` needs the artifact to exist -- ADR-0010's publication step is now a
