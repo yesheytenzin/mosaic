@@ -54,7 +54,20 @@ async fn run() -> i32 {
 async fn dispatch(args: &MosaicArgs, action: Action) -> anyhow::Result<()> {
     match action {
         Action::Install(install) => {
-            let reserved = broker::request(args, &Request::Install { apk: install.apk }).await?;
+            // The path is resolved here, where the user typed it, not in the
+            // broker: the broker is a service with a working directory of its own,
+            // so `mosaic install app.apk` from the directory holding app.apk had it
+            // looking for the file beside itself and reporting
+            //
+            //   cannot read app.apk: No such file or directory
+            //
+            // for a file that was right there. Resolving also means an unreadable
+            // path is reported by the command that was given it.
+            let apk = std::fs::canonicalize(&install.apk)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", install.apk, e))?
+                .to_string_lossy()
+                .to_string();
+            let reserved = broker::request(args, &Request::Install { apk }).await?;
             let package = match reserved {
                 // Already installed: the broker did everything.
                 Response::Installed(package) => return render(Response::Installed(package)),
