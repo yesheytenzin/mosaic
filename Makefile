@@ -44,11 +44,20 @@ install:
 	@# building afterwards -- and in this project's case made rustc panic outright.
 	@# Build as yourself, then install: cargo build --release && sudo make install
 	@test -f target/release/mosaic || { \
-		echo "target/release/mosaic is missing or stale. As yourself, first:"; \
+		echo "target/release/mosaic is missing. Build it first, as yourself:"; \
 		echo "    cargo build --release"; \
 		echo "then: sudo make install"; \
 		exit 1; \
 	}
+	@# Installing a binary that is older than the tree is silent, and silence here
+	@# has cost a whole evening: the fix is committed, the command is run, and the
+	@# behaviour does not change because /usr/bin/mosaic is from before the fix.
+	@stale=$$(find src -name '*.rs' -newer target/release/mosaic 2>/dev/null | head -1); \
+	if [ -n "$$stale" ]; then \
+		echo "warning: target/release/mosaic is older than $$stale"; \
+		echo "         what you are installing does not have the latest changes."; \
+		echo "         As yourself: cargo build --release"; \
+	fi
 	install -d $(INSTALL_BIN_DIR)
 	install -d $(INSTALL_APPS_DIR)
 	install -d $(INSTALL_APPS_DIRECTORY_DIR)
