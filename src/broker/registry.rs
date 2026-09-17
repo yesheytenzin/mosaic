@@ -62,6 +62,66 @@ impl Registry {
         self.packages.get(name)
     }
 
+    /// The package a person means by `selector`.
+    ///
+    /// Nobody wants to type `termux.app.v0.119.0.beta.3.apt.android.7.github.debug.x86.64`,
+    /// and the name an installed package has is derived from its file anyway. An
+    /// exact name wins; failing that a unique prefix; failing that a unique
+    /// substring. Anything else is an error that says what it matched, because
+    /// "not found" and "several" need different things from the caller.
+    pub fn resolve(&self, selector: &str) -> anyhow::Result<&Package> {
+        if let Some(package) = self.packages.get(selector) {
+            return Ok(package);
+        }
+        let folded = selector.to_lowercase();
+        // Prefix first, then substring: "termux" should not be ambiguous with a
+        // package that merely contains it.
+        for prefixes_only in [true, false] {
+            let mut matches: Vec<&Package> = self
+                .packages
+                .values()
+                .filter(|package| {
+                    let name = package.name.to_lowercase();
+                    if prefixes_only {
+                        name.starts_with(&folded)
+                    } else {
+                        name.contains(&folded)
+                    }
+                })
+                .collect();
+            matches.sort_by(|a, b| a.name.cmp(&b.name));
+            match matches.len() {
+                0 => continue,
+                1 => return Ok(matches[0]),
+                _ => {
+                    anyhow::bail!(
+                        "{} matches {} packages: {}",
+                        selector,
+                        matches.len(),
+                        matches
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+        }
+        let installed = self.list();
+        if installed.is_empty() {
+            anyhow::bail!("{} is not installed, and nothing is", selector)
+        }
+        anyhow::bail!(
+            "{} is not installed. Installed: {}",
+            selector,
+            installed
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
     pub fn list(&self) -> Vec<Package> {
         self.packages.values().cloned().collect()
     }
@@ -105,6 +165,73 @@ mod tests {
         let work = dir.path().to_str().unwrap();
         std::fs::write(format!("{}/registry.json", work), b"{ not json").unwrap();
         assert!(Registry::load(work).list().is_empty());
+    }
+
+    fn registry_with(names: &[&str]) -> Registry {
+        let mut registry = Registry::default();
+        for (i, name) in names.iter().enumerate() {
+            registry.add(Package {
+                name: name.to_string(),
+                uid: 5000 + i as u32,
+                data_dir: format!("/apps/{}", name),
+                apk: format!("/apks/{}.apk", name),
+                installed_at: 0,
+            });
+        }
+        registry
+    }
+
+    /// Nobody types `termux.app.v0.119.0.beta.3...`, and the name is derived from
+    /// the file anyway, so a prefix has to find the package.
+    #[test]
+    fn a_unique_prefix_finds_the_package() {
+        let registry = registry_with(&["termux.app.v0.119.0.beta.3", "org.example.other"]);
+        assert_eq!(
+            registry.resolve("termux").unwrap().name,
+            "termux.app.v0.119.0.beta.3"
+        );
+        // Case does not matter, and an exact name still wins.
+        assert_eq!(
+            registry.resolve("TERMUX").unwrap().name,
+            "termux.app.v0.119.0.beta.3"
+        );
+        assert_eq!(registry.resolve("org.example.other").unwrap().uid, 5001);
+    }
+
+    /// A prefix beats a mere substring, and a substring is the fallback.
+    #[test]
+    fn prefix_first_then_substring() {
+        let registry = registry_with(&["termux.app", "app.termux.helper"]);
+        assert_eq!(registry.resolve("termux").unwrap().name, "termux.app");
+        assert_eq!(
+            registry.resolve("helper").unwrap().name,
+            "app.termux.helper"
+        );
+    }
+
+    /// Several matches need a different answer from none: "which of these?" rather
+    /// than "there is nothing".
+    #[test]
+    fn ambiguity_says_which_it_matched() {
+        let registry = registry_with(&["termux.one", "termux.two"]);
+        let err = registry.resolve("termux").unwrap_err().to_string();
+        assert!(err.contains("matches 2 packages"), "{}", err);
+        assert!(
+            err.contains("termux.one") && err.contains("termux.two"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_miss_names_what_is_installed() {
+        let registry = registry_with(&["termux.app"]);
+        let err = registry.resolve("nope").unwrap_err().to_string();
+        assert!(err.contains("termux.app"), "{}", err);
+
+        let empty = Registry::default();
+        let err = empty.resolve("nope").unwrap_err().to_string();
+        assert!(err.contains("nothing is"), "{}", err);
     }
 
     #[test]
