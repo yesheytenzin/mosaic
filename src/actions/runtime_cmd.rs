@@ -116,18 +116,28 @@ fn build_from_image(args: &MosaicArgs, image: &std::path::Path) -> anyhow::Resul
 }
 
 pub fn status(args: &MosaicArgs) -> anyhow::Result<()> {
-    match crate::runtime::installed_version(&args.work) {
-        Some(version) => {
-            let dir = crate::runtime::version_dir(&args.work, &version);
+    match crate::runtime::resolve(&args.work) {
+        Some((dir, version)) => {
+            let scope = if std::path::Path::new(&dir)
+                .starts_with(crate::runtime::runtime_dir(&args.work))
+            {
+                "this user's"
+            } else {
+                "the machine's"
+            };
             println!(
-                "Runtime bundle {} ({}) at {}",
+                "Runtime bundle {} ({}, {}) at {}",
                 version,
                 crate::runtime::host_arch(),
+                scope,
                 dir
             );
         }
         None => {
-            println!("No runtime bundle installed. Run 'mosaic runtime fetch' to download one.")
+            println!(
+                "No runtime bundle installed. Run 'mosaic runtime install' to build one \n\
+                 from this machine's system image."
+            )
         }
     }
     Ok(())
@@ -195,7 +205,7 @@ mod tests {
         let err = verify(&args_for(dir.path().to_str().unwrap()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("mosaic runtime fetch"), "got: {}", err);
+        assert!(err.contains("runtime install"), "got: {}", err);
     }
 
     #[test]

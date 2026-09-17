@@ -25,20 +25,70 @@ pub fn runtime_dir(work: &str) -> String {
     format!("{}/runtime", work)
 }
 
+/// Where a runtime installed for the whole machine lives.
+///
+/// The bundle is read-only and identical for every user of a machine, so one copy
+/// belongs to all of them rather than one 1.5 GB copy each. An administrator puts
+/// it here with `sudo mosaic runtime install` -- root's own work directory is this
+/// one -- and every user's launch finds it.
+pub fn shared_runtime_dir() -> String {
+    std::env::var("MOSAIC_SHARED_RUNTIME").unwrap_or_else(|_| "/var/lib/mosaic/runtime".to_string())
+}
+
+/// Every place a bundle may be, nearest first: this user's, then the machine's.
+pub fn runtime_dirs(work: &str) -> Vec<String> {
+    runtime_dirs_in(work, &shared_runtime_dir())
+}
+
+pub fn runtime_dirs_in(work: &str, shared: &str) -> Vec<String> {
+    let mine = runtime_dir(work);
+    if mine == shared {
+        vec![mine]
+    } else {
+        vec![mine, shared.to_string()]
+    }
+}
+
+/// The bundle to run from, and which version it is: this user's if they have one,
+/// otherwise the machine's.
+pub fn resolve(work: &str) -> Option<(String, String)> {
+    resolve_in(work, &shared_runtime_dir())
+}
+
+/// The same, with the machine-wide directory given rather than read from the
+/// environment, so that the decision can be tested without one.
+pub fn resolve_in(work: &str, shared: &str) -> Option<(String, String)> {
+    for dir in runtime_dirs_in(work, shared) {
+        // `continue`, not `?`: a user with no bundle of their own is the ordinary
+        // case, and returning early there would hide the machine's completely.
+        let version = match std::fs::read_to_string(format!("{}/version", dir)) {
+            Ok(version) => version.trim().to_string(),
+            Err(_) => continue,
+        };
+        if version.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}-{}", dir, version, host_arch());
+        if Path::new(&candidate).is_dir() {
+            return Some((candidate, version));
+        }
+    }
+    None
+}
+
 pub fn version_dir(work: &str, version: &str) -> String {
     format!("{}/{}-{}", runtime_dir(work), version, host_arch())
 }
 
-/// The version currently extracted, if any.
+/// The version currently installed, if any.
 pub fn installed_version(work: &str) -> Option<String> {
-    let dir = runtime_dir(work);
-    let marker = format!("{}/version", dir);
-    let version = std::fs::read_to_string(marker).ok()?.trim().to_string();
-    if version.is_empty() || !Path::new(&version_dir(work, &version)).is_dir() {
-        None
-    } else {
-        Some(version)
-    }
+    resolve(work).map(|(_, version)| version)
+}
+
+/// Where the bundle in use actually is, which is not always under this user's work
+/// directory: a machine-wide one is found too.
+pub fn installed_dir(work: &str) -> Option<String> {
+    resolve(work).map(|(dir, _)| dir)
 }
 
 /// Point the work directory at a bundle that already exists on disk.
@@ -73,20 +123,29 @@ pub fn use_local(work: &str, directory: &str, version: &str) -> anyhow::Result<S
 /// Directory to run from: the extracted bundle, or an error explaining how to
 /// get one.
 pub fn require(args: &MosaicArgs) -> anyhow::Result<String> {
-    match installed_version(&args.work) {
-        Some(version) => Ok(version_dir(&args.work, &version)),
+    require_in(&args.work, &shared_runtime_dir())
+}
+
+/// The same, with the machine-wide directory given rather than read from the
+/// environment.
+pub fn require_in(work: &str, shared: &str) -> anyhow::Result<String> {
+    match resolve_in(work, shared) {
+        // The path that was found, not the path this user's work directory would
+        // have held: a machine-wide bundle is somewhere else, and handing back the
+        // user's own path would name a directory that does not exist.
+        Some((dir, _)) => Ok(dir),
         None => {
             // Say which of the two things is wrong. A link that exists but points
             // somewhere this process cannot see looks exactly like nothing being
             // installed, and that is not a rare case: the broker runs with
             // PrivateTmp=yes, so a bundle left in /tmp is invisible to it while
             // being perfectly visible to whoever built it.
-            let dir = runtime_dir(&args.work);
+            let dir = runtime_dir(work);
             let marker = format!("{}/version", dir);
             let hint = match std::fs::read_to_string(&marker) {
                 Ok(version) => {
                     let version = version.trim();
-                    let link = version_dir(&args.work, version);
+                    let link = version_dir(work, version);
                     format!(
                         " {} records version {} and {} does not resolve to a directory -- \
                          if it points into /tmp, this process cannot see it (the broker runs \
@@ -95,8 +154,9 @@ pub fn require(args: &MosaicArgs) -> anyhow::Result<String> {
                     )
                 }
                 Err(_) => format!(
-                    " Run 'mosaic runtime fetch', or point it at a bundle you built: \
-                     mosaic runtime use <bundle directory>"
+                    " Run 'mosaic runtime install', which builds one from this machine's \
+                     system image, or ask an administrator to install the machine-wide one: \
+                     sudo mosaic runtime install"
                 ),
             };
             anyhow::bail!("no runtime bundle installed.{}", hint)
@@ -243,6 +303,46 @@ fn write_marker(work: &str, version: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// A machine-wide bundle is found by a user who has none of their own, and the
+    /// path handed to the launcher is the machine's, not a directory that does not
+    /// exist under their work directory.
+    #[test]
+    fn a_machine_wide_bundle_is_found_too() {
+        let shared = tempfile::tempdir().unwrap();
+        let version_dir = shared.path().join(format!("shared-{}", host_arch()));
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("run.sh"), b"#!/bin/bash\n").unwrap();
+        std::fs::write(version_dir.join("bootclasspath.txt"), b"").unwrap();
+        std::fs::write(shared.path().join("version"), b"shared\n").unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path().to_str().unwrap();
+        assert_eq!(installed_version(work), None, "nothing of the user's own");
+
+        let shared_dir = shared.path().to_str().unwrap();
+        assert_eq!(
+            resolve_in(work, shared_dir).map(|(_, v)| v),
+            Some("shared".to_string())
+        );
+        assert_eq!(
+            resolve_in(work, shared_dir).map(|(d, _)| d),
+            Some(version_dir.to_string_lossy().to_string())
+        );
+
+        // This user's own bundle takes precedence over the machine's.
+        let mine = tempfile::tempdir().unwrap();
+        std::fs::write(mine.path().join("run.sh"), b"#!/bin/bash\n").unwrap();
+        std::fs::write(mine.path().join("bootclasspath.txt"), b"").unwrap();
+        use_local(work, mine.path().to_str().unwrap(), "mine").unwrap();
+        assert_eq!(installed_version(work), Some("mine".to_string()));
+
+        // And a user with their own bundle keeps it, machine-wide or not.
+        assert_eq!(
+            resolve_in(work, shared_dir).map(|(_, v)| v),
+            Some("mine".to_string())
+        );
+    }
+
     /// A bundle built here is a bundle: `use_local` links it and records the
     /// version, and `require` then finds it.
     #[test]
@@ -286,6 +386,6 @@ mod tests {
         .unwrap();
         let args = crate::args::MosaicArgs::from_cli(cli);
         let err = require(&args).unwrap_err().to_string();
-        assert!(err.contains("mosaic runtime fetch"), "got: {}", err);
+        assert!(err.contains("runtime install"), "got: {}", err);
     }
 }
