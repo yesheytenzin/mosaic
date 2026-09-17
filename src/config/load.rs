@@ -14,6 +14,20 @@ impl MosaicConfig {
         self.mosaic.get(key)
     }
 
+    /// Where a published bundle is fetched from: the environment, then the config
+    /// file, then the project's own releases.
+    pub fn bundle_channel(&self) -> String {
+        if let Ok(channel) = std::env::var("MOSAIC_BUNDLE_CHANNEL") {
+            if !channel.is_empty() {
+                return channel;
+            }
+        }
+        self.mosaic
+            .get("bundle_channel")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string())
+    }
+
     pub fn bundle_version(&self) -> String {
         // Overridable like the channel, for the same reason: a bundle packed on one
         // machine has the version it was installed under, and the machine fetching it
@@ -26,7 +40,7 @@ impl MosaicConfig {
         self.mosaic
             .get("bundle_version")
             .cloned()
-            .unwrap_or_else(|| "0".to_string())
+            .unwrap_or_else(|| "local".to_string())
     }
 
     pub fn uid_range(&self) -> (u32, u32) {
@@ -91,6 +105,7 @@ pub fn load(config_path: &str) -> MosaicConfig {
     for key in CONFIG_KEYS {
         if !mosaic.contains_key(*key) {
             let value = match *key {
+                "bundle_channel" => defaults.bundle_channel.clone(),
                 "bundle_version" => defaults.bundle_version.clone(),
                 "uid_range_start" => defaults.uid_range_start.to_string(),
                 "uid_range_end" => defaults.uid_range_end.to_string(),
@@ -122,7 +137,7 @@ mod tests {
     #[test]
     fn load_missing_file_returns_defaults() {
         let cfg = load("/nonexistent/path/mosaic.cfg");
-        assert_eq!(cfg.bundle_version(), "0");
+        assert_eq!(cfg.bundle_version(), "local");
         assert_eq!(cfg.uid_range(), (5000, 5999));
     }
 

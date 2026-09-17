@@ -650,13 +650,22 @@ do_properties() { # <image> <bundle>
 #
 # Compression is xz because that is what the fetch side decodes; the level is 1 so
 # that packing a few hundred megabytes takes a minute rather than ten.
-do_pack() { # <bundle> [outdir]
-  local bundle="$1" out="${2:-$PWD}"
+do_pack() { # [--version V] <bundle> [outdir]
+  local version_arg="" out="${PWD}" bundle=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) version_arg="${2:?--version needs a value}"; shift ;;
+      *) if [ -z "$bundle" ]; then bundle="$1"; else out="$1"; fi ;;
+    esac
+    shift
+  done
+  [ -n "$bundle" ] || { echo "usage: bundle.sh pack [--version V] <bundle> [outdir]" >&2; return 2; }
   [ -d "$bundle" ] || { echo "no such bundle: $bundle" >&2; return 2; }
   [ -f "$bundle/run.sh" ] || { echo "$bundle does not look like a bundle" >&2; return 2; }
 
   local version="local" arch
   [ -f "$bundle/version" ] && version=$(tr -d '\n' < "$bundle/version")
+  [ -n "$version_arg" ] && version="$version_arg"
   arch=$(uname -m)
   case "$arch" in
     aarch64|arm64) arch=aarch64 ;;

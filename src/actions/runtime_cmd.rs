@@ -6,7 +6,6 @@ use crate::args::{MosaicArgs, RuntimeSubaction};
 
 /// Where a Mosaic build keeps the system image it was built from.
 const DEFAULT_IMAGE: &str = "/var/lib/mosaic/images/system.img";
-use crate::config::Defaults;
 
 pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow::Result<()> {
     match subaction {
@@ -20,18 +19,18 @@ pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow
 }
 
 pub async fn fetch(args: &MosaicArgs) -> anyhow::Result<()> {
-    let defaults = Defaults::new();
     let config = crate::config::load(&args.config);
     let version = config.bundle_version();
-    let dir = crate::runtime::fetch(args, &defaults.bundle_channel, &version)
+    let dir = crate::runtime::fetch(args, &config.bundle_channel(), &version)
         .await
         .map_err(|e| {
             // The published bundle is per release and may not exist for the version
             // this build asks for. Saying only "404" leaves a person with a bundle
             // they built themselves and no idea it can be used.
             anyhow::anyhow!(
-                "{}. If you built a bundle yourself, use it instead: \
-                 mosaic runtime use <bundle directory>",
+                "{}. Either build one from a system image -- mosaic runtime install \
+                 <image> -- or install a bundle from wherever it is published: \
+                 mosaic runtime install <url>",
                 e
             )
         })?;

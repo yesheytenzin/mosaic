@@ -16,7 +16,12 @@ pub use load::load;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Keys persisted in the config file.
-pub const CONFIG_KEYS: &[&str] = &["bundle_version", "uid_range_start", "uid_range_end"];
+pub const CONFIG_KEYS: &[&str] = &[
+    "bundle_channel",
+    "bundle_version",
+    "uid_range_start",
+    "uid_range_end",
+];
 
 #[derive(Debug, Clone)]
 pub struct Defaults {
@@ -84,9 +89,16 @@ impl Defaults {
             // Overridable, because the published artifact is per release and may be
             // hosted anywhere -- a release, a mirror, or a directory on a local
             // network while an image is being moved between machines.
-            bundle_channel: std::env::var("MOSAIC_BUNDLE_CHANNEL")
-                .unwrap_or_else(|_| "https://ota.waydro.id/mosaic".to_string()),
-            bundle_version: "0".to_string(),
+            // Where a published bundle is fetched from. The project's own releases by
+            // default: publishing one is `tools/publish-runtime.sh`, and until somebody
+            // does, `runtime fetch` says so rather than fetching from a host that was
+            // never going to have it.
+            bundle_channel: std::env::var("MOSAIC_BUNDLE_CHANNEL").unwrap_or_else(|_| {
+                "https://github.com/yesheytenzin/mosaic/releases/latest/download".to_string()
+            }),
+            // What `pack` names the archive after, from the bundle's own version
+            // marker. Overridable, because a release may be tagged differently.
+            bundle_version: "local".to_string(),
             uid_range_start: 5000,
             uid_range_end: 5999,
             work,
