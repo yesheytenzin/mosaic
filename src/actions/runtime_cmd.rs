@@ -9,6 +9,7 @@ pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow
     match subaction {
         RuntimeSubaction::Fetch => fetch(args).await,
         RuntimeSubaction::Status => status(args),
+        RuntimeSubaction::Use { directory, version } => use_local(args, directory, version),
         RuntimeSubaction::Verify => verify(args),
     }
 }
@@ -17,8 +18,35 @@ pub async fn fetch(args: &MosaicArgs) -> anyhow::Result<()> {
     let defaults = Defaults::new();
     let config = crate::config::load(&args.config);
     let version = config.bundle_version();
-    let dir = crate::runtime::fetch(args, &defaults.bundle_channel, &version).await?;
+    let dir = crate::runtime::fetch(args, &defaults.bundle_channel, &version)
+        .await
+        .map_err(|e| {
+            // The published bundle is per release and may not exist for the version
+            // this build asks for. Saying only "404" leaves a person with a bundle
+            // they built themselves and no idea it can be used.
+            anyhow::anyhow!(
+                "{}. If you built a bundle yourself, use it instead: \
+                 mosaic runtime use <bundle directory>",
+                e
+            )
+        })?;
     println!("Runtime bundle {} installed at {}", version, dir);
+    Ok(())
+}
+
+/// Point Mosaic at a bundle that was built here rather than downloaded.
+///
+/// The download path exists so that a fresh machine can get a runtime without a
+/// system image and a build (ADR-0010). This is the other half of that: a bundle
+/// built by `tools/bundle/bundle.sh build` is a bundle, and there is no reason to
+/// make anyone fetch one to use it.
+pub fn use_local(args: &MosaicArgs, directory: &str, version: &str) -> anyhow::Result<()> {
+    let dir = std::fs::canonicalize(directory)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", directory, e))?;
+    let dir = dir.to_string_lossy().to_string();
+    let link = crate::runtime::use_local(&args.work, &dir, version)?;
+    println!("Runtime bundle {} at {}", version, dir);
+    println!("  linked as {}", link);
     Ok(())
 }
 
