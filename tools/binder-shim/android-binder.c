@@ -806,10 +806,42 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
         say_once();
     }
 
-    /* The cookie, which is the field Parcel::unflattenBinder reads for a local
-     * object, and which the reply path needs as an IBinder. Handed back again now
-     * that the sp layout below is the variable under test rather than this. */
-    if (fields[1]) return (void *)fields[1];
+    /* The field beside the cookie, which is the IBinder -- measured, not assumed.
+     *
+     * With the pointer in the *second* word of the sp the framework got a null
+     * binder ("No service published for: power") because that makes m_ptr null and
+     * flatten_binder writes an empty object; with it in the first word and the
+     * cookie as the object it got something it could not call. This field, with the
+     * pointer first, is the combination that delivers: "No service published for:
+     * power" and "Manager wrapper not available" both go to zero.
+     *
+     * A userspace pointer is what it has to look like, because the object's shape
+     * is not the same in every request -- one of them yields 0x100000000, which
+     * libbinder reads as a vtable address and dies on. A value outside the
+     * process's address space is not an object, and answering "not found" for it is
+     * better than handing it over. */
+    /* A null binder is a binder object with a zero pointer, and reading eight bytes
+     * at offset 8 then glues that zero to whatever field follows -- 0x100000000,
+     * which libbinder takes for a vtable. The low half being zero is the tell. */
+    if (u32_at(object + 8) == 0) return 0;
+
+    unsigned long type = u32_at(object);
+    if (type == BINDER_TYPE_HANDLE) {
+        /* A handle, not an object: the field at 8 is a 32-bit index into the
+         * *sender's* handle table, and reading eight bytes there gives
+         * {handle, cookie-low} -- which is where 0x100000000 came from, a value
+         * libbinder then treats as a vtable and dies on. There is nothing to hand
+         * back for one of these: a proxy would need a handle in *this* process's
+         * table, and the broker is the thing that allocates those. */
+        static int said = 0;
+        if (said < 3) {
+            said++;
+            say("android-binder:   object is a handle, not a local binder; not handing it back\n");
+            say_once();
+        }
+        return 0;
+    }
+    if (fields[0] >= 0x10000 && fields[0] < 0x800000000000UL) return (void *)fields[0];
     return 0;
 }
 
@@ -1314,13 +1346,9 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             }
             say("\n");
             say_once();
-            /* An sp<IBinder> could be one pointer or two, depending on the
-             * library version, and every Java registration crashes when this side
-             * builds it by hand. Try the other layout: the pointer in the second
-             * word. If the crash goes and the service is still found, this was the
-             * bug; if it goes and the service is null, the first layout was right
-             * and the object is the problem after all. */
-            unsigned long value[2] = {0, (unsigned long)object};
+            /* The pointer in the first word: the layout that hands libbinder an
+             * object rather than a null. */
+            unsigned long value[2] = {(unsigned long)object, 0};
             parcel_write_binder(reply, value);
         }
         return 1;
