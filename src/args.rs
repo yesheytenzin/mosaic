@@ -106,8 +106,8 @@ pub enum RuntimeSubaction {
     Verify,
     /// Install a runtime bundle: a directory one, or a system image to build from
     Install {
-        /// A bundle directory (as bundle.sh build produces), or a system image.
-        /// Omit it to use the system image this machine has at the usual place.
+        /// A bundle directory, a bundle archive, a system image -- local or an
+        /// http(s) URL. Omit it to use the system image this machine has.
         path: Option<String>,
         /// Version to record it under
         #[arg(long, default_value = "local")]

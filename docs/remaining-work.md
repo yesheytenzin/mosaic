@@ -163,9 +163,20 @@ Three ways, and the first is the one to prefer because it costs nothing per pers
    checkout, which meant a user with an installed Mosaic could not build one at all.
    It needs `debugfs`, `python3`, `clang`, `tar` and `xz`; when one is missing the
    builder says so.
-3. **A published bundle.** `MOSAIC_BUNDLE_CHANNEL=<where it is served>
-   MOSAIC_BUNDLE_VERSION=<version> mosaic runtime fetch` needs no image and no build
-   tools, which is the right shape for an end user -- once somebody publishes one.
+3. **A published bundle, by URL.** `mosaic runtime install <url>` fetches an archive or
+   an image, verifies the sha256 published beside it, and either unpacks it or builds
+   from it. Nothing local is needed: no checkout, no image, no build tools for an
+   archive. The same artifact also works as
+   `MOSAIC_BUNDLE_CHANNEL=<where it is served> MOSAIC_BUNDLE_VERSION=<version>
+   mosaic runtime fetch`, which is what a published release would use.
+
+   ```
+   mosaic runtime install https://example.org/mosaic/runtime-local-x86_64.tar.xz
+     -> the archive unpacked, hash verified, and run.sh starts ART from it
+   ```
+
+   `bundle.sh pack` produces exactly those two files, so hosting one is a `cp` to
+   wherever they are served from.
 
 When none of the three is available the error names all three, rather than leaving
 someone to guess.
