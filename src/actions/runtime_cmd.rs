@@ -73,32 +73,49 @@ pub fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> anyhow::
     Ok(())
 }
 
+/// Where the bundle builder is, if this machine has one.
+///
+/// Three places, in order: what the environment says, where the package puts it, and
+/// where a source checkout keeps it. The package one is why this exists at all --
+/// without it a user whose machine has an installed Mosaic cannot build a runtime,
+/// and has to wait for the administrator's machine-wide one or a published artifact.
+fn bundle_script() -> Option<String> {
+    let candidates = [
+        std::env::var("MOSAIC_BUNDLE_SCRIPT").ok(),
+        Some("/usr/lib/mosaic/bundle.sh".to_string()),
+        // A checkout, relative to this binary: target/<profile>/mosaic is three
+        // levels below the root that holds tools/.
+        std::env::current_exe().ok().and_then(|exe| {
+            let root = exe.parent()?.parent()?.parent()?;
+            Some(
+                root.join("tools/bundle/bundle.sh")
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        }),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| std::path::Path::new(path).exists())
+}
+
 /// Build a bundle from a system image, by running the builder this repository
 /// ships. Refuses with the reason when there is no builder to run.
 fn build_from_image(args: &MosaicArgs, image: &std::path::Path) -> anyhow::Result<String> {
-    let script = std::env::var("MOSAIC_BUNDLE_SCRIPT")
-        .ok()
-        .filter(|s| std::path::Path::new(s).exists())
-        .or_else(|| {
-            // Where a checkout keeps it, relative to this binary:
-            // target/<profile>/mosaic -> ../../tools/bundle/bundle.sh
-            let exe = std::env::current_exe().ok()?;
-            let root = exe.parent()?.parent()?.parent()?;
-            let candidate = root.join("tools/bundle/bundle.sh");
-            candidate
-                .exists()
-                .then(|| candidate.to_string_lossy().to_string())
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} is an image, not a bundle, and building from one needs \
-                 tools/bundle/bundle.sh -- which a checkout has and an installed \
-                 package does not. Build it yourself:\n    bundle.sh build {} <directory>\n\
-                 then:\n    mosaic runtime install <directory>",
-                image.display(),
-                image.display()
-            )
-        })?;
+    let script = bundle_script().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is a system image, so it has to be built into a bundle, and the builder \
+             is not here. Either:\n\
+             \x20 ask an administrator to install the machine-wide runtime once --\n\
+             \x20     sudo mosaic runtime install\n\
+             \x20 fetch a published bundle --\n\
+             \x20     MOSAIC_BUNDLE_CHANNEL=<where it is served> mosaic runtime fetch\n\
+             \x20 or install the package's builder, which a checkout has at {}",
+            image.display(),
+            "tools/bundle/bundle.sh"
+        )
+    })?;
 
     let runtime = crate::runtime::runtime_dir(&args.work);
     std::fs::create_dir_all(&runtime)?;
@@ -191,6 +208,27 @@ pub fn verify(args: &MosaicArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The builder is looked for in three places, and the package's is the one that
+    /// matters for a user whose machine has an installed Mosaic: without it nobody
+    /// without a checkout can build a runtime.
+    #[test]
+    fn the_bundle_builder_is_found_where_it_is_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bundle.sh");
+        std::fs::write(&script, b"#!/bin/bash\n").unwrap();
+        std::env::set_var("MOSAIC_BUNDLE_SCRIPT", &script);
+        assert_eq!(bundle_script(), Some(script.to_string_lossy().to_string()));
+
+        // One that does not exist is skipped rather than used, which is how the
+        // package's copy gets its turn.
+        std::env::set_var("MOSAIC_BUNDLE_SCRIPT", dir.path().join("absent.sh"));
+        assert_ne!(
+            bundle_script(),
+            Some(dir.path().join("absent.sh").to_string_lossy().to_string())
+        );
+        std::env::remove_var("MOSAIC_BUNDLE_SCRIPT");
+    }
     use clap::Parser;
 
     fn args_for(work: &str) -> MosaicArgs {
