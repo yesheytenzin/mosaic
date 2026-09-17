@@ -140,7 +140,7 @@ broker's working directory rather than the user's, which is why
 `mosaic install app.apk` in the directory holding it reported "No such file or
 directory"; the caller resolves it now.
 
-The runtime bundle has a second way in: `mosaic runtime use <directory>` links a
+The runtime bundle has a second way in: `mosaic runtime install <directory>` links a
 bundle built by `tools/bundle/bundle.sh build` and records its version, so a bundle
 built here does not have to be published anywhere to be used. One trap worth
 knowing: the broker runs with `PrivateTmp=yes`, so a bundle left in `/tmp` is

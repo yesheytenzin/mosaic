@@ -3,13 +3,16 @@
 //! `mosaic runtime` — manage the host-native ART and Bionic bundle (ADR-0010).
 
 use crate::args::{MosaicArgs, RuntimeSubaction};
+
+/// Where a Mosaic build keeps the system image it was built from.
+const DEFAULT_IMAGE: &str = "/var/lib/mosaic/images/system.img";
 use crate::config::Defaults;
 
 pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow::Result<()> {
     match subaction {
         RuntimeSubaction::Fetch => fetch(args).await,
         RuntimeSubaction::Status => status(args),
-        RuntimeSubaction::Use { directory, version } => use_local(args, directory, version),
+        RuntimeSubaction::Install { path, version } => install(args, path.as_deref(), version),
         RuntimeSubaction::Verify => verify(args),
     }
 }
@@ -34,20 +37,82 @@ pub async fn fetch(args: &MosaicArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Point Mosaic at a bundle that was built here rather than downloaded.
+/// Install a runtime bundle, from whatever was pointed at.
 ///
-/// The download path exists so that a fresh machine can get a runtime without a
-/// system image and a build (ADR-0010). This is the other half of that: a bundle
-/// built by `tools/bundle/bundle.sh build` is a bundle, and there is no reason to
-/// make anyone fetch one to use it.
-pub fn use_local(args: &MosaicArgs, directory: &str, version: &str) -> anyhow::Result<()> {
-    let dir = std::fs::canonicalize(directory)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {}", directory, e))?;
-    let dir = dir.to_string_lossy().to_string();
-    let link = crate::runtime::use_local(&args.work, &dir, version)?;
-    println!("Runtime bundle {} at {}", version, dir);
-    println!("  linked as {}", link);
+/// A bundle directory is linked as it is. A system image is built into a bundle
+/// first, which is what a machine with an image and no published bundle needs --
+/// and that needs the builder, which lives in a checkout rather than in the package.
+pub fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> anyhow::Result<()> {
+    let path = match path {
+        Some(path) => path.to_string(),
+        None => {
+            // The image a Mosaic build leaves behind, so that the common case is
+            // one word: `mosaic runtime install`.
+            let image = std::env::var("MOSAIC_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
+            anyhow::ensure!(
+                std::path::Path::new(&image).exists(),
+                "no system image at {}. Pass one: mosaic runtime install <bundle directory | image>",
+                image
+            );
+            image
+        }
+    };
+    let source =
+        std::fs::canonicalize(&path).map_err(|e| anyhow::anyhow!("cannot read {}: {}", path, e))?;
+
+    let directory = if source.is_dir() {
+        source.to_string_lossy().to_string()
+    } else {
+        build_from_image(args, &source)?
+    };
+
+    let link = crate::runtime::use_local(&args.work, &directory, version)?;
+    println!("Runtime bundle {} installed", version);
+    println!("  from    {}", directory);
+    println!("  linked  {}", link);
     Ok(())
+}
+
+/// Build a bundle from a system image, by running the builder this repository
+/// ships. Refuses with the reason when there is no builder to run.
+fn build_from_image(args: &MosaicArgs, image: &std::path::Path) -> anyhow::Result<String> {
+    let script = std::env::var("MOSAIC_BUNDLE_SCRIPT")
+        .ok()
+        .filter(|s| std::path::Path::new(s).exists())
+        .or_else(|| {
+            // Where a checkout keeps it, relative to this binary:
+            // target/<profile>/mosaic -> ../../tools/bundle/bundle.sh
+            let exe = std::env::current_exe().ok()?;
+            let root = exe.parent()?.parent()?.parent()?;
+            let candidate = root.join("tools/bundle/bundle.sh");
+            candidate
+                .exists()
+                .then(|| candidate.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is an image, not a bundle, and building from one needs \
+                 tools/bundle/bundle.sh -- which a checkout has and an installed \
+                 package does not. Build it yourself:\n    bundle.sh build {} <directory>\n\
+                 then:\n    mosaic runtime install <directory>",
+                image.display(),
+                image.display()
+            )
+        })?;
+
+    let runtime = crate::runtime::runtime_dir(&args.work);
+    std::fs::create_dir_all(&runtime)?;
+    let out = format!("{}/bundle", runtime);
+    log::info!("Building a runtime bundle from {}", image.display());
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("build")
+        .arg(image)
+        .arg(&out)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run {}: {}", script, e))?;
+    anyhow::ensure!(status.success(), "{} build failed", script);
+    Ok(out)
 }
 
 pub fn status(args: &MosaicArgs) -> anyhow::Result<()> {
