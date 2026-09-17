@@ -160,9 +160,11 @@ async fn dispatch(args: &MosaicArgs, request: Request) -> Response {
         Request::Query { package } => {
             let registry = Registry::load(&args.work);
             match package {
-                Some(name) => match registry.get(&name) {
-                    Some(p) => Response::Apps(vec![p.clone()]),
-                    None => Response::Apps(Vec::new()),
+                Some(name) => match registry.resolve(&name) {
+                    Ok(p) => Response::Apps(vec![p.clone()]),
+                    // A query that matches nothing is an answer, not a failure: it
+                    // prints as an empty list rather than an error message.
+                    Err(_) => Response::Apps(Vec::new()),
                 },
                 None => Response::Apps(registry.list()),
             }
@@ -249,9 +251,10 @@ fn commit(args: &MosaicArgs, package: Package) -> anyhow::Result<Package> {
 /// directory needs root, which the broker does not have; the caller does that.
 fn uninstall(args: &MosaicArgs, name: &str) -> anyhow::Result<Package> {
     let mut registry = Registry::load(&args.work);
+    let resolved = registry.resolve(name)?.name.clone();
     let package = registry
-        .remove(name)
-        .ok_or_else(|| anyhow::anyhow!("{} is not installed", name))?;
+        .remove(&resolved)
+        .ok_or_else(|| anyhow::anyhow!("{} is not installed", resolved))?;
     registry.save(&args.work)?;
     log::info!("Uninstalled {}", name);
     Ok(package)
@@ -259,24 +262,9 @@ fn uninstall(args: &MosaicArgs, name: &str) -> anyhow::Result<Package> {
 
 async fn launch(args: &MosaicArgs, name: &str, extra: Vec<String>) -> anyhow::Result<()> {
     let registry = Registry::load(&args.work);
-    let package = registry.get(name).ok_or_else(|| {
-        // Say what is installed: the name of an installed package is derived from
-        // its file, so "not installed" on its own leaves nothing to try next.
-        let installed = registry.list();
-        if installed.is_empty() {
-            anyhow::anyhow!("{} is not installed, and nothing is", name)
-        } else {
-            anyhow::anyhow!(
-                "{} is not installed. Installed: {}",
-                name,
-                installed
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-    })?;
+    // A selector, not necessarily the exact name: the name is derived from the file
+    // and nobody wants to type it.
+    let package = registry.resolve(name)?;
     let _runtime = crate::runtime::require(args)?;
 
     crate::binder::launch_app(args, package, &extra)
