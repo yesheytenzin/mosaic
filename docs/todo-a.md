@@ -115,6 +115,15 @@ that answers, and much better than one that takes the process down, so the searc
 reports what it finds (`a type word at N with cookie 0x...`) and hands nothing back.
 The shim is in that state, with no crash.
 
+Then both pointer fields were tried as the IBinder -- the cookie first, and then the
+field beside it, with libbinder's reader taken out of the way so that its own
+`finishUnflattenBinder` could not be the crash. Both take the process down inside
+`flattenBinder`, at the call through the object's vtable, from this process's own
+`writeStrongBinder`. So **neither field is an IBinder**, and the object at both
+candidate positions is not the service being registered, despite a type word, flags
+and two heap pointers that all look right. That is the thing to explain, and it is
+not a question of which field to read.
+
 Next, in order:
 
 1. work out why the cookie at the position where the type word sits is not callable
