@@ -26,7 +26,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%t/mosaic
+# The registry lives in the user's data directory, because the broker is a user
+# service and the app data directories it plans for are created by root separately
+# (ADR-0008). ProtectHome makes the home read-only, so this path has to be named
+# explicitly, and it is the one the work directory falls back to.
+ReadWritePaths=%t/mosaic %h/.local/share/mosaic
 
 [Install]
 WantedBy=default.target
