@@ -38,10 +38,17 @@ check:
 # needs, which only the user manager can grant, and the tmpfiles entry for the
 # paths Bionic hardcodes.
 install:
-	@# Always build: cargo is incremental, so this is cheap, and installing a
-	@# binary that happens to already be there is how a fix that is in the tree
-	@# gets tested against an install that does not have it.
-	cargo build --release
+	@# Never build here. `install` runs under sudo, and a root cargo build uses
+	@# root's CARGO_HOME: it re-downloads the registry, recompiles from scratch,
+	@# writes root-owned files into the user's target/ -- which stops that user
+	@# building afterwards -- and in this project's case made rustc panic outright.
+	@# Build as yourself, then install: cargo build --release && sudo make install
+	@test -f target/release/mosaic || { \
+		echo "target/release/mosaic is missing or stale. As yourself, first:"; \
+		echo "    cargo build --release"; \
+		echo "then: sudo make install"; \
+		exit 1; \
+	}
 	install -d $(INSTALL_BIN_DIR)
 	install -d $(INSTALL_APPS_DIR)
 	install -d $(INSTALL_APPS_DIRECTORY_DIR)
