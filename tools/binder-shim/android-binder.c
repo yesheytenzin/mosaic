@@ -719,6 +719,51 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
      * reader still cannot call, at vtable offset 0x60. A service that answers
      * "not found" is worse than one that answers, and much better than one that
      * takes the process down. So the search reports and returns nothing. */
+    /* Every type word in the request, with both of its pointers, before choosing
+     * any of them. The first match has a type word, binder flags and two heap
+     * pointers, and is not the service, so the question is whether there is another
+     * one -- and where. */
+    {
+        static int listed = 0;
+        if (listed < 2) {
+            listed++;
+            say("android-binder: type words in this request:");
+            const unsigned char *end = data + size;
+            for (const unsigned char *p = data; p + 24 <= end; p += 4) {
+                uint32 type = u32_at(p);
+                if (type != BINDER_TYPE_BINDER && type != BINDER_TYPE_HANDLE) continue;
+                unsigned long a = 0, b = 0;
+                for (int i = 0; i < 8; i++) a |= ((unsigned long)p[8 + i]) << (8 * i);
+                for (int i = 0; i < 8; i++) b |= ((unsigned long)p[16 + i]) << (8 * i);
+                say(" [");
+                say_dec((long)(p - data));
+                say(" type=");
+                say_dec((long)type);
+                say(" flags=");
+                say_dec((long)u32_at(p + 4));
+                say(" +8=0x");
+                for (int shift = 60; shift >= 0; shift -= 4) {
+                    static const char hex[] = "0123456789abcdef";
+                    char digit[2];
+                    digit[0] = hex[(a >> shift) & 0xf];
+                    digit[1] = 0;
+                    say(digit);
+                }
+                say(" +16=0x");
+                for (int shift = 60; shift >= 0; shift -= 4) {
+                    static const char hex[] = "0123456789abcdef";
+                    char digit[2];
+                    digit[0] = hex[(b >> shift) & 0xf];
+                    digit[1] = 0;
+                    say(digit);
+                }
+                say("]");
+            }
+            say("\n");
+            say_once();
+        }
+    }
+
     const unsigned char *object = find_object(data, size, after_name);
     if (!object) return 0;
 
@@ -761,21 +806,10 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
         say_once();
     }
 
-    /* Nothing is handed back, and the reason is measured rather than guessed.
-     *
-     * Both pointer fields were tried as the IBinder -- the cookie first, then the
-     * field beside it -- and both take the process down inside flattenBinder, at
-     * the call through the object's own vtable. So neither is an IBinder, which
-     * means the object found at that position is not the service being registered,
-     * even though its type word and flags look exactly like one and both of its
-     * pointers point into the heap.
-     *
-     * Registering it anyway is what that would cost: all eight services land and
-     * the framework dies on the first lookup of one. A service that answers "not
-     * found" is worse than one that answers and much better than one that takes
-     * the process down, so nothing is handed back until the object's position is
-     * understood. What the search sees is logged below, which is the evidence for
-     * whoever picks this up. */
+    /* The cookie, which is the field Parcel::unflattenBinder reads for a local
+     * object, and which the reply path needs as an IBinder. Handed back again now
+     * that the sp layout below is the variable under test rather than this. */
+    if (fields[1]) return (void *)fields[1];
     return 0;
 }
 
@@ -1280,7 +1314,13 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             }
             say("\n");
             say_once();
-            unsigned long value[2] = {(unsigned long)object, 0};
+            /* An sp<IBinder> could be one pointer or two, depending on the
+             * library version, and every Java registration crashes when this side
+             * builds it by hand. Try the other layout: the pointer in the second
+             * word. If the crash goes and the service is still found, this was the
+             * bug; if it goes and the service is null, the first layout was right
+             * and the object is the problem after all. */
+            unsigned long value[2] = {0, (unsigned long)object};
             parcel_write_binder(reply, value);
         }
         return 1;
