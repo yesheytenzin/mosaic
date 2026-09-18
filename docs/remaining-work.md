@@ -108,16 +108,38 @@ difference between a SIGSEGV and an answer:
    is a SIGSEGV; answering "not found" is worse for the caller and much better
    than taking the process down.
 
-With those, there are no fatal signals at all, `StartActivityManager` is passed,
-and the boot stops somewhere else: `ActivityManagerService`'s constructor hangs
-inside `ProcessStatsService` -> `ProcessStats.<init>` ->
-`Debug.getDirtyPagesPid` -> memtrack -> `AServiceManager_checkService` (the NDK
-path) -> the shim's `service_manager` -> `Parcel::flattenBinder`, blocked on an
-ART `MemMapArenaPool` mutex. `flattenBinder` calls `IPCThreadState::self()`, and
-reaching it from inside a binder transaction on the NDK path is what deadlocks.
-The `svc`-style service the NDK path looks up is `memtrack.proxy`, which the shim
-does hand back; the question is how the NDK's `checkService` reply differs from
-the Java one's.
+3. **A remembered pointer that is not an IBinder is not handed back.** The NDK
+   door (`AServiceManager_addService`) is given `memtrack.proxy`, and the pointer
+   it hands over is not an `IBinder`: its vtable's `localBinder` slot is
+   `art::MemMapArenaPool::TrimMaps`. `flattenBinder` called that as
+   `localBinder()`, which is the "deadlock" it looked like from a thread dump --
+   it was a wrong function, not a lock. The hand-back now checks the object
+   before using it: the vtable entry at byte `0x60` has to resolve, through
+   `dladdr`, into `libbinder` or `libandroid_runtime`, which is where a real
+   local binder's `localBinder` lives. Anything else is answered absent.
+
+With those there are no fatal signals at all, `StartActivityManager` completes
+(194 ms), and the bootstrap services after it run: `StartDataLoaderManagerService`,
+`StartIncrementalService`, `StartPowerManager`, `StartThermalManager`,
+`StartHintManager`, `InitPowerManagement`. The boot now aborts on an NPE one
+layer past that:
+
+```
+No service published for: power
+java.lang.NullPointerException: newWakeLock on a null PowerManager
+    at ActivityTaskSupervisor.initPowerManagement(ActivityTaskSupervisor.java:512)
+```
+
+`power` is registered -- the shim logs `registered power`, and a later
+`checkService power found` hands it back -- but the `getServiceOrThrow` inside
+`InitPowerManagement` gets null for it, so the registration is not visible at
+the instant the main thread asks. The shim's `remember` and `lookup` share one
+lock and the framework's `addService` is synchronous, so the next thing to do is
+settle whether that is real ordering (the shim's output and the framework's
+logd output are two channels and their line order cannot be compared) or a
+registry bug. `service_manager`'s ADD_SERVICE path logged one
+"answered code 7 with an empty reply" just before `registered power`; which
+`IServiceManager` method code 7 is, in this build, is worth checking first.
 2. The broker client works up to the last layer, and is off by default. Verified
    against a running broker, with the framework in one process and
    `tools/two-process-call.py` in another:
