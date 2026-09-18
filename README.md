@@ -34,6 +34,22 @@ cargo test
 make build
 ```
 
+## Runtime
+
+Mosaic runs on an Android runtime bundle: the system image's ART, Bionic and
+framework jars, unmodified. A published one for x86_64 installs with one command,
+no image, no checkout and no build tools:
+
+```
+mosaic runtime fetch
+```
+
+`mosaic runtime install <image>` builds one from a system image instead, and
+`mosaic runtime install <url>` fetches one from anywhere -- a mirror, a release, a
+directory on a local network. [`docs/runtime-bundle.md`](docs/runtime-bundle.md)
+records what the bundle contains and
+[`docs/remaining-work.md`](docs/remaining-work.md) how it is published.
+
 ## Documentation
 
 Start with [`CONTEXT.md`](CONTEXT.md) for the vocabulary and
