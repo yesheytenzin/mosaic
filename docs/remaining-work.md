@@ -132,14 +132,33 @@ java.lang.NullPointerException: newWakeLock on a null PowerManager
 
 `power` is registered -- the shim logs `registered power`, and a later
 `checkService power found` hands it back -- but the `getServiceOrThrow` inside
-`InitPowerManagement` gets null for it, so the registration is not visible at
-the instant the main thread asks. The shim's `remember` and `lookup` share one
-lock and the framework's `addService` is synchronous, so the next thing to do is
-settle whether that is real ordering (the shim's output and the framework's
-logd output are two channels and their line order cannot be compared) or a
-registry bug. `service_manager`'s ADD_SERVICE path logged one
-"answered code 7 with an empty reply" just before `registered power`; which
-`IServiceManager` method code 7 is, in this build, is worth checking first.
+`InitPowerManagement` gets null for it.
+
+What the instrumentation ruled out, so the next person does not repeat it:
+
+- The failing lookup never reaches `service_manager`. With the
+  getService/checkService log made unconditional and a sequence number put on
+  every call, the first mention of `power` is `checkService ... power found`
+  (seq 44), after `registered power` (seq 41); there is no earlier
+  `... power not found`.
+- It is not the interface-token early return: logging that path showed no
+  failures at all.
+- It is not a full registry (`MAX_SERVICES` is 128, 14 used), and it is not the
+  IBinder check (`looks_like_ibinder` never rejected `power`; the one rejection
+  in a run is `memtrack.proxy`).
+- It cannot be the Java cache: AOSP-13 `ServiceManager.addService` does not put
+  the service in `sCache`, so `ServiceManager.getService` falls through to
+  `rawGetService` and the shim. `PowerManagerService.onStart` does publish
+  `power` synchronously (`publishBinderService` at PowerManagerService.java:1192),
+  before `SystemServer` calls `initPowerManagement`.
+
+So a `getService("power")` that returns null without a shim call contradicts the
+code as read, and the next probe is one level up: log every `handle_transaction`
+call (both doors) with its handle and code, to see whether the failing lookup
+arrives with a code that is not 1 or 2, or does not arrive at all. The three
+`answered code 7 with an empty reply` lines are the only unhandled
+`IServiceManager` calls seen; code 7 in AOSP-13 is `unregisterForNotifications`,
+which should not be in this path.
 2. The broker client works up to the last layer, and is off by default. Verified
    against a running broker, with the framework in one process and
    `tools/two-process-call.py` in another:
