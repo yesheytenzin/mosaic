@@ -153,10 +153,36 @@ What the instrumentation ruled out, so the next person does not repeat it:
   before `SystemServer` calls `initPowerManagement`.
 
 So a `getService("power")` that returns null without a shim call contradicts the
-code as read, and the next probe is one level up: log every `handle_transaction`
-call (both doors) with its handle and code, to see whether the failing lookup
-arrives with a code that is not 1 or 2, or does not arrive at all. The three
-`answered code 7 with an empty reply` lines are the only unhandled
+code as read.
+
+To settle it without the log pipeline, the shim can now write a trace of every
+registration and lookup straight to `/tmp/mosaic-sm-trace.log` with raw syscalls,
+independent of the line budget and of logd's timing. `MOSAIC_BINDER_TRACE=1`
+turns it on. It records every `service_manager` entry with its code and size and
+every `handle_transaction` entry with its code, so a lookup that never arrives is
+as visible as one that does. It shows, in real order:
+
+```
+smcode 2 ... miss activity          (direct ServiceManager calls, from the framework)
+smcode 2 ... miss waydroidhardware
+smcode 1 ... miss android.system.suspend.ISystemSuspend/default
+smcode 1599098439 0                 (the unexplained driver-door stream)
+smcode 7 ...
+smcode 3 ... add power
+smcode 3 ... add thermalservice
+smcode 3 ... add performance_hint
+smcode 2 ... found power
+```
+
+`add power` precedes `found power`, and no earlier `power` lookup exists on either
+door. The shim writes the object and `writeStrongBinder` returns 0 (logged), and
+`platform_compat`'s identical hand-back demonstrably works -- `ActivityManagerService`
+constructs, which reads it. So the failing `getSystemService("power")` in
+`ActivityTaskSupervisor.initPowerManagement` is answered from framework-side state
+before any transact; the next probe is `SystemServiceRegistry`'s cached fetcher for
+`PowerManager`, whose `createService` is what the NPE stack names.
+
+The three `answered code 7 with an empty reply` lines are the only unhandled
 `IServiceManager` calls seen; code 7 in AOSP-13 is `unregisterForNotifications`,
 which should not be in this path.
 2. The broker client works up to the last layer, and is off by default. Verified
