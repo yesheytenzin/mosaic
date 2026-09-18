@@ -865,6 +865,58 @@ static int looks_like_ibinder(void *object) {
     return ok;
 }
 
+/* A trace written straight to a file, for questions the log pipeline cannot
+ * answer: say() goes through a line budget and stderr, and the framework's own
+ * output comes through logd, so their order cannot be compared. This does not
+ * share either. */
+#define SYS_WRITE 1
+#define SYS_OPENAT 257
+static int trace_fd = -2;
+static int trace_wanted(void) {
+    if (trace_fd == -2) {
+        const char *on = getenv("MOSAIC_BINDER_TRACE");
+        if (on && on[0] == '1') {
+            trace_fd = (int)syscall(SYS_OPENAT, -100, "/tmp/mosaic-sm-trace.log",
+                                    0x441 /* O_WRONLY|O_CREAT|O_APPEND */, 0644);
+        } else {
+            trace_fd = -1;
+        }
+    }
+    return trace_fd >= 0;
+}
+static void trace_num(const char *what, long a, long b) {
+    if (!trace_wanted()) return;
+    char buf[160];
+    long n = 0;
+    for (const char *p = what; p && *p && n < 60; p++) buf[n++] = *p;
+    buf[n++] = ' ';
+    if (a < 0) { buf[n++] = '-'; a = -a; }
+    char digits[24];
+    int d = 0;
+    if (a == 0) digits[d++] = '0';
+    while (a > 0) { digits[d++] = (char)('0' + a % 10); a /= 10; }
+    while (d > 0) buf[n++] = digits[--d];
+    buf[n++] = ' ';
+    if (b < 0) { buf[n++] = '-'; b = -b; }
+    d = 0;
+    if (b == 0) digits[d++] = '0';
+    while (b > 0) { digits[d++] = (char)('0' + b % 10); b /= 10; }
+    while (d > 0) buf[n++] = digits[--d];
+    buf[n++] = '\n';
+    syscall(SYS_WRITE, trace_fd, buf, n);
+}
+
+static void trace_pair(const char *what, const char *name) {
+    if (!trace_wanted()) return;
+    char buf[256];
+    long n = 0;
+    for (const char *p = what; p && *p && n < 200; p++) buf[n++] = *p;
+    buf[n++] = ' ';
+    for (const char *p = name ? name : "(null)"; *p && n < 240; p++) buf[n++] = *p;
+    buf[n++] = '\n';
+    syscall(SYS_WRITE, trace_fd, buf, n);
+}
+
 static void broker_export(const char *name, ulong node);
 
 static void remember(const char *name, void *object, unsigned long cookie) {
@@ -1210,6 +1262,7 @@ static int broker_transact(uint32 handle, uint32 code, uint32 flags, const unsig
 static int service_manager(uint32 code, const unsigned char *data, ulong size, void *request_parcel,
                            void *reply) {
     resolve();
+    trace_num("smcode", (long)code, (long)size);
     if (!parcel_write_int32) return 0;
     if (!after_token(data, size, SERVICE_MANAGER_TOKEN)) return 0;
 
@@ -1265,6 +1318,7 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             void *object = object_at(request_parcel, data, size, after_name, &weakrefs);
             if (object) {
                 remember(name, object, weakrefs);
+                trace_pair("add", name);
                 say("android-binder: registered ");
                 say(name);
                 say("\n");
@@ -1361,6 +1415,7 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
             say(object ? " found\n" : " not found\n");
             say_once();
         }
+        trace_pair(object ? "found" : "miss", have_name ? name : "(unreadable)");
         parcel_write_int32(reply, 0);
         /* A null object is written by writing nothing: libbinder's own
          * writeStrongBinder dereferences the pointer it is given, so handing it
@@ -1398,7 +1453,17 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
                 /* The pointer in the first word: the layout that hands libbinder
                  * an object rather than a null. */
                 unsigned long value[2] = {(unsigned long)object, 0};
-                parcel_write_binder(reply, value);
+                int wrote = parcel_write_binder(reply, value);
+                static int shown = 0;
+                if (shown < 12) {
+                    shown++;
+                    say("android-binder:   writeStrongBinder(");
+                    say(have_name ? name : "?");
+                    say(") -> ");
+                    say_dec((long)wrote);
+                    say("\n");
+                    say_once();
+                }
             }
         }
         return 1;
@@ -1440,6 +1505,7 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
     (void)handle;
     (void)flags;
     resolve();
+    trace_num("door", (long)code, (long)handle);
 
     if (!reply) {
         /* A oneway transaction owes no answer. */
