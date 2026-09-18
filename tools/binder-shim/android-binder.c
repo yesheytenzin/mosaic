@@ -187,7 +187,12 @@ typedef void (*parcel_ctor_fn)(void *);
 typedef void (*parcel_dtor_fn)(void *);
 typedef const unsigned long *(*parcel_objects_fn)(const void *);
 typedef ulong (*parcel_count_fn)(const void *);
-typedef int (*parcel_position_fn)(const void *, ulong);
+/* setDataPosition returns void, not status_t: reading its return as an int and
+ * treating a non-zero value as failure is what kept readStrongBinder from ever
+ * being reached -- the reader looked like it "returns nothing for the Java
+ * requests", and the object was taken by pointer archaeology instead, with no
+ * reference held. */
+typedef void (*parcel_position_fn)(const void *, ulong);
 typedef ulong (*parcel_where_fn)(const void *);
 /* readStrongBinder returns an sp<IBinder> by value. sp has a user-declared
  * destructor, so the Itanium ABI returns it through a hidden first pointer --
@@ -629,8 +634,6 @@ static int service_name_of(const unsigned char *data, ulong size, char *out, int
  * destructor, so the Itanium ABI returns it through a hidden first pointer:
  * calling it as though it returned a pointer in rax is what made the first
  * attempt at this crash. */
-static int parcel_read_strong_works = 0;
-
 /* Where the object is, found rather than computed.
  *
  * Three attempts to work the position out from the name's length were wrong for
@@ -683,89 +686,40 @@ static const unsigned char *find_object(const unsigned char *data, ulong size, c
  * live as long as the process, so it is the AIDL half that matters for it.
  */
 static void *object_at(void *parcel, const unsigned char *data, ulong size, const unsigned char *after_name) {
-    /* The reader first, at the positions the two formats allow. */
-    if (parcel && parcel_set_position && parcel_read_strong && parcel_read_strong_works) {
-        ulong candidates[3];
-        int count = 0;
-        if (after_name) candidates[count++] = (ulong)(after_name - data);
-        if (parcel_ipc_objects && parcel_ipc_objects_count) {
-            const unsigned long *offsets = parcel_ipc_objects(parcel);
-            ulong objects_count = parcel_ipc_objects_count(parcel);
-            if (offsets && objects_count > 0) {
-                if (offsets[0] >= 24) candidates[count++] = offsets[0] - 24;
-                candidates[count++] = offsets[0];
-            }
-        }
-        ulong saved = parcel_data_position ? parcel_data_position(parcel) : 0;
-        for (int i = 0; i < count; i++) {
-            if (parcel_set_position(parcel, candidates[i]) != 0) continue;
+    const unsigned char *found = find_object(data, size, after_name);
+
+    /* The reader first: it is the one that takes a reference, the way a real
+     * binder node does on registration, so the registry owns the service from
+     * registration on -- and a service the framework registers from a temporary,
+     * `platform_compat` among them, stays alive because of it. The position to
+     * read from is the one find_object found; computing it from the name's length
+     * was wrong for even-length names and the object table's offsets did not agree
+     * either, which is why this reader was tried at guessed positions, came back
+     * empty, and was left off. */
+    if (parcel && found && parcel_set_position && parcel_read_strong && parcel_data_position) {
+        ulong saved = parcel_data_position(parcel);
+        if ((ulong)(found - data) + 24 <= size) {
+            parcel_set_position(parcel, (ulong)(found - data));
             /* The sp lands here and is deliberately not destroyed: its reference
              * is the registry's. */
             unsigned long held[2] = {0, 0};
             parcel_read_strong(held, parcel);
+            parcel_set_position(parcel, saved);
             if (held[0]) {
-                parcel_set_position(parcel, saved);
+                static int said = 0;
+                if (said < 3) {
+                    said++;
+                    say("android-binder:   object taken by readStrongBinder, reference held\n");
+                    say_once();
+                }
                 return (void *)held[0];
             }
         }
         parcel_set_position(parcel, saved);
     }
 
-    /* Then the type word -- but only to report what is there, not to register it.
-     *
-     * Storing what the search finds makes the framework *crash* rather than
-     * simply not find the service: the object at the position the name's length
-     * implies has a cookie that looks like a heap pointer and that libbinder's
-     * reader still cannot call, at vtable offset 0x60. A service that answers
-     * "not found" is worse than one that answers, and much better than one that
-     * takes the process down. So the search reports and returns nothing. */
-    /* Every type word in the request, with both of its pointers, before choosing
-     * any of them. The first match has a type word, binder flags and two heap
-     * pointers, and is not the service, so the question is whether there is another
-     * one -- and where. */
-    {
-        static int listed = 0;
-        if (listed < 2) {
-            listed++;
-            say("android-binder: type words in this request:");
-            const unsigned char *end = data + size;
-            for (const unsigned char *p = data; p + 24 <= end; p += 4) {
-                uint32 type = u32_at(p);
-                if (type != BINDER_TYPE_BINDER && type != BINDER_TYPE_HANDLE) continue;
-                unsigned long a = 0, b = 0;
-                for (int i = 0; i < 8; i++) a |= ((unsigned long)p[8 + i]) << (8 * i);
-                for (int i = 0; i < 8; i++) b |= ((unsigned long)p[16 + i]) << (8 * i);
-                say(" [");
-                say_dec((long)(p - data));
-                say(" type=");
-                say_dec((long)type);
-                say(" flags=");
-                say_dec((long)u32_at(p + 4));
-                say(" +8=0x");
-                for (int shift = 60; shift >= 0; shift -= 4) {
-                    static const char hex[] = "0123456789abcdef";
-                    char digit[2];
-                    digit[0] = hex[(a >> shift) & 0xf];
-                    digit[1] = 0;
-                    say(digit);
-                }
-                say(" +16=0x");
-                for (int shift = 60; shift >= 0; shift -= 4) {
-                    static const char hex[] = "0123456789abcdef";
-                    char digit[2];
-                    digit[0] = hex[(b >> shift) & 0xf];
-                    digit[1] = 0;
-                    say(digit);
-                }
-                say("]");
-            }
-            say("\n");
-            say_once();
-        }
-    }
-
-    const unsigned char *object = find_object(data, size, after_name);
-    if (!object) return 0;
+    if (!found) return 0;
+    const unsigned char *object = found;
 
     /* Which of the two pointer fields is the IBinder.
      *
@@ -801,38 +755,49 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
                 digit[1] = 0;
                 say(digit);
             }
+            unsigned long w0 = 0;
+            if (fields[f] >= 0x10000 && fields[f] < 0x800000000000UL) {
+                w0 = *(const unsigned long *)fields[f];
+            }
+            say(" w0=0x");
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                static const char hex[] = "0123456789abcdef";
+                char digit[2];
+                digit[0] = hex[(w0 >> shift) & 0xf];
+                digit[1] = 0;
+                say(digit);
+            }
         }
         say("\n");
         say_once();
     }
 
-    /* The field beside the cookie, which is the IBinder -- measured, not assumed.
+    /* Which of the two fields is the IBinder, read off libbinder rather than
+     * guessed.
      *
-     * With the pointer in the *second* word of the sp the framework got a null
-     * binder ("No service published for: power") because that makes m_ptr null and
-     * flatten_binder writes an empty object; with it in the first word and the
-     * cookie as the object it got something it could not call. This field, with the
-     * pointer first, is the combination that delivers: "No service published for:
-     * power" and "Manager wrapper not available" both go to zero.
+     * A flat_binder_object is type at 0, flags at 4, and two pointers at 8 and 16.
+     * For a local object, Parcel::flattenBinder() -- the function on the other side
+     * of the hand-back -- calls RefBase::getWeakRefs() and stores the result at
+     * `%rsp+0x8`, then stores the BBinder at `%rsp+0x10`. So offset 8 is the weak
+     * reference table and offset 16 is the BBinder. This code used to hand back
+     * offset 8, and flattenBinder died on it: it reads the object's first word as a
+     * vtable and calls localBinder() through it, and the weak reference table's
+     * first word is its refcounts -- {strong=0, weak=1} is 0x100000000, not a code
+     * pointer. That is the SIGSEGV at Parcel::flattenBinder+52 that stopped
+     * StartActivityManager.
      *
-     * A userspace pointer is what it has to look like, because the object's shape
-     * is not the same in every request -- one of them yields 0x100000000, which
-     * libbinder reads as a vtable address and dies on. A value outside the
-     * process's address space is not an object, and answering "not found" for it is
-     * better than handing it over. */
-    /* A null binder is a binder object with a zero pointer, and reading eight bytes
-     * at offset 8 then glues that zero to whatever field follows -- 0x100000000,
-     * which libbinder takes for a vtable. The low half being zero is the tell. */
-    if (u32_at(object + 8) == 0) return 0;
-
+     * Offset 16 is therefore preferred; offset 8 is a fallback only. Which
+     * candidate is an object is decided by reading its first word and asking
+     * whether it looks like a vtable -- a userspace pointer. Both are pointers
+     * libbinder itself wrote into the parcel, so reading them is safe, and the
+     * size test rejects the small integers a handle or an fd would leave here
+     * before anything is dereferenced. */
     unsigned long type = u32_at(object);
     if (type == BINDER_TYPE_HANDLE) {
         /* A handle, not an object: the field at 8 is a 32-bit index into the
-         * *sender's* handle table, and reading eight bytes there gives
-         * {handle, cookie-low} -- which is where 0x100000000 came from, a value
-         * libbinder then treats as a vtable and dies on. There is nothing to hand
-         * back for one of these: a proxy would need a handle in *this* process's
-         * table, and the broker is the thing that allocates those. */
+         * *sender's* handle table. There is nothing to hand back for one of these:
+         * a proxy would need a handle in *this* process's table, and the broker is
+         * the thing that allocates those. */
         static int said = 0;
         if (said < 3) {
             said++;
@@ -841,7 +806,12 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
         }
         return 0;
     }
-    if (fields[0] >= 0x10000 && fields[0] < 0x800000000000UL) return (void *)fields[0];
+    for (int f = 1; f >= 0; f--) {
+        unsigned long candidate = fields[f];
+        if (candidate < 0x10000 || candidate >= 0x800000000000UL) continue;
+        unsigned long first = *(const unsigned long *)candidate;
+        if (first >= 0x10000 && first < 0x800000000000UL) return (void *)candidate;
+    }
     return 0;
 }
 
@@ -1344,12 +1314,31 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
                 digit[1] = 0;
                 say(digit);
             }
+            /* The object has to still be one. A service the framework registers
+             * from a temporary -- `platform_compat` is one -- loses the Java wrapper
+             * the native pointer belongs to when the temporary is collected, and the
+             * pointer this registry kept then dangles: its first word stops being a
+             * vtable. Handing that to libbinder is the SIGSEGV inside
+             * Parcel::flattenBinder that stopped StartActivityManager, so it is
+             * checked here and an object that no longer looks alive is answered
+             * absent rather than passed on. */
+            unsigned long w0 = 0;
+            if ((unsigned long)object >= 0x10000 && (unsigned long)object < 0x800000000000UL) {
+                w0 = *(const unsigned long *)object;
+            }
             say("\n");
             say_once();
-            /* The pointer in the first word: the layout that hands libbinder an
-             * object rather than a null. */
-            unsigned long value[2] = {(unsigned long)object, 0};
-            parcel_write_binder(reply, value);
+            if (w0 < 0x10000 || w0 >= 0x800000000000UL) {
+                say("android-binder:   ");
+                say(have_name ? name : "(unnamed)");
+                say(" no longer looks like an object; answering absent\n");
+                say_once();
+            } else {
+                /* The pointer in the first word: the layout that hands libbinder
+                 * an object rather than a null. */
+                unsigned long value[2] = {(unsigned long)object, 0};
+                parcel_write_binder(reply, value);
+            }
         }
         return 1;
     }

@@ -76,20 +76,48 @@ android-binder: checkService platform_compat found
 android-binder: checkService memtrack.proxy found
 ```
 
-`ActivityManagerService`'s constructor still does not complete. Two known reasons,
-in order:
+`ActivityManagerService`'s constructor still does not complete, and the reason is
+no longer a crash. Three things were fixed to get this far, each of them the
+difference between a SIGSEGV and an answer:
 
-0. **A2's Java registration path works**, verified by the framework using it:
-   `PowerManagerService` constructs, which requires `appops` from the service
-   manager. `startBootstrapServices` now reaches `StartPowerManager`,
-   `StartThermalManager`, `StartHintManager` and `InitPowerManagement`. Three
-   findings on the way -- the object found by its type word rather than a computed
-   position, the cookie at offset 16 as the IBinder, and `sp<IBinder>` being sixteen
-   bytes with the pointer in the *second* word -- are in `docs/todo-a.md`.
-1. ~~The registry stores a pointer without a reference.~~ Fixed: the object is
-   taken with `Parcel::readStrongBinder`, whose reference is left in place, so the
-   registry owns the service from registration on. Verified -- no SIGSEGV and no
-   staleness guard, with lookups still finding what is registered.
+0. **The hand-back used the wrong field.** A `flat_binder_object` has type at 0,
+   flags at 4, and two pointers at 8 and 16, and `Parcel::flattenBinder()` -- the
+   function on the other side -- writes `RefBase::getWeakRefs()` at 8 and the
+   `BBinder` at 16 (read off its disassembly: `getWeakRefs()` result to
+   `%rsp+0x8`, `rbx` to `%rsp+0x10`). The shim handed back offset 8, so
+   `flattenBinder` called `localBinder()` through the weak reference table's first
+   word -- its refcounts, `{strong=0, weak=1}` being `0x100000000` rather than a
+   vtable. That is the `Parcel::flattenBinder+52` SIGSEGV that stopped
+   `StartActivityManager`. Offset 16 is preferred now, with offset 8 only as a
+   fallback, and the candidate is required to have a first word that looks like a
+   vtable before it is used.
+1. **The registry did not hold a reference.** `object_at` preferred
+   `Parcel::readStrongBinder` -- which takes a strong reference, the way a binder
+   node does -- but the call was gated on `Parcel::setDataPosition` returning
+   zero, and that function returns `void`: the shim read a stale register as its
+   status and skipped the reader every time. So every Java registration fell
+   through to pointer arithmetic with no reference held, and a service the
+   framework registers from a temporary -- `platform_compat` is one, `new
+   PlatformCompat(...)` inside `startBootstrapServices` -- was freed before
+   anything looked it up. With the signature corrected the reader runs: three
+   registrations are now taken by `readStrongBinder` with the reference left in
+   place, and `platform_compat` is still alive when it is looked up.
+2. **A dead object is answered absent, not handed over.** The service manager's
+   hand-back checks that the object's first word still looks like a vtable. One
+   that does not is a pointer into freed memory, and passing it to `flattenBinder`
+   is a SIGSEGV; answering "not found" is worse for the caller and much better
+   than taking the process down.
+
+With those, there are no fatal signals at all, `StartActivityManager` is passed,
+and the boot stops somewhere else: `ActivityManagerService`'s constructor hangs
+inside `ProcessStatsService` -> `ProcessStats.<init>` ->
+`Debug.getDirtyPagesPid` -> memtrack -> `AServiceManager_checkService` (the NDK
+path) -> the shim's `service_manager` -> `Parcel::flattenBinder`, blocked on an
+ART `MemMapArenaPool` mutex. `flattenBinder` calls `IPCThreadState::self()`, and
+reaching it from inside a binder transaction on the NDK path is what deadlocks.
+The `svc`-style service the NDK path looks up is `memtrack.proxy`, which the shim
+does hand back; the question is how the NDK's `checkService` reply differs from
+the Java one's.
 2. The broker client works up to the last layer, and is off by default. Verified
    against a running broker, with the framework in one process and
    `tools/two-process-call.py` in another:
