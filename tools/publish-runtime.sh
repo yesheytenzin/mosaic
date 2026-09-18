@@ -2,8 +2,13 @@
 # Publish a runtime bundle as a GitHub release, so that any machine can install it
 # with one command and no image, no checkout and no build tools.
 #
-#   tools/publish-runtime.sh [--dry-run] [--repo owner/name] [--tag TAG]
+#   tools/publish-runtime.sh [--dry-run] [--draft] [--repo owner/name] [--tag TAG]
 #                            [--version V] [bundle-directory]
+#
+# --draft uploads the assets without making the release visible: nothing is listed,
+# no tag is created until it is published, and removing it is one command. It is how
+# the upload path can be tested without publishing Android's binaries under your own
+# name, and how a release can be prepared before it goes out.
 #
 # What it does:
 #
@@ -37,6 +42,7 @@ repo=""
 tag=""
 version="local"
 dry_run=0
+draft=0
 bundle=""
 
 usage() {
@@ -47,6 +53,7 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry_run=1 ;;
+    --draft) draft=1 ;;
     --repo) repo="${2:?--repo needs owner/name}" && shift ;;
     --tag) tag="${2:?--tag needs a value}" && shift ;;
     --version) version="${2:?--version needs a value}" && shift ;;
@@ -107,7 +114,13 @@ if [ "$dry_run" = 1 ]; then
   exit 0
 fi
 
-gh release create "$tag" --repo "$repo" --latest \
+draft_flag=""
+[ "$draft" = 1 ] && draft_flag="--draft"
+# shellcheck disable=SC2086
+# The name to quote back for this release: a published one is its tag, a draft has no
+# tag and GitHub calls it `untagged-<id>`, and printing the tag for a draft gives a
+# command that does not work.
+release=$(gh release create "$tag" --repo "$repo" --latest $draft_flag \
   --title "Runtime bundle $version ($arch)" \
   --notes "Mosaic runtime bundle for $arch, built from a system image.
 
@@ -116,10 +129,19 @@ Install it on a machine of this architecture with:
     mosaic runtime install https://github.com/$repo/releases/download/$tag/runtime-$version-$arch.tar.xz
 
 The archive holds the image's ART, Bionic and framework jars, unmodified." \
-  "$archive" "$archive.sha256"
+  "$archive" "$archive.sha256" | tail -1)
+name=${release##*/}
 
 echo
-echo "published. On a machine of this architecture:"
+if [ "$draft" = 1 ]; then
+  echo "uploaded as a draft: not visible, nothing public, and removable with"
+  echo "  gh release delete $name --repo $repo --cleanup-tag"
+  echo
+  echo "publish it -- this is the step that makes it visible -- with:"
+  echo "  gh release edit $name --repo $repo --draft=false"
+  echo
+fi
+echo "On a machine of this architecture:"
 echo "  mosaic runtime install https://github.com/$repo/releases/download/$tag/runtime-$version-$arch.tar.xz"
 echo
 echo "or, for every such machine, in <work>/mosaic.cfg:"
