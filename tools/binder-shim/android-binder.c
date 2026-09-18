@@ -51,6 +51,7 @@ extern void free(void *);
 #define SYM_SET_POSITION "_ZNK7android6Parcel15setDataPositionEm"
 #define SYM_GET_POSITION "_ZNK7android6Parcel12dataPositionEv"
 #define SYM_READ_BINDER "_ZNK7android6Parcel16readStrongBinderEv"
+#define SYM_WRITE_OBJECT "_ZN7android6Parcel11writeObjectERK18flat_binder_objectb"
 #define SYM_SET_REFERENCE "_ZN7android6Parcel19ipcSetDataReferenceEPKhmPKymPFvPS0_S2_mS4_mE"
 #define SYM_BINDER_TRANSACT "_ZN7android7BBinder8transactEjRKNS_6ParcelEPS1_j"
 extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
@@ -199,6 +200,7 @@ typedef ulong (*parcel_where_fn)(const void *);
  * calling it as if it returned a pointer in rax is what made the first attempt
  * at this crash. */
 typedef void (*parcel_read_fn)(void *out, const void *self);
+typedef int (*write_object_fn)(void *self, const void *obj, int null_meta_data);
 typedef void (*parcel_set_reference_fn)(void *self, const unsigned char *data, ulong size,
                                         const ulong *objects, ulong count, void *release);
 typedef int (*binder_transact_fn)(void *self, uint32 code, const void *data, void *reply,
@@ -206,6 +208,7 @@ typedef int (*binder_transact_fn)(void *self, uint32 code, const void *data, voi
 
 static write_int32_fn parcel_write_int32;
 static write_binder_fn parcel_write_binder;
+static write_object_fn parcel_write_object;
 static write_bytes_fn parcel_write_bytes;
 static parcel_data_fn parcel_data;
 static parcel_size_fn parcel_data_size;
@@ -231,6 +234,7 @@ static void resolve(void) {
     parcel_write_int32 = (write_int32_fn)dlsym(binder, SYM_WRITE_INT32);
     parcel_write_bytes = (write_bytes_fn)dlsym(binder, SYM_WRITE_BYTES);
     parcel_write_binder = (write_binder_fn)dlsym(binder, SYM_WRITE_BINDER);
+    parcel_write_object = (write_object_fn)dlsym(binder, SYM_WRITE_OBJECT);
     parcel_data = (parcel_data_fn)dlsym(binder, SYM_DATA);
     parcel_data_size = (parcel_size_fn)dlsym(binder, SYM_DATA_SIZE);
     parcel_ctor = (parcel_ctor_fn)dlsym(binder, SYM_PARCEL_CTOR);
@@ -685,8 +689,15 @@ static const unsigned char *find_object(const unsigned char *data, ulong size, c
  * holds no reference, which is a thing to fix here; the framework's own services
  * live as long as the process, so it is the AIDL half that matters for it.
  */
-static void *object_at(void *parcel, const unsigned char *data, ulong size, const unsigned char *after_name) {
+static void *object_at(void *parcel, const unsigned char *data, ulong size,
+                       const unsigned char *after_name, unsigned long *weakrefs_out) {
     const unsigned char *found = find_object(data, size, after_name);
+    if (weakrefs_out) *weakrefs_out = 0;
+    if (found && weakrefs_out) {
+        unsigned long w = 0;
+        for (int i = 0; i < 8; i++) w |= ((unsigned long)found[8 + i]) << (8 * i);
+        *weakrefs_out = w;
+    }
 
     /* The reader first: it is the one that takes a reference, the way a real
      * binder node does on registration, so the registry owns the service from
@@ -816,6 +827,44 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size, cons
 }
 
 
+/* Whether a remembered pointer is still an IBinder.
+ *
+ * An IBinder's first word is its vtable and localBinder() is at byte offset 0x60.
+ * Asking which library that entry points into is what tells a live binder from a
+ * stale pointer: a real one comes from libbinder, or from libandroid_runtime for
+ * a Java binder, and anything else -- memtrack.proxy's registration through the
+ * NDK door is one -- is not a binder at all. Handing that to writeStrongBinder is
+ * what called art::MemMapArenaPool::TrimMaps as if it were localBinder().
+ *
+ * The vtable entry is read, never called, and dladdr only inspects the address.
+ */
+extern char *strstr(const char *, const char *);
+
+typedef struct {
+    const char *dli_fname;
+    void *dli_fbase;
+    const char *dli_sname;
+    void *dli_saddr;
+} dl_info_t;
+extern int dladdr(const void *, dl_info_t *);
+
+static int looks_like_ibinder(void *object) {
+    if (!object) return 0;
+    unsigned long address = (unsigned long)object;
+    if (address < 0x10000 || address >= 0x800000000000UL) return 0;
+    unsigned long vtable = *(const unsigned long *)object;
+    if (vtable < 0x10000 || vtable >= 0x800000000000UL) return 0;
+    void *slot = ((void **)vtable)[0x60 / 8];
+    if (!slot) return 0;
+    dl_info_t info;
+    __builtin_memset(&info, 0, sizeof info);
+    int resolved = dladdr(slot, &info);
+    int ok = resolved && info.dli_fname &&
+             (strstr(info.dli_fname, "libbinder") != 0 ||
+              strstr(info.dli_fname, "libandroid_runtime") != 0);
+    return ok;
+}
+
 static void broker_export(const char *name, ulong node);
 
 static void remember(const char *name, void *object, unsigned long cookie) {
@@ -860,7 +909,16 @@ static void remember(const char *name, void *object, unsigned long cookie) {
     if (listed) broker_export(name, node);
 }
 
-static void *lookup(const char *name) {
+/* The object, and the weak reference table that goes beside it in a hand-back.
+ *
+ * A flat_binder_object carries both, and the hand-back writes one directly now
+ * rather than calling Parcel::writeStrongBinder. That call reaches
+ * IPCThreadState::self(), which re-enters binder initialisation from inside a
+ * transaction and deadlocks on ART's arena pool on the NDK checkService path --
+ * the hang that replaced the SIGSEGV. Parcel::writeObject does not.
+ */
+static void *lookup_full(const char *name, unsigned long *weakrefs_out) {
+    if (weakrefs_out) *weakrefs_out = 0;
     if (!name) return 0;
     lock_registry();
     for (int i = 0; i < service_count; i++) {
@@ -874,12 +932,17 @@ static void *lookup(const char *name) {
         }
         if (same) {
             void *object = services[i].object;
+            if (weakrefs_out) *weakrefs_out = services[i].cookie;
             unlock_registry();
             return object;
         }
     }
     unlock_registry();
     return 0;
+}
+
+static void *lookup(const char *name) {
+    return lookup_full(name, 0);
 }
 
 static int registered_count(void) {
@@ -1198,9 +1261,10 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
     if (code == TRANSACTION_ADD_SERVICE) {
         if (have_name) {
             const unsigned char *after_name = name_after_token(data, size, name, NAME_MAX);
-            void *object = object_at(request_parcel, data, size, after_name);
+            unsigned long weakrefs = 0;
+            void *object = object_at(request_parcel, data, size, after_name, &weakrefs);
             if (object) {
-                remember(name, object, 0);
+                remember(name, object, weakrefs);
                 say("android-binder: registered ");
                 say(name);
                 say("\n");
@@ -1322,13 +1386,10 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
              * Parcel::flattenBinder that stopped StartActivityManager, so it is
              * checked here and an object that no longer looks alive is answered
              * absent rather than passed on. */
-            unsigned long w0 = 0;
-            if ((unsigned long)object >= 0x10000 && (unsigned long)object < 0x800000000000UL) {
-                w0 = *(const unsigned long *)object;
-            }
+            int alive = looks_like_ibinder(object);
             say("\n");
             say_once();
-            if (w0 < 0x10000 || w0 >= 0x800000000000UL) {
+            if (!alive) {
                 say("android-binder:   ");
                 say(have_name ? name : "(unnamed)");
                 say(" no longer looks like an object; answering absent\n");
