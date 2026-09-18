@@ -15,7 +15,7 @@ pub async fn retrieve(url: &str, headers: Option<HashMap<String, String>>) -> (i
     if reqwest::Url::parse(url).is_err() {
         return (-1, Vec::new());
     }
-    let client = reqwest::Client::new();
+    let client = client();
     let mut request = client.get(url);
     if let Some(headers) = headers {
         for (k, v) in headers {
@@ -55,6 +55,32 @@ pub async fn download(
     cache: bool,
     allow_404: bool,
 ) -> anyhow::Result<Option<String>> {
+    download_with(args, url, prefix, cache, allow_404, None).await
+}
+
+/// The HTTP client every request goes through.
+///
+/// GitHub's API refuses a request with no User-Agent -- "Request forbidden by
+/// administrative rules" -- and reqwest sends none by default, while curl does. That
+/// single missing header is why the API path answered 403 to this and 200 to a shell.
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("mosaic/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default()
+}
+
+/// The same, with headers. A release in a private repository is the reason this
+/// exists: the asset URLs answer 404 to anything unauthenticated, so a deployment
+/// that keeps its runtime internal has to be able to say who it is.
+pub async fn download_with(
+    args: &MosaicArgs,
+    url: &str,
+    prefix: &str,
+    cache: bool,
+    allow_404: bool,
+    headers: Option<HashMap<String, String>>,
+) -> anyhow::Result<Option<String>> {
     let cache_dir = format!("{}/cache_http", args.work);
     std::fs::create_dir_all(&cache_dir)?;
     let path = cache_path(&args.work, prefix, url);
@@ -71,9 +97,14 @@ pub async fn download(
     if reqwest::Url::parse(url).is_err() {
         anyhow::bail!("Failed to download {}: malformed URL", url);
     }
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
+    let client = client();
+    let mut request = client.get(url);
+    if let Some(headers) = &headers {
+        for (k, v) in headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to download {}: {}", url, e))?;

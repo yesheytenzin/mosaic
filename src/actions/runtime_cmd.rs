@@ -21,17 +21,28 @@ pub async fn dispatch(args: &MosaicArgs, subaction: &RuntimeSubaction) -> anyhow
 pub async fn fetch(args: &MosaicArgs) -> anyhow::Result<()> {
     let config = crate::config::load(&args.config);
     let version = config.bundle_version();
-    let dir = crate::runtime::fetch(args, &config.bundle_channel(), &version)
+    let channel = config.bundle_channel();
+    let dir = crate::runtime::fetch(args, &channel, &version)
         .await
         .map_err(|e| {
-            // The published bundle is per release and may not exist for the version
-            // this build asks for. Saying only "404" leaves a person with a bundle
-            // they built themselves and no idea it can be used.
+            // A 404 has several causes that look identical, and they need different
+            // things from whoever reads it. The one worth naming is a release in a
+            // private repository: github.com's download URLs answer 404 to everything,
+            // token or no token, because they are browser-facing.
+            let private = channel.starts_with("https://github.com/")
+                && std::env::var("MOSAIC_BUNDLE_TOKEN").is_err();
             anyhow::anyhow!(
-                "{}. Either build one from a system image -- mosaic runtime install \
+                "{}.{} Either build one from a system image -- mosaic runtime install \
                  <image> -- or install a bundle from wherever it is published: \
                  mosaic runtime install <url>",
-                e
+                e,
+                if private {
+                    " If that release is in a private repository, github.com's download \
+                     URLs are not reachable at all: set MOSAIC_BUNDLE_TOKEN to a token \
+                     that can read it, and the release is resolved through the API."
+                } else {
+                    ""
+                }
             )
         })?;
     println!("Runtime bundle {} installed at {}", version, dir);
@@ -60,16 +71,28 @@ pub async fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> an
         }
     };
 
-    // A URL is fetched first; what comes back is a file on disk, like any other.
-    let local = if given.starts_with("http://") || given.starts_with("https://") {
-        let name = given.rsplit('/').next().unwrap_or("runtime").to_string();
-        if version_name(&name).is_some() && version == "local" {
-            // Nothing to do here: the archive's own name carries the version.
-        }
-        log::info!("Fetching {}", given);
-        crate::helpers::http::download(args, &given, "runtime-install", true, false)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("{} could not be fetched", given))?
+    // A URL is fetched first; what comes back is a file on disk, like any other. A URL
+    // that names a release asset is resolved first: over a private repository the URL
+    // itself is not reachable, and the API is.
+    let is_url = given.starts_with("http://") || given.starts_with("https://");
+    let (fetch_url, sidecar) = if is_url {
+        crate::runtime::reachable(&given).await?
+    } else {
+        (given.clone(), None)
+    };
+
+    let local = if is_url {
+        log::info!("Fetching {}", fetch_url);
+        crate::helpers::http::download_with(
+            args,
+            &fetch_url,
+            "runtime-install",
+            true,
+            false,
+            crate::runtime::bundle_asset_headers(),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{} could not be fetched", fetch_url))?
     } else {
         std::fs::canonicalize(&given)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {}", given, e))?
@@ -88,8 +111,8 @@ pub async fn install(args: &MosaicArgs, path: Option<&str>, version: &str) -> an
 
     // A fetched archive is checked against the hash published beside it, the same as
     // `runtime fetch` does: what arrives over a network is what is worth verifying.
-    if given.starts_with("http://") || given.starts_with("https://") {
-        crate::runtime::verify_published_checksum(args, &given, &local).await?;
+    if is_url {
+        crate::runtime::verify_checksum(sidecar.as_deref(), &local).await?;
     }
 
     if std::path::Path::new(&local).is_dir() {

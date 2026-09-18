@@ -743,8 +743,13 @@ int ioctl(int fd, unsigned long request, ...) {
                 bwr->read_consumed =
                     write_reply((unsigned char *)bwr->read_buffer, bwr->read_size);
                 pending.have = 0;
-            } else if (bwr->write_size == 0) {
-                /* Nothing to answer: a no-op keeps the reader where it is. */
+            } else {
+                /* Nothing to answer, and read space to answer it in: a no-op keeps
+                 * the reader where it is. This used to happen only for a read-only
+                 * call, so a *write* that also had read space got an empty buffer --
+                 * and an empty buffer is not a command, whatever the reader makes of
+                 * it. A reply that is owed is delivered above; this is the case where
+                 * none is. */
                 if (bwr->read_size >= 4) {
                     unsigned int noop = BR_NOOP;
                     __builtin_memcpy((void *)bwr->read_buffer, &noop, 4);
