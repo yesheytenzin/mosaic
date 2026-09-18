@@ -147,3 +147,17 @@ echo
 echo "or, for every such machine, in <work>/mosaic.cfg:"
 echo "  bundle_channel = https://github.com/$repo/releases/latest/download"
 echo "  bundle_version = $version"
+
+# A private repository is the case where the lines above are not enough, and it is
+# worth saying so here rather than letting the 404 explain itself: github.com's
+# download URLs are browser-facing and answer 404 to a private repository with or
+# without a token. The API asset URLs do serve it, and `mosaic runtime fetch` uses
+# them whenever MOSAIC_BUNDLE_TOKEN is set.
+if [ "$(gh repo view "$repo" --json isPrivate --jq '.isPrivate' 2>/dev/null)" = "true" ]; then
+  echo
+  echo "note: $repo is private, so those URLs answer 404 without a token."
+  echo "A machine installs from it by setting MOSAIC_BUNDLE_TOKEN to a token that"
+  echo "can read the repository; the release is then resolved through the API:"
+  echo "  MOSAIC_BUNDLE_TOKEN=<token> mosaic runtime fetch"
+  echo "Making the repository public makes the plain URLs work instead."
+fi

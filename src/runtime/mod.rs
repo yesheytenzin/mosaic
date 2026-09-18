@@ -119,19 +119,141 @@ pub fn use_local(work: &str, directory: &str, version: &str) -> anyhow::Result<S
     Ok(link)
 }
 
+/// Headers a bundle download should carry.
+///
+/// A release in a *private* repository answers 404 to anything unauthenticated, which
+/// looks exactly like a release that does not exist. A deployment that keeps its
+/// runtime internal sets MOSAIC_BUNDLE_TOKEN and can fetch it; one that publishes it
+/// needs no token at all.
+pub fn bundle_headers() -> Option<std::collections::HashMap<String, String>> {
+    let token = std::env::var("MOSAIC_BUNDLE_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())?;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    Some(headers)
+}
+
+/// The same, asking for an asset's *bytes*.
+///
+/// An API asset URL answers with a JSON description of the asset unless this is asked
+/// for, and the release *description* answers 404 if it is -- which is exactly the
+/// mistake that made the API path look broken: one header set for two different things.
+pub fn bundle_asset_headers() -> Option<std::collections::HashMap<String, String>> {
+    let mut headers = bundle_headers()?;
+    headers.insert("Accept".to_string(), "application/octet-stream".to_string());
+    Some(headers)
+}
+
+/// Where an asset lives.
+///
+/// Over a release in a private repository, github.com's download URLs are not reachable
+/// at all: they are browser-facing and answer 404 to a token as well. The API is the way
+/// in, so it is used whenever a token is set and the channel names a release. Otherwise
+/// the plain URL, which is what a public release serves and what a directory does.
+pub async fn asset_url(channel: &str, version: &str, asset: &str) -> anyhow::Result<String> {
+    if bundle_headers().is_some() {
+        if let Some((repo, release)) = github_release(channel) {
+            if let Some(url) = api_asset_url(&repo, &release, asset).await? {
+                log::info!("Resolved {} through the GitHub API", asset);
+                return Ok(url);
+            }
+        }
+    }
+    let _ = version;
+    Ok(format!("{}/{}", channel.trim_end_matches('/'), asset))
+}
+
+/// The repository and release a channel names, when it names one.
+///
+/// Three shapes reach the same place: a release's `latest/download` directory, its
+/// `download/<tag>` directory, and the API's own release URL. The download forms work
+/// for a public repository and not for a private one; the API form works for both.
+fn github_release(channel: &str) -> Option<(String, String)> {
+    let rest = channel
+        .strip_prefix("https://github.com/")
+        .or_else(|| channel.strip_prefix("https://api.github.com/repos/"))?;
+    let rest = rest.strip_prefix("repos/").unwrap_or(rest);
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 3 || parts[2] != "releases" {
+        return None;
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let release = match parts.get(3)? {
+        &"latest" => "latest".to_string(),
+        // `download/<tag>` and `tags/<tag>` both name a release by its tag.
+        &"download" | &"tags" => parts.get(4)?.to_string(),
+        other => other.to_string(),
+    };
+    Some((repo, release))
+}
+
+/// A release asset's own URL, through the API. That URL is the only one that serves a
+/// private repository's assets, and it needs `Accept: application/octet-stream`.
+async fn api_asset_url(repo: &str, release: &str, asset: &str) -> anyhow::Result<Option<String>> {
+    // A release is addressed three ways and only one of them is bare: `latest`, a
+    // numeric id, and a tag -- and a tag lives under `/tags/`. Asking for
+    // `/releases/<tag>` reads the tag as an id and answers 404, which looks exactly
+    // like a release that is not there.
+    let release = match release {
+        "latest" => "latest".to_string(),
+        tag if tag.parse::<u64>().is_ok() => tag.to_string(),
+        tag => format!("tags/{}", tag),
+    };
+    let endpoint = format!("https://api.github.com/repos/{}/releases/{}", repo, release);
+    let (status, body) = crate::helpers::http::retrieve(&endpoint, bundle_headers()).await;
+    if status != 200 || body.is_empty() {
+        return Ok(None);
+    }
+    let release: serde_json::Value = serde_json::from_slice(&body)?;
+    let found = release
+        .get("assets")
+        .and_then(|assets| assets.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(asset))
+        })
+        .and_then(|a| a.get("url").and_then(|u| u.as_str()))
+        .map(|u| u.to_string());
+    Ok(found)
+}
+
 /// Check a downloaded file against the sha256 published beside it, if one was.
 ///
 /// The same check `runtime fetch` makes, for the same reason: a runtime that arrives
 /// over a network is the one thing here worth verifying. A sidecar that does not
 /// exist is not a failure -- not every host publishes one -- but a sidecar that
 /// disagrees is.
-pub async fn verify_published_checksum(
-    args: &MosaicArgs,
-    url: &str,
-    file: &str,
-) -> anyhow::Result<()> {
-    let sidecar = format!("{}.sha256", url);
-    let (status, body) = crate::helpers::http::retrieve(&sidecar, None).await;
+/// Where a URL that names an asset actually lives, and where its checksum does.
+///
+/// For a public release, or any plain directory, those are the URL itself and
+/// `<url>.sha256`. For a release in a private repository github.com serves neither, so
+/// both are resolved through the API, which is the only thing that serves them.
+pub async fn reachable(url: &str) -> anyhow::Result<(String, Option<String>)> {
+    let name = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let channel = url[..url.len().saturating_sub(name.len())].trim_end_matches('/');
+    if bundle_headers().is_some() && github_release(channel).is_some() {
+        let archive = asset_url(channel, "", &name).await?;
+        let sidecar = asset_url(channel, "", &format!("{}.sha256", name))
+            .await
+            .ok();
+        return Ok((archive, sidecar));
+    }
+    Ok((url.to_string(), Some(format!("{}.sha256", url))))
+}
+
+/// Check a downloaded file against the sha256 published beside it, when there is one.
+pub async fn verify_checksum(sidecar: Option<&str>, file: &str) -> anyhow::Result<()> {
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+    let (status, body) = crate::helpers::http::retrieve(sidecar, bundle_asset_headers()).await;
     if status != 200 || body.is_empty() {
         return Ok(());
     }
@@ -147,12 +269,11 @@ pub async fn verify_published_checksum(
     anyhow::ensure!(
         actual == expected,
         "{} does not match the published hash\n  published {}\n  downloaded {}",
-        url,
+        sidecar,
         expected,
         actual
     );
     log::info!("Runtime bundle hash verified");
-    let _ = args;
     Ok(())
 }
 
@@ -189,11 +310,10 @@ pub fn require_in(work: &str, shared: &str) -> anyhow::Result<String> {
                         marker, version, link, dir
                     )
                 }
-                Err(_) => format!(
-                    " Run 'mosaic runtime install', which builds one from this machine's \
-                     system image, or ask an administrator to install the machine-wide one: \
-                     sudo mosaic runtime install"
-                ),
+                Err(_) => " Run 'mosaic runtime install', which builds one from this \
+                            machine's system image, or ask an administrator to install the \
+                            machine-wide one: sudo mosaic runtime install"
+                    .to_string(),
             };
             anyhow::bail!("no runtime bundle installed.{}", hint)
         }
@@ -287,14 +407,25 @@ pub async fn fetch(args: &MosaicArgs, channel: &str, version: &str) -> anyhow::R
         return Ok(dest);
     }
 
-    let url = bundle_url(channel, version);
+    // Over a release in a private repository, github.com's download URLs are not
+    // reachable at all: they are browser-facing and answer 404 to a token as well.
+    // The API is the way in, and it is used whenever a token is set and the channel
+    // names a release -- otherwise the plain URL, which is what a public release wants.
+    let asset = format!("runtime-{}-{}.tar.xz", version, host_arch());
+    let url = asset_url(channel, version, &asset).await?;
     log::info!("Fetching runtime bundle {}", url);
 
-    let archive = http::download(args, &url, "runtime", true, false)
+    let archive = http::download_with(args, &url, "runtime", true, false, bundle_asset_headers())
         .await?
         .ok_or_else(|| anyhow::anyhow!("runtime bundle not found: {}", url))?;
 
-    let expected = http::retrieve(&format!("{}.sha256", url), None).await.1;
+    // The sidecar is resolved the same way the archive was: over the API when the
+    // channel is a private release, because there is no URL to append `.sha256` to.
+    let sidecar = format!("{}.sha256", asset);
+    let expected = match asset_url(channel, version, &sidecar).await {
+        Ok(sidecar_url) => http::retrieve(&sidecar_url, bundle_asset_headers()).await.1,
+        Err(_) => Vec::new(),
+    };
     if !expected.is_empty() {
         let expected = String::from_utf8_lossy(&expected)
             .split_whitespace()
@@ -332,7 +463,7 @@ pub fn unpack_archive(args: &MosaicArgs, archive: &str, version: &str) -> anyhow
 
 fn unpack_archive_into(archive: &str, dest: &str) -> anyhow::Result<()> {
     log::info!("Extracting to {}", dest);
-    std::fs::create_dir_all(&dest)?;
+    std::fs::create_dir_all(dest)?;
     let file = std::fs::File::open(archive)?;
     let decoder = xz2::read::XzDecoder::new(file);
     let mut tar = tar::Archive::new(decoder);
@@ -392,6 +523,40 @@ mod tests {
         );
     }
 
+    /// A channel names a repository and a release in three shapes, and the parser has
+    /// to see all of them: the two browser-facing download directories work for a
+    /// public repository, and the API form is the one that works for a private one.
+    #[test]
+    fn a_channel_names_a_repository_and_a_release() {
+        for channel in [
+            "https://github.com/me/mosaic/releases/latest/download",
+            "https://github.com/me/mosaic/releases/download/runtime-local-x86_64",
+            "https://api.github.com/repos/me/mosaic/releases/latest",
+            "https://api.github.com/repos/me/mosaic/releases/tags/runtime-local-x86_64",
+        ] {
+            assert!(
+                github_release(channel).is_some(),
+                "{} should name a release",
+                channel
+            );
+        }
+        assert_eq!(
+            github_release("https://github.com/me/mosaic/releases/latest/download"),
+            Some(("me/mosaic".to_string(), "latest".to_string()))
+        );
+        assert_eq!(
+            github_release("https://github.com/me/mosaic/releases/download/v1"),
+            Some(("me/mosaic".to_string(), "v1".to_string()))
+        );
+        assert_eq!(
+            github_release("https://api.github.com/repos/me/mosaic/releases/tags/v1"),
+            Some(("me/mosaic".to_string(), "v1".to_string()))
+        );
+        // A directory or any other host is not a release.
+        assert_eq!(github_release("/var/lib/mosaic/published"), None);
+        assert_eq!(github_release("https://example.org/mosaic"), None);
+    }
+
     /// A bundle built here is a bundle: `use_local` links it and records the
     /// version, and `require` then finds it.
     #[test]
@@ -412,8 +577,6 @@ mod tests {
         let err = use_local(work, empty.path().to_str().unwrap(), "nope").unwrap_err();
         assert!(err.to_string().contains("does not look like"), "{}", err);
     }
-
-    use super::*;
 
     #[test]
     fn url_layout_is_stable() {

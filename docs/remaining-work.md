@@ -140,6 +140,23 @@ MOSAIC_BUNDLE_VERSION=local \
   mosaic runtime fetch
 ```
 
+A GitHub release is the default too: the channel is
+`https://github.com/yesheytenzin/mosaic/releases/latest/download` and the version is
+`local`, so `mosaic runtime fetch` needs no configuration at all.
+
+**A private repository changes that.** github.com's release download URLs are
+browser-facing, and to a private repository they answer 404 to everything -- with a
+token as well. Only the API's asset URLs serve them, so when `MOSAIC_BUNDLE_TOKEN` is
+set the fetch resolves the release and both assets through `api.github.com` and
+downloads them as bytes. Verified against the real private release: both
+`runtime fetch` and `runtime install <url>` downloaded 126 MB, verified the sha256,
+unpacked, and started ART from what arrived. Three things made that path look broken
+before it worked, and each is written where it bit: the GitHub API refuses a request
+with no `User-Agent`, which reqwest sends none of and curl does (the same call answered
+403 here and 200 in a shell); a release tag is addressed under `/releases/tags/<tag>`,
+not `/releases/<tag>`, which reads the tag as an id and answers 404; and the release
+JSON and an asset's bytes need different `Accept` headers.
+
 Verified as a round trip: packed the real bundle, served it over HTTP, fetched it into
 a work directory that had never seen it, and the status and launch paths found it.
 What the fetch does: downloads, verifies the sha256, unpacks to
@@ -182,9 +199,13 @@ When none of the three is available the error names all three, rather than leavi
 someone to guess.
 
 Two things remain. A bundle carries the image's ART and Bionic, so it is specific to
-an architecture: an aarch64 machine needs an aarch64 image and its own bundle. And
-`runtime fetch` needs the artifact to exist -- ADR-0010's publication step is now a
-command, but nobody has published one yet.
+an architecture: an aarch64 machine needs an aarch64 image and its own bundle. And the
+published release lives in a private repository, so an *unauthenticated* machine still
+cannot fetch it: either the repository becomes public, or a machine sets
+`MOSAIC_BUNDLE_TOKEN` to a token that can read it. The publication step itself is done
+-- `tools/publish-runtime.sh` packed, created the release, uploaded both assets and
+printed the install lines, and the release is live with the archive's digest matching
+the local file exactly.
 
 ### More than one user
 
