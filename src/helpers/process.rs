@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::args::MosaicArgs;
+use parking_lot::Mutex;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Recursively kill a pid and its children, so a timeout does not leave
@@ -197,7 +198,7 @@ pub fn core(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    *last_output_out.lock().unwrap() = std::time::Instant::now();
+                    *last_output_out.lock() = std::time::Instant::now();
                     let chunk = &buf[..n];
                     for line in chunk.split(|&b| b == b'\n') {
                         if !line.is_empty() {
@@ -209,7 +210,7 @@ pub fn core(
                         }
                     }
                     if should_capture {
-                        output_buffer_clone.lock().unwrap().extend_from_slice(chunk);
+                        output_buffer_clone.lock().extend_from_slice(chunk);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -228,7 +229,7 @@ pub fn core(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    *last_output_err.lock().unwrap() = std::time::Instant::now();
+                    *last_output_err.lock() = std::time::Instant::now();
                     let chunk = &buf[..n];
                     for line in chunk.split(|&b| b == b'\n') {
                         if !line.is_empty() {
@@ -247,7 +248,7 @@ pub fn core(
                 handle_out.join().ok();
                 handle_err.join().ok();
                 let output_str = if output_return {
-                    String::from_utf8_lossy(&output_buffer.lock().unwrap()).to_string()
+                    String::from_utf8_lossy(&output_buffer.lock()).to_string()
                 } else {
                     String::new()
                 };
@@ -266,7 +267,7 @@ pub fn core(
                 }
             }
             None => {
-                let silent_for = last_output.lock().unwrap().elapsed();
+                let silent_for = last_output.lock().elapsed();
                 if output_timeout && silent_for >= timeout_duration {
                     log::info!(
                         "Process did not write any output for {} seconds. Killing it.",

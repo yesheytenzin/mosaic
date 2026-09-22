@@ -33,6 +33,7 @@ futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false }
 tar = "0.4"
 xz2 = "0.1"
+parking_lot = "0.12"
 
 [dev-dependencies]
 assert_cmd = "2.0"

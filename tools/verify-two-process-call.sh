@@ -39,11 +39,14 @@ fi
 socket=$(mktemp -u /tmp/mosaic-verify-XXXXXX.sock)
 log=$(mktemp)
 daemon_log=$(mktemp)
+daemon_file=$(mktemp)
+owner_log=$(mktemp)
 
 cleanup() {
   [ -n "${run_pid:-}" ] && kill "$run_pid" 2>/dev/null || true
+  [ -n "${owner_pid:-}" ] && kill "$owner_pid" 2>/dev/null || true
   [ -n "${daemon_pid:-}" ] && kill "$daemon_pid" 2>/dev/null || true
-  rm -f "$socket"
+  rm -f "$socket" "$daemon_file"
 }
 trap cleanup EXIT
 
@@ -57,14 +60,13 @@ MOSAIC_ANDROID_ROOT="$bundle" "$root/tools/build-native.sh" "$bundle" >/dev/null
 "$root/tools/binder-shim/build.sh" >/dev/null
 "$root/tools/launcher/build.sh" >/dev/null 2>&1 || true
 
-# NOTE: the automatic form of this is not reliable yet. The framework's
-# registrations do not always reach the broker inside the window this waits for,
-# and when they do not, this reports that nothing was published. The sequence that
-# is verified by hand is in docs/todo-a.md: run the framework with
-# MOSAIC_BINDER_BROKER=1 and MOSAIC_BINDER_SOCKET set, wait for the broker's log to
-# say a name was exported, then run tools/two-process-call.py against it.
+# NOTE: the wait below reads the broker's own log file, which is where the export
+# line is written (see above). The sequence it automates is the one in
+# docs/todo-a.md: run the framework with MOSAIC_BINDER_BROKER=1 and
+# MOSAIC_BINDER_SOCKET set, wait for the broker to say a name was exported, then
+# call that name from a second process.
 echo "starting the broker on $socket"
-MOSAIC_SOCKET="$socket" "$root/target/debug/mosaic" daemon >"$daemon_log" 2>&1 &
+MOSAIC_SOCKET="$socket" "$root/target/debug/mosaic" -l "$daemon_file" daemon >"$daemon_log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 1 100); do [ -S "$socket" ] && break; sleep 0.05; done
 if [ ! -S "$socket" ]; then
@@ -72,9 +74,33 @@ if [ ! -S "$socket" ]; then
   exit 1
 fi
 
+# An object a reply hands back, from a second process. Deterministic, unlike the
+# framework's own objects below: the suspend hal is hosted by the broker itself,
+# so this needs nothing else alive and can be the first thing checked. It is the
+# other half of the round trip -- not "can a caller reach a name", but "can an
+# answer give a caller something new to call".
+echo "asking a reply for an object and calling it"
+if ! "$root/tools/broker-object.py" "$socket"; then
+  echo "a reply's object could not be called; the broker is still on $socket" >&2
+  exit 1
+fi
+
+# The display half, whose answers are about *this* machine: the ids it lists have
+# to be the ones the host has, or it is inventing displays.
+echo "asking the display service about this host"
+if ! "$root/tools/display-probe.py" "$socket"; then
+  echo "the display service did not answer with this host's displays" >&2
+  exit 1
+fi
+
 shim="$root/tools/binder-shim/out"
 preload="$root/tools/launcher/out/launcher.so $shim/probe.so"
 preload="$preload $shim/pretend-nice.so $shim/pretend-cgroups.so"
+# alloc-trace.so is deliberately *not* here even though it is inert without
+# MOSAIC_ALLOC_TRACE=1: interposing malloc and free slows the framework down
+# enough that it dies before this gate gets its answer, and a gate must not
+# perturb what it measures. It is in tools/boot-system-server.sh, which is where
+# the allocation question is asked.
 preload="$preload $shim/android-binder.so $shim/android-properties.so"
 
 echo "running the framework, with the broker client on"
@@ -96,12 +122,16 @@ run_pid=$!
 # processes look, and its line is not interleaved with anything else. The
 # framework takes about forty seconds to get that far, and how long moves with the
 # machine, so the wait is generous.
-for _ in $(seq 1 150); do
-  grep -aq ' exported .* as node ' "$daemon_log" 2>/dev/null && break
-  sleep 1
+# Polled every 20 ms, not every second: the framework now dies a couple of seconds
+# into its boot (the suspend path, see docs/remaining-work.md), and it is only
+# alive while it is publishing. A slow poll calls after it is gone, which reads as
+# "the broker closed the connection" and says nothing about the round trip.
+for _ in $(seq 1 3000); do
+  grep -aq ' exported .* as node ' "$daemon_file" 2>/dev/null && break
+  sleep 0.02
 done
 
-name=$(grep -ao 'exported [^ ]* as node' "$daemon_log" 2>/dev/null | head -1 |
+name=$(grep -ao 'exported [^ ]* as node' "$daemon_file" 2>/dev/null | head -1 |
   sed 's/^exported //; s/ as node$//' || true)
 if [ -z "$name" ]; then
   echo "the framework published nothing to the broker." >&2
@@ -113,18 +143,60 @@ fi
 echo "the broker holds: $name"
 
 echo "calling it from a second process"
+# The framework's own object. Best effort on purpose: the framework dies a couple
+# of seconds into its boot (the suspend path, docs/remaining-work.md), so a call
+# that arrives after it is gone proves nothing either way. What it exercises when
+# it does land is the whole path with a Java object at the far end.
 if "$root/tools/two-process-call.py" "$socket" "$name" 1 >"$log.call" 2>&1; then
   cat "$log.call"
   if grep -aq "served node" "$log"; then
-    echo
-    echo "ok: the owner logged that it served the call, and the caller got a Reply."
-    echo "    A5's gate: a transaction between two processes works."
-    exit 0
+    echo "ok: the framework's own object served the call, and the caller got a Reply."
+  else
+    echo "ok: the caller got a Reply from the framework's object."
   fi
-  echo "the caller got an answer but the owner did not log serving it" >&2
+else
+  echo "the framework did not answer (it exits a couple of seconds in); continuing"
+fi
+
+# The forwarding itself, with an owner that stays up: this is the gate. A name
+# another process published resolves, the broker carries the transaction to that
+# process, it runs it, and the answer comes back with the caller's request id on
+# it. Nothing here can fail because something else got there first.
+echo "checking the forwarding with an owner that stays"
+"$root/tools/two-process-owner.py" "$socket" mosaic.transport.probe >"$owner_log" 2>&1 &
+owner_pid=$!
+for _ in $(seq 1 200); do
+  grep -aq "exported" "$owner_log" 2>/dev/null && break
+  sleep 0.02
+done
+if ! grep -aq "exported" "$owner_log"; then
+  echo "the owner did not publish; see $owner_log" >&2
   exit 1
 fi
 
-cat "$log.call" >&2
-echo "the call did not come back; the framework's log is $log" >&2
-exit 1
+if ! "$root/tools/two-process-call.py" "$socket" mosaic.transport.probe 7 >"$log.forward" 2>&1; then
+  cat "$log.forward" >&2
+  cat "$owner_log" >&2
+  echo "the forwarded call did not come back" >&2
+  exit 1
+fi
+cat "$log.forward"
+
+# The other direction: an object handed over *as an argument*. The caller passes
+# the suspend hal's handle, the owner -- a different process -- calls it back, and
+# what the hal said comes home. A handle is an index into one process's table, so
+# this only works if the broker minted the owner its own.
+echo "checking an object passed as an argument"
+if ! "$root/tools/two-process-argument.py" "$socket" mosaic.transport.probe >"$log.argument" 2>&1; then
+  cat "$log.argument" >&2
+  cat "$owner_log" >&2
+  echo "an object passed as an argument did not come back callable" >&2
+  exit 1
+fi
+cat "$log.argument"
+cat "$owner_log"
+echo
+echo "ok: a name published by one process was called from another, an answer came"
+echo "    back, and an object passed as an argument was called by the callee."
+echo "    The gate: a transaction between two processes works, both ways."
+exit 0

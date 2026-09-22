@@ -50,9 +50,34 @@ socket by `src/binder/transport.rs`.
       now copied into a fresh Parcel instead. On by default; `MOSAIC_BINDER_BROKER=0`
       turns it off for a harness with no broker to talk to.
 
-      What it cannot carry yet is a binder object among a transaction's
-      arguments, which the copy does not preserve -- nothing in the boot path
-      sends one.
+      A binder object in an *answer* is carried now, and that is a different
+      thing from one in the arguments. `Answer` on the Rust side names objects
+      inside its data (`ObjectRef`/`Handed`), the transport sees a node and the
+      caller's table and writes the caller's handle where the object word is, the
+      wire appends the offsets after the data, and the shim writes each one
+      through libbinder's own object writer so that it lands in the caller's
+      object table -- an object missing from that table is refused rather than
+      handed over. `ISystemSuspend.acquireWakeLock` is the first user: it used to
+      answer with a null object, and the framework's `disableAutoSuspend` asserts
+      the lock it asked for is not null.
+
+      The *argument* direction is carried now too, and it is the mirror: a
+      caller passing the binder it owns into a transaction. The sender's shim
+      finds the objects in the request parcel (from libbinder's own object table,
+      which is the only thing that knows where they are -- the bytes alone cannot
+      say), exports a local one as an unnamed node and leaves a handle one alone
+      with a node of zero; the broker resolves each into a node, checks that the
+      sender is entitled to it, and writes the *callee's* handle into the object
+      word before forwarding; the callee's shim writes those objects through
+      libbinder's writer as it rebuilds the request parcel, so the callee's
+      object table holds them. The node rides in the object word's cookie, which
+      is what lets a process handed its own object back recognize it and get the
+      local binder rather than a proxy that would call itself through the broker.
+
+      Verified across three processes: `tools/two-process-argument.py` passes the
+      suspend hal's handle to another process's object, that process calls it
+      back, and what the hal said comes home (`tools/two-process-owner.py` does
+      the calling). Both directions are in the gate.
 
       The sequence, to reproduce it by hand:
 
@@ -75,9 +100,10 @@ socket by `src/binder/transport.rs`.
       window, and it then reports that nothing was published. The manual sequence
       is the one that is verified.
 
-*The defect, with the measurements.* The framework's own services do not reach the
-registry, so a second process cannot reach one. It is not the request format and not
-an empty object table; three Java `addService` requests, dumped as they arrive:
+*The defect, with the measurements — fixed, and kept for the record.* The
+framework's own services did not reach the registry, so a second process could not
+reach one. It was not the request format and not an empty object table; three Java
+`addService` requests, dumped as they arrive:
 
 | service | request size | name ends at | object table | first offset |
 | --- | --- | --- | --- | --- |
@@ -136,16 +162,21 @@ Next, in order:
    `readStrongBinder`, which is the only reason the hand parse was abandoned
 
 *Gate:* a service registered by name is found by name and a transaction reaches
-it. **Met for the AIDL path only, and the box is open because of it.** The broker's
-own tests and `tools/binder-probe.py` pass, and the framework's
-`AServiceManager_addService` registrations land and are found -- `memtrack.proxy`
-and `android.frameworks.stats.IStats/default`. The framework's *Java*
-registrations do not land at all, which is the defect below: `activity_task`,
-`platform_compat`, `file_integrity`, `uri_grants`, `powerstats` and every other
-`ServiceManager.addService` are read as having no binder object, so a second
-process cannot reach them. This box was marked done on the strength of the AIDL
-half and the defect was recorded underneath rather than reopening it, which was the
-wrong way round.
+it. **Met.** Both halves:
+
+- The **AIDL** path: `AServiceManager_addService` registrations land and are found
+  (`memtrack.proxy`, `android.frameworks.stats.IStats/default`), and the object is
+  now *kept alive* — `AIBinder_incStrong` at registration, never released, the way
+  the Java door's `readStrongBinder` leaves a reference behind. Without it the
+  caller's reference went away with the caller and the registry answered a stale
+  pointer as absent (one `no longer looks like an object` line per boot).
+- The **Java** path: `activity_task`, `platform_compat`, `file_integrity`,
+  `uri_grants`, `powerstats` and the rest of `ServiceManager.addService` land, are
+  published to the broker, and are handed back — verified from a boot log, and from
+  a second process calling one of them (`tools/verify-two-process-call.sh`).
+
+The measurements above are kept because they are what the bug *looked* like; the
+resolution is in `docs/remaining-work.md` under "Where the system server is now".
 
 ## A3. Reference counting and lifetime ✅
 
@@ -250,17 +281,29 @@ Done: `/vendor`, `/product`, `/system_ext`, `/odm`, and the vendor library list.
 Done: the trie has a catch-all prefix and the write path is in the shim. The
 failing property was 34 characters against libc's 32-character limit.
 
+## A6. `SurfaceFlinger`'s display half [OK]
+
+`src/device/surfaceflinger.rs`, hosted under the name `DisplayManagerService` waits
+for. Real data from the host (`/sys/class/drm`), two interfaces told apart by the
+interface token, codes and layouts taken from the bundle's own branch and its own
+`libgui.so`. The compositing half (`createConnection`, vsync, surfaces) answers
+null and says so.
+
 ## What is left of A
 
-The binder path is answered. The system server now stops on something that is not
-a binder problem: it waits for `installd`, a native daemon on a device, and
+The binder path is answered, and so are the three services that used to stop the
+boot: `installd` (A9), `SurfaceFlinger`'s display half (A6), and the wake lock the
+suspend path asks for. The system server now runs every bootstrap service and
+reaches the boot phases of `startOtherServices` (30 `OnBootPhase` stages).
 
-```
-Installer: installd not found; trying again
-```
+What stops it there is the **frame clock**: `DisplayManagerService` times out
+waiting for a default display because `LocalDisplayAdapter` builds its device on a
+`DisplayEventReceiver`, and the receiver fails to initialize. The connection object
+and its channel are real and verified from another process (two live descriptors);
+the framework's own end reports `EBADF` when it uses the descriptor it was handed,
+so the next step is inside its `DisplayEventReceiver` initialization rather than on
+this side of the wire.
 
-repeats until the run ends. The service manager is telling the truth -- there is no
-installd -- and the fix is for one to exist. Two ways, and they are the same work
-seen from two sides: implement the AIDL service in Rust and host it in the broker,
-and have the shim forward a lookup it cannot answer to the broker over the socket.
-That is what `src/binder/transport.rs` was built for, and it is the next item.
+After that, the compositing half of the windowing phase (ADR-0006): surfaces,
+`BLASTBufferQueue`, dma-buf, EGL. That is a subsystem, and it is section D of
+`docs/remaining-work.md`.

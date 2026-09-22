@@ -10,12 +10,16 @@
 //! else to do until the answer arrives.
 
 use crate::binder::broker::{BinderBroker, ClientId, Dispatch};
-use crate::binder::wire::{Conn, Frame, Message, Reader, Writer, NO_HANDLE, TF_ONE_WAY};
+use crate::binder::table::Target;
+use crate::binder::wire::{
+    ArgumentRef, Conn, Frame, Message, Reader, Writer, NO_HANDLE, TF_ONE_WAY,
+};
 use crate::binder::BinderObject;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long a forwarded transaction waits for the process that owns the
@@ -28,10 +32,17 @@ pub struct Transport {
     broker: Mutex<BinderBroker>,
     peers: Mutex<HashMap<ClientId, Arc<Peer>>>,
     /// Where an answer from a process goes when it comes back. Keyed by the
-    /// process that was asked and the node it was asked about, because one
-    /// connection runs one transaction at a time.
-    pending: Mutex<HashMap<(ClientId, u64), SyncSender<Frame>>>,
+    /// process that was asked, the node it was asked about, *and the request*:
+    /// one node can have several transactions in flight, and a node on its own
+    /// cannot tell one answer from another.
+    /// An in-flight forwarded call: who asked, and where their answer goes. The
+    /// caller is here because the answer may carry objects, and a handle is only
+    /// meaningful beside the table it belongs to.
+    pending: Mutex<Pending>,
 }
+
+/// In-flight forwarded calls, by the node, the owner and the request.
+type Pending = HashMap<(ClientId, u64, u32), (ClientId, SyncSender<Frame>)>;
 
 struct Peer {
     writer: Mutex<Writer>,
@@ -40,10 +51,15 @@ struct Peer {
 /// One transaction as the caller sent it, kept together because it travels
 /// through the broker and then to whichever process owns the object.
 struct Call {
+    /// The caller's name for this request, echoed back with the answer.
+    id: u32,
     handle: u32,
     code: u32,
     flags: u32,
     data: Vec<u8>,
+    /// Objects among the arguments, which the broker resolves into the owner's
+    /// handles before the call is forwarded.
+    objects: Vec<ArgumentRef>,
     fds: Vec<std::os::fd::OwnedFd>,
 }
 
@@ -65,12 +81,12 @@ impl Transport {
     /// Host an object in the broker, so every process can reach it without a
     /// second process existing to provide it.
     pub fn host(&self, name: &str, object: Box<dyn BinderObject>) -> u64 {
-        self.broker.lock().unwrap().host(name, object)
+        self.broker.lock().host(name, object)
     }
 
     /// The names currently registered, for the control plane and for logging.
     pub fn names(&self) -> Vec<String> {
-        self.broker.lock().unwrap().names()
+        self.broker.lock().names()
     }
 
     /// Serve one connection until it goes away. Blocking: the caller gives it a
@@ -79,24 +95,23 @@ impl Transport {
         let fd = stream.as_raw_fd();
         let pid = peer_pid(fd)?;
         let (reader, writer) = Conn::new(fd).split();
-        let client = self.broker.lock().unwrap().connect(pid);
+        let client = self.broker.lock().connect(pid);
         let peer = Arc::new(Peer {
             writer: Mutex::new(writer),
         });
-        self.peers.lock().unwrap().insert(client, peer);
+        self.peers.lock().insert(client, peer);
 
         let result = self.session(client, reader);
 
-        let notices = self.broker.lock().unwrap().disconnect(client);
-        self.peers.lock().unwrap().remove(&client);
+        let notices = self.broker.lock().disconnect(client);
+        self.peers.lock().remove(&client);
         self.pending
             .lock()
-            .unwrap()
-            .retain(|(owner, _), _| *owner != client);
+            .retain(|(owner, _, _), _| *owner != client);
         for notice in notices {
-            let target = self.peers.lock().unwrap().get(&notice.client).cloned();
+            let target = self.peers.lock().get(&notice.client).cloned();
             if let Some(target) = target {
-                let _ = target.writer.lock().unwrap().send(
+                let _ = target.writer.lock().send(
                     &Message::Dead {
                         handle: notice.handle,
                     },
@@ -115,43 +130,63 @@ impl Transport {
                 Message::Bye => return Ok(()),
 
                 Message::Transaction {
+                    id,
                     handle,
                     code,
                     flags,
                     data,
+                    objects,
                 } => self.transaction(
                     client,
                     Call {
+                        id,
                         handle,
                         code,
                         flags,
                         data,
+                        objects,
                         fds: frame.fds,
                     },
                 )?,
 
-                Message::IncomingReply { node, status, data } => {
-                    let waiter = self.pending.lock().unwrap().remove(&(client, node));
+                // Matched by the request it answers, not by the node: one node
+                // can have several transactions in flight, and the node alone
+                // cannot tell one answer from another.
+                Message::IncomingReply {
+                    id,
+                    node,
+                    status,
+                    data,
+                    objects,
+                } => {
+                    let waiter = self.pending.lock().remove(&(client, node, id));
                     match waiter {
-                        Some(waiter) => {
+                        Some((caller, waiter)) => {
+                            let (data, objects) = self.reply_objects(client, caller, data, objects);
                             let _ = waiter.send(Frame {
-                                message: Message::Reply { status, data },
+                                message: Message::Reply {
+                                    id,
+                                    status,
+                                    data,
+                                    objects,
+                                },
                                 fds: frame.fds,
                             });
                         }
                         None => log::debug!(
-                            "client {} answered node {} with nobody waiting",
+                            "client {} answered node {} with nobody waiting for request {}",
                             client,
-                            node
+                            node,
+                            id
                         ),
                     }
                 }
 
                 Message::Acquire { handle } => {
-                    self.broker.lock().unwrap().acquire(client, handle)?;
+                    self.broker.lock().acquire(client, handle)?;
                 }
                 Message::Release { handle } => {
-                    let released = self.broker.lock().unwrap().release(client, handle)?;
+                    let released = self.broker.lock().release(client, handle)?;
                     log::trace!(
                         "client {} released handle {} ({:?})",
                         client,
@@ -160,24 +195,21 @@ impl Transport {
                     );
                 }
                 Message::IncRefs { handle } => {
-                    self.broker.lock().unwrap().inc_refs(client, handle)?;
+                    self.broker.lock().inc_refs(client, handle)?;
                 }
                 Message::DecRefs { handle } => {
-                    self.broker.lock().unwrap().dec_refs(client, handle)?;
+                    self.broker.lock().dec_refs(client, handle)?;
                 }
 
                 Message::LinkToDeath { handle } => {
-                    self.broker.lock().unwrap().link_to_death(client, handle)?;
+                    self.broker.lock().link_to_death(client, handle)?;
                 }
                 Message::UnlinkToDeath { handle } => {
-                    self.broker
-                        .lock()
-                        .unwrap()
-                        .unlink_to_death(client, handle)?;
+                    self.broker.lock().unlink_to_death(client, handle)?;
                 }
 
                 Message::Export { name, node } => {
-                    match self.broker.lock().unwrap().export(client, &name, node) {
+                    match self.broker.lock().export(client, &name, node) {
                         Ok(()) => {
                             log::debug!("client {} exported {} as node {}", client, name, node)
                         }
@@ -185,15 +217,17 @@ impl Transport {
                     }
                 }
 
-                Message::Lookup { name } => {
-                    let found = self.broker.lock().unwrap().lookup(client, &name);
+                Message::Lookup { id, name } => {
+                    let found = self.broker.lock().lookup(client, &name);
                     let answer = match found {
                         Some((handle, node, owner)) => Message::Found {
+                            id,
                             handle,
                             node,
                             owner,
                         },
                         None => Message::Found {
+                            id,
                             handle: NO_HANDLE,
                             node: 0,
                             owner: 0,
@@ -207,19 +241,101 @@ impl Transport {
         }
     }
 
+    /// The objects a callee answered with, rewritten for the caller.
+    ///
+    /// Each one is a handle in the *callee's* table, and the caller has its own:
+    /// passing the number through would point at whatever happens to sit at that
+    /// number there, which is worse than failing. This looks each one up and mints
+    /// the caller's own handle for it.
+    fn reply_objects(
+        &self,
+        callee: ClientId,
+        caller: ClientId,
+        mut data: Vec<u8>,
+        objects: Vec<u32>,
+    ) -> (Vec<u8>, Vec<u32>) {
+        let mut broker = self.broker.lock();
+        let mut rewritten = Vec::with_capacity(objects.len());
+        for offset in objects {
+            let at = offset as usize;
+            if at + 28 > data.len() {
+                continue;
+            }
+            let handle = u32::from_le_bytes(data[at + 8..at + 12].try_into().unwrap_or([0; 4]));
+            let node = match broker.target_of(callee, handle) {
+                Some(Target::Remote { node, .. }) | Some(Target::Local(node)) => node,
+                _ => continue,
+            };
+            let Some(caller_handle) = broker.handle_for(caller, node) else {
+                continue;
+            };
+            crate::binder::broker::write_handle(&mut data, at, caller_handle, node);
+            rewritten.push(offset);
+        }
+        (data, rewritten)
+    }
+
     fn transaction(&self, client: ClientId, call: Call) -> anyhow::Result<()> {
-        let dispatch = self.broker.lock().unwrap().transact(
+        let dispatch = match self.broker.lock().transact(
             client,
             call.handle,
             call.code,
             call.flags,
             call.data.clone(),
-        )?;
+            call.objects.clone(),
+        ) {
+            Ok(dispatch) => dispatch,
+            // A transaction the broker cannot route is the caller's problem, not
+            // the connection's. Failing the session here -- which is what this did
+            // -- closed the socket, and every later call from that process then
+            // failed with "sending to the broker failed" for the rest of its life:
+            // one unroutable handle cost the whole process its transport. The
+            // answer is a failed transaction, which is what a driver gives.
+            Err(e) => {
+                log::warn!(
+                    "client {} sent a transaction that cannot be routed: {}",
+                    client,
+                    e
+                );
+                if call.flags & TF_ONE_WAY == 0 {
+                    self.to_peer(
+                        client,
+                        Message::Reply {
+                            id: call.id,
+                            status: -129, // EX_TRANSACTION_FAILED
+                            data: e.to_string().into_bytes(),
+                            objects: Vec::new(),
+                        },
+                        &[],
+                    )?;
+                }
+                return Ok(());
+            }
+        };
 
         match dispatch {
-            Dispatch::Reply { status, data } => {
+            Dispatch::Reply {
+                status,
+                data,
+                objects,
+                fds,
+            } => {
                 if call.flags & TF_ONE_WAY == 0 {
-                    self.to_peer(client, Message::Reply { status, data }, &[])?;
+                    // The descriptors go with the frame: the answer says where
+                    // their words are, and the frame carries the descriptors
+                    // themselves, which is how they cross into the caller's
+                    // process at all.
+                    let raw: Vec<RawFd> = fds.iter().map(|(_, fd)| fd.as_raw_fd()).collect();
+                    self.to_peer(
+                        client,
+                        Message::Reply {
+                            id: call.id,
+                            status,
+                            data,
+                            objects,
+                        },
+                        &raw,
+                    )?;
                 }
             }
             Dispatch::Local { node } => {
@@ -234,8 +350,10 @@ impl Transport {
                     self.to_peer(
                         client,
                         Message::Reply {
+                            id: call.id,
                             status: -1,
                             data: b"a local object is called directly".to_vec(),
+                            objects: Vec::new(),
                         },
                         &[],
                     )?;
@@ -250,45 +368,48 @@ impl Transport {
     /// answer to whoever asked.
     fn forward(
         &self,
-        client: ClientId,
+        caller: ClientId,
         owner: ClientId,
         node: u64,
         call: Call,
     ) -> anyhow::Result<()> {
         let (sender, receiver) = sync_channel(1);
-        self.pending.lock().unwrap().insert((owner, node), sender);
+        self.pending
+            .lock()
+            .insert((owner, node, call.id), (caller, sender));
         let descriptors: Vec<RawFd> = call.fds.iter().map(|fd| fd.as_raw_fd()).collect();
         self.to_peer(
             owner,
             Message::Incoming {
-                from: client,
+                id: call.id,
                 node,
                 code: call.code,
                 flags: call.flags,
                 data: call.data,
+                objects: call.objects.iter().map(|object| object.offset).collect(),
             },
             &descriptors,
         )?;
 
         if call.flags & TF_ONE_WAY != 0 {
-            self.pending.lock().unwrap().remove(&(owner, node));
+            self.pending.lock().remove(&(owner, node, call.id));
             return Ok(());
         }
 
         let answer = receiver.recv_timeout(FORWARD_TIMEOUT);
-        self.pending.lock().unwrap().remove(&(owner, node));
+        self.pending.lock().remove(&(owner, node, call.id));
         let answer = answer
             .map_err(|_| anyhow::anyhow!("no answer for node {} from client {}", node, owner))?;
         let fds: Vec<RawFd> = answer.fds.iter().map(|fd| fd.as_raw_fd()).collect();
-        self.to_peer(client, answer.message, &fds)
+        self.to_peer(caller, answer.message, &fds)
     }
 
     fn to_peer(&self, client: ClientId, message: Message, fds: &[RawFd]) -> anyhow::Result<()> {
-        let peer = self.peers.lock().unwrap().get(&client).cloned();
+        let peer = self.peers.lock().get(&client).cloned();
         let peer = peer.ok_or_else(|| anyhow::anyhow!("no connection for client {}", client))?;
         // The lock on the writer is taken after the map's is dropped, so a slow
         // connection cannot hold up everyone else's routing.
-        let sent = peer.writer.lock().unwrap().send(&message, fds);
+        let sent = peer.writer.lock().send(&message, fds);
         sent
     }
 }
@@ -308,13 +429,16 @@ fn peer_pid(fd: RawFd) -> anyhow::Result<u32> {
 mod tests {
     use super::*;
     use crate::binder::wire::MAX_FDS;
+    use crate::binder::Answer;
     use std::os::unix::net::{UnixListener, UnixStream};
 
     struct Echo;
 
     impl BinderObject for Echo {
-        fn transact(&mut self, code: u32, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-            Ok([b"echo:".as_slice(), &code.to_be_bytes(), data].concat())
+        fn transact(&mut self, code: u32, data: &[u8]) -> anyhow::Result<Answer> {
+            Ok([b"echo:".as_slice(), &code.to_be_bytes(), data]
+                .concat()
+                .into())
         }
     }
 
@@ -361,6 +485,58 @@ mod tests {
         }
     }
 
+    /// An object the broker hosts that answers with a descriptor, which is the
+    /// shape a display event connection has.
+    struct HandingDescriptor;
+
+    impl BinderObject for HandingDescriptor {
+        fn transact(&mut self, _code: u32, _data: &[u8]) -> anyhow::Result<Answer> {
+            let (a, _b) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::SeqPacket,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )?;
+            let mut reply = crate::binder::parcel::Parcel::new();
+            reply.ok();
+            let offset = reply.fd_placeholder();
+            Ok(Answer::from(reply.into_bytes()).handing_fd(offset, a))
+        }
+    }
+
+    #[test]
+    fn a_reply_can_carry_a_descriptor() {
+        let mut h = harness();
+        let node = h
+            .transport
+            .host("descriptor.svc", Box::new(HandingDescriptor));
+        let handle = find(&mut h.caller, "descriptor.svc");
+        assert!(node != 0 && handle != u32::MAX);
+
+        h.caller
+            .send(
+                &Message::Transaction {
+                    id: 1,
+                    handle,
+                    code: 1,
+                    flags: 0,
+                    data: Vec::new(),
+                    objects: Vec::new(),
+                },
+                &[],
+            )
+            .unwrap();
+        let frame = h.caller.recv().unwrap();
+        // The descriptor crosses with the frame: the word in the data says where it
+        // belongs, and the frame carries the descriptor itself.
+        assert_eq!(frame.fds.len(), 1, "the answer carried a descriptor");
+        let Message::Reply { data, objects, .. } = frame.message else {
+            panic!("expected an answer")
+        };
+        assert_eq!(objects, vec![4]);
+        assert!(data.len() >= 4 + 28);
+    }
+
     fn connect(path: &std::path::Path) -> UnixStream {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -382,6 +558,7 @@ mod tests {
         loop {
             conn.send(
                 &Message::Lookup {
+                    id: 1,
                     name: name.to_string(),
                 },
                 &[],
@@ -407,6 +584,7 @@ mod tests {
     fn settle(conn: &mut Conn) {
         conn.send(
             &Message::Lookup {
+                id: 2,
                 name: "nothing.sync".to_string(),
             },
             &[],
@@ -449,16 +627,23 @@ mod tests {
 
         conn.send(
             &Message::Transaction {
+                id: 1,
                 handle,
                 code: 7,
                 flags: 0,
                 data: b"parcel".to_vec(),
+                objects: Vec::new(),
             },
             &[],
         )
         .unwrap();
         match conn.recv().unwrap().message {
-            Message::Reply { status, data } => {
+            Message::Reply {
+                id: 1,
+                status,
+                data,
+                ..
+            } => {
                 assert_eq!(status, 0);
                 assert_eq!(&data[..5], b"echo:");
                 assert_eq!(&data[5..9], &7u32.to_be_bytes());
@@ -490,18 +675,20 @@ mod tests {
         h.caller
             .send(
                 &Message::Transaction {
+                    id: 1,
                     handle,
                     code: 3,
                     flags: 0,
                     data: b"who is it".to_vec(),
+                    objects: Vec::new(),
                 },
                 &[],
             )
             .unwrap();
 
-        let from = match h.owner.recv().unwrap().message {
+        let id = match h.owner.recv().unwrap().message {
             Message::Incoming {
-                from,
+                id,
                 node: asked,
                 code,
                 data,
@@ -510,25 +697,35 @@ mod tests {
                 assert_eq!(asked, node);
                 assert_eq!(code, 3);
                 assert_eq!(data, b"who is it");
-                from
+                id
             }
             other => panic!("expected Incoming, got {:?}", other),
         };
-        assert!(from > 0, "the caller is named so the answer can be routed");
+        assert!(
+            id > 0,
+            "the request is named so the answer can be matched to it"
+        );
 
         h.owner
             .send(
                 &Message::IncomingReply {
+                    id,
                     node,
                     status: 0,
                     data: b"the owner".to_vec(),
+                    objects: Vec::new(),
                 },
                 &[],
             )
             .unwrap();
 
         match h.caller.recv().unwrap().message {
-            Message::Reply { status, data } => {
+            Message::Reply {
+                id: 1,
+                status,
+                data,
+                ..
+            } => {
                 assert_eq!(status, 0);
                 assert_eq!(data, b"the owner");
             }
@@ -562,10 +759,12 @@ mod tests {
         h.caller
             .send(
                 &Message::Transaction {
+                    id: 1,
                     handle,
                     code: 1,
                     flags: 0,
                     data: Vec::new(),
+                    objects: Vec::new(),
                 },
                 &[file.as_raw_fd()],
             )
@@ -584,9 +783,11 @@ mod tests {
         h.owner
             .send(
                 &Message::IncomingReply {
+                    id: 1,
                     node,
                     status: 0,
                     data: Vec::new(),
+                    objects: Vec::new(),
                 },
                 &[],
             )
@@ -638,16 +839,23 @@ mod tests {
         h.caller
             .send(
                 &Message::Transaction {
+                    id: 1,
                     handle,
                     code: 1,
                     flags: 0,
                     data: b"register".to_vec(),
+                    objects: Vec::new(),
                 },
                 &[],
             )
             .unwrap();
         match h.caller.recv().unwrap().message {
-            Message::Reply { status, data } => {
+            Message::Reply {
+                id: 1,
+                status,
+                data,
+                ..
+            } => {
                 assert_eq!(status, 0);
                 assert!(data.starts_with(b"echo:"));
             }
