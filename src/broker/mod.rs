@@ -79,8 +79,16 @@ pub async fn serve(args: &MosaicArgs) -> anyhow::Result<()> {
 
     let open = Arc::new(AtomicUsize::new(0));
     let binder = Arc::new(crate::binder::Transport::new());
+    // The device services the framework asks for by name have to be here before
+    // it asks: those lookups wait rather than fail, so a name nobody hosts is a
+    // boot that waits.
+    // What the device services need of this process's configuration: the runtime
+    // bundle is where the framework's `/data` and `/system` live.
+    let root = crate::runtime::resolve(&args.work)
+        .map(|(dir, _)| dir)
+        .unwrap_or_default();
+    crate::device::host_all(&binder, &root);
     monitor_idle(open.clone());
-
     loop {
         let (stream, _) = listener.accept().await?;
         open.fetch_add(1, Ordering::SeqCst);

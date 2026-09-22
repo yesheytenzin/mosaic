@@ -188,6 +188,51 @@ static jobjectArray build_args(void *table[], JNIEnvP env, const char *spec) {
 
 static int run_class(JNIEnvP env, const char *class_name, const char *args_spec);
 
+/* Give the framework's runtime its JavaVM back.
+ *
+ * libandroid_runtime keeps a pointer to the `AndroidRuntime` object its own entry
+ * point would have constructed, and `AndroidRuntime::getJavaVM()` returns that
+ * object's first member, `mJavaVM`. This launcher creates the VM itself -- the
+ * registrars have to be ordered and `AndroidRuntime::startReg` is not exported --
+ * so that pointer is null, and every framework path that asks the runtime for its
+ * env dereferences null: `AndroidRuntime::getJNIEnv()` does `vm->GetEnv(...)` on
+ * it. That is how `~NativeDisplayEventReceiver` took the system server down with a
+ * SIGSEGV when a display event receiver failed to initialize.
+ *
+ * The slot is found from `getJavaVM`'s own code rather than from a recorded
+ * offset, and written only if it is still null: `mov gCurRuntime(%rip),%rax` is
+ * `48 8b 05` followed by the displacement, which is the whole of that function.
+ * A build whose code does not look like that is left alone. */
+static void publish_runtime(void *runtime, JavaVM *vm) {
+    /* Through the handle this library was opened with: it was not opened
+     * RTLD_GLOBAL, so its symbols are not in the default scope. */
+    void *get_java_vm = dlsym(runtime, "_ZN7android14AndroidRuntime9getJavaVMEv");
+    if (!get_java_vm) return;
+    const unsigned char *code = (const unsigned char *)get_java_vm;
+    if (code[0] != 0x48 || code[1] != 0x8b || code[2] != 0x05) {
+        say("launcher: getJavaVM is not the shape this knows; leaving it alone\n");
+        return;
+    }
+    int displacement = 0;
+    __builtin_memcpy(&displacement, code + 3, 4);
+    unsigned char **slot = (unsigned char **)(code + 7 + displacement);
+    if (*slot) {
+        /* The object exists -- something constructed one -- but never got its VM,
+         * which is the state `startVm` would have left it out of. Its first member
+         * is the one `getJavaVM` reads, so that is where the VM goes. */
+        if (*(JavaVM **)*slot) return;
+        __builtin_memcpy(*slot, &vm, sizeof(vm));
+        say("launcher: the framework runtime object had no JavaVM; set it\n");
+        return;
+    }
+    /* No object at all: one big enough for the first member, which is the only one
+     * `getJavaVM` reads. */
+    static unsigned char runtime_object[256];
+    __builtin_memcpy(runtime_object, &vm, sizeof(vm));
+    *slot = runtime_object;
+    say("launcher: the framework runtime now has the JavaVM\n");
+}
+
 /* The host binary calls this from its main, which is late enough that the
  * environment exists and early enough to take over before the host's own main
  * body runs. The host is therefore any Bionic binary that creates a VM; its
@@ -223,6 +268,8 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
         fail("cannot open libandroid_runtime", runtime_path);
         exit(2);
     }
+
+    publish_runtime(runtime, *vm);
 
     /* The registrar has to come from the library Android would take it from, and
      * that is not always libandroid_runtime: register_android_graphics_classes is

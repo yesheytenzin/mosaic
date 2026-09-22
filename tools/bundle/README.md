@@ -112,4 +112,7 @@ Each of these cost more than an hour, and each is encoded in the tool.
 `build` reads an existing Android system image. The retired container port
 already downloaded one to `/var/lib/mosaic/images/system.img`, and that is what
 the record in [`docs/runtime-bundle.md`](../../docs/runtime-bundle.md) uses.
-Publishing a pinned bundle as a release artifact is still to do (ADR-0010).
+`pack` turns a built bundle into the two files a release serves, and
+[`../publish-runtime.sh`](../publish-runtime.sh) does the whole publication — pack,
+create the release, upload both assets — so a pinned bundle is published, not
+pending (ADR-0010).

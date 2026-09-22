@@ -27,6 +27,10 @@ KIND_INCOMING_REPLY = 12
 
 HEADER = ">BBHIIIQII"
 
+# The request's name, which the answer must come back with. Anything but zero
+# proves the id is carried end to end rather than defaulted.
+REQUEST_ID = 0x1234
+
 
 def send(sock, kind, a=0, b=0, c=0, node=0, data=b"", fd_count=0):
     sock.sendall(struct.pack(HEADER, kind, 1, 0, a, b, c, node, len(data), fd_count) + data)
@@ -60,9 +64,14 @@ def main(path, name, code):
     # A transaction with the code the caller was given. The owner is a Java
     # object in the other process, so an unknown code comes back as an error --
     # which is still the round trip finishing.
-    send(sock, KIND_TRANSACTION, a=handle, b=code, c=0, data=b"")
-    kind, status, _, _, _, body, fds = recv(sock)
-    print(f"answer: kind={kind} status={status} bytes={len(body)} fds={fds}")
+    send(sock, KIND_TRANSACTION, a=handle, b=code, c=0, node=REQUEST_ID, data=b"")
+    kind, status, answer_id, _, _, body, fds = recv(sock)
+    print(f"answer: kind={kind} status={status} bytes={len(body)} fds={fds} request={answer_id:#x}")
+    if kind == KIND_REPLY and answer_id != REQUEST_ID:
+        raise SystemExit(
+            f"the answer carries request {answer_id:#x}, not {REQUEST_ID:#x}: "
+            "an answer is not matched to the request that asked for it"
+        )
 
     send(sock, KIND_BYE)
     return 0 if kind == KIND_REPLY else 1

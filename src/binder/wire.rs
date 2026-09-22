@@ -45,19 +45,59 @@ const KIND_UNLINK: u8 = 14;
 /// A handle that names nothing, for [`Message::Found`].
 pub const NO_HANDLE: u32 = u32::MAX;
 
+/// Where the object count sits in a message whose header field also carries
+/// something else (a transaction's flags).
+///
+/// Transactions and the incoming form of them have no free header field -- `a` is
+/// the handle, `b` the code, `c` the flags, `node` the request id -- so the count
+/// goes in the upper half of `flags`, which the low bits of are all any reader
+/// uses. The refs themselves are appended to the body, exactly as a reply's
+/// offsets are, so a message with no objects is byte for byte what it always was.
+const OBJECT_SHIFT: u32 = 16;
+
+/// A binder object among a transaction's *arguments*: where it sits in the data,
+/// and what it is.
+///
+/// `node` is what the broker needs to resolve it. A process may pass an object it
+/// owns, named by its node; or `0`, meaning the four bytes at `offset` are a
+/// handle in *this sender's* table. Either way what the callee gets is a different
+/// handle -- minted for the callee's table -- which is why the ref has to travel
+/// at all: a handle is only a number until it is looked up in the table it came
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgumentRef {
+    pub offset: u32,
+    pub node: u64,
+}
+
 /// One message on the data plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// A transaction. The handle is in the sender's table.
+    /// A transaction. The handle is in the sender's table. `id` names the
+    /// request, so an answer that arrives late can be told apart from the answer
+    /// to something asked afterwards.
     Transaction {
+        id: u32,
         handle: u32,
         code: u32,
         flags: u32,
         data: Vec<u8>,
+        /// Objects among the arguments, which the broker resolves for the callee.
+        objects: Vec<ArgumentRef>,
     },
-    /// The answer to a transaction. `status` is negative on failure, as
-    /// Binder's own statuses are.
-    Reply { status: i32, data: Vec<u8> },
+    /// The answer to a transaction. `status` is negative on failure, as Binder's
+    /// own statuses are.
+    ///
+    /// `objects` names the binder objects *inside* `data`, by offset: a reply can
+    /// hand the caller an object (a display token, a wake lock), and an object is
+    /// not just bytes to a Parcel -- the caller has to be told where it is so it
+    /// can be registered on the receiving side. Empty for most replies.
+    Reply {
+        id: u32,
+        status: i32,
+        data: Vec<u8>,
+        objects: Vec<u32>,
+    },
     /// A strong reference taken.
     Acquire { handle: u32 },
     /// A strong reference dropped.
@@ -68,29 +108,41 @@ pub enum Message {
     DecRefs { handle: u32 },
     /// A service this process was using has died.
     Dead { handle: u32 },
-    /// The broker asking the owner of a node to run a transaction. The owner
-    /// is named by `from`, so its answer can be routed back.
+    /// The broker asking the owner of a node to run a transaction. `id` is the
+    /// caller's, and the owner echoes it so the answer is matched to the request
+    /// that asked for it rather than to whatever is waiting on that node.
     Incoming {
-        from: u32,
+        id: u32,
         node: u64,
         code: u32,
         flags: u32,
         data: Vec<u8>,
+        /// Where the objects among the arguments are, once the broker has written
+        /// this owner's handles into them. Offsets alone: the object words in the
+        /// data already say what each one is.
+        objects: Vec<u32>,
     },
     /// The answer to an [`Message::Incoming`]. Separate from `Reply` on
     /// purpose: a process can be asked to run one while it is waiting for an
     /// answer of its own, and the two must not be confused.
     IncomingReply {
+        id: u32,
         node: u64,
         status: i32,
         data: Vec<u8>,
+        objects: Vec<u32>,
     },
     /// Publish a name for a node this process owns.
     Export { name: String, node: u64 },
     /// Ask for the handle of a name.
-    Lookup { name: String },
+    Lookup { id: u32, name: String },
     /// The answer to a [`Message::Lookup`]. `NO_HANDLE` means no such name.
-    Found { handle: u32, node: u64, owner: u32 },
+    Found {
+        id: u32,
+        handle: u32,
+        node: u64,
+        owner: u32,
+    },
     /// Ask to be told when the owner of a handle goes away.
     LinkToDeath { handle: u32 },
     /// Stop asking.
@@ -124,12 +176,25 @@ impl Message {
     fn fields(&self) -> (u32, u32, u32, u64, &[u8]) {
         match self {
             Message::Transaction {
+                id,
                 handle,
                 code,
                 flags,
                 data,
-            } => (*handle, *code, *flags, 0, data),
-            Message::Reply { status, data } => (*status as u32, 0, 0, 0, data),
+                objects,
+            } => (
+                *handle,
+                *code,
+                *flags | ((objects.len() as u32) << OBJECT_SHIFT),
+                *id as u64,
+                data,
+            ),
+            Message::Reply {
+                id,
+                status,
+                data,
+                objects,
+            } => (*status as u32, *id, objects.len() as u32, 0, data),
             Message::Acquire { handle }
             | Message::Release { handle }
             | Message::IncRefs { handle }
@@ -138,28 +203,69 @@ impl Message {
             | Message::LinkToDeath { handle }
             | Message::UnlinkToDeath { handle } => (*handle, 0, 0, 0, &[]),
             Message::Incoming {
-                from,
+                id,
                 node,
                 code,
                 flags,
                 data,
-            } => (*from, *code, *flags, *node, data),
-            Message::IncomingReply { node, status, data } => (*status as u32, 0, 0, *node, data),
+                objects,
+            } => (
+                *id,
+                *code,
+                *flags | ((objects.len() as u32) << OBJECT_SHIFT),
+                *node,
+                data,
+            ),
+            Message::IncomingReply {
+                id,
+                node,
+                status,
+                data,
+                objects,
+            } => (*status as u32, *id, objects.len() as u32, *node, data),
             Message::Export { name, node } => (0, 0, 0, *node, name.as_bytes()),
-            Message::Lookup { name } => (0, 0, 0, 0, name.as_bytes()),
+            Message::Lookup { id, name } => (*id, 0, 0, 0, name.as_bytes()),
             Message::Found {
+                id,
                 handle,
                 node,
                 owner,
-            } => (*handle, *owner, 0, *node, &[]),
+            } => (*handle, *owner, *id, *node, &[]),
             Message::Bye => (0, 0, 0, 0, &[]),
         }
     }
 
+    /// The offsets of the binder objects inside this message's data, for the
+    /// messages that carry a ref per object.
+    fn object_refs(&self) -> &[ArgumentRef] {
+        match self {
+            Message::Transaction { objects, .. } => objects,
+            _ => &[],
+        }
+    }
+
+    /// The offsets of the binder objects inside this message's data, for the
+    /// messages whose refs are offsets alone.
+    fn object_offsets(&self) -> &[u32] {
+        match self {
+            Message::Reply { objects, .. }
+            | Message::IncomingReply { objects, .. }
+            | Message::Incoming { objects, .. } => objects,
+            _ => &[],
+        }
+    }
+
     /// The bytes for this message, given how many descriptors accompany it.
+    ///
+    /// The object offsets are appended to the body rather than interleaved with the
+    /// data, so the body starts with the data exactly as before and a reader that
+    /// knows nothing of objects reads the same first `size - 4 * count` bytes.
     pub fn encode(&self, fd_count: usize) -> Vec<u8> {
         let (a, b, c, node, data) = self.fields();
-        let mut out = Vec::with_capacity(HEADER + data.len());
+        let refs = self.object_refs();
+        let offsets = self.object_offsets();
+        let body = data.len() + offsets.len() * 4 + refs.len() * 12;
+        let mut out = Vec::with_capacity(HEADER + body);
         out.push(self.kind());
         out.push(VERSION);
         out.extend_from_slice(&[0, 0]);
@@ -167,9 +273,16 @@ impl Message {
         out.extend_from_slice(&b.to_be_bytes());
         out.extend_from_slice(&c.to_be_bytes());
         out.extend_from_slice(&node.to_be_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(body as u32).to_be_bytes());
         out.extend_from_slice(&(fd_count as u32).to_be_bytes());
         out.extend_from_slice(data);
+        for offset in offsets {
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+        for object in refs {
+            out.extend_from_slice(&object.offset.to_be_bytes());
+            out.extend_from_slice(&object.node.to_be_bytes());
+        }
         out
     }
 
@@ -206,43 +319,64 @@ impl Message {
         let data = bytes[HEADER..].to_vec();
 
         let message = match bytes[0] {
-            KIND_TRANSACTION => Message::Transaction {
-                handle: a,
-                code: b,
-                flags: c,
-                data,
-            },
-            KIND_REPLY => Message::Reply {
-                status: a as i32,
-                data,
-            },
+            KIND_TRANSACTION => {
+                let (data, objects) = split_refs(data, c >> OBJECT_SHIFT);
+                Message::Transaction {
+                    id: node as u32,
+                    handle: a,
+                    code: b,
+                    flags: c & 0xffff,
+                    data,
+                    objects,
+                }
+            }
+            KIND_REPLY => {
+                let (data, objects) = split_objects(data, c);
+                Message::Reply {
+                    id: b,
+                    status: a as i32,
+                    data,
+                    objects,
+                }
+            }
             KIND_ACQUIRE => Message::Acquire { handle: a },
             KIND_RELEASE => Message::Release { handle: a },
             KIND_INCREFS => Message::IncRefs { handle: a },
             KIND_DECREFS => Message::DecRefs { handle: a },
             KIND_DEAD => Message::Dead { handle: a },
-            KIND_INCOMING => Message::Incoming {
-                from: a,
-                node,
-                code: b,
-                flags: c,
-                data,
-            },
-            KIND_INCOMING_REPLY => Message::IncomingReply {
-                node,
-                status: a as i32,
-                data,
-            },
+            KIND_INCOMING => {
+                let (data, objects) = split_objects(data, c >> OBJECT_SHIFT);
+                Message::Incoming {
+                    id: a,
+                    node,
+                    code: b,
+                    flags: c & 0xffff,
+                    data,
+                    objects,
+                }
+            }
+            KIND_INCOMING_REPLY => {
+                let (data, objects) = split_objects(data, c);
+                Message::IncomingReply {
+                    id: b,
+                    node,
+                    status: a as i32,
+                    data,
+                    objects,
+                }
+            }
             KIND_EXPORT => Message::Export {
                 name: String::from_utf8(data)
                     .map_err(|_| anyhow::anyhow!("a name must be UTF-8"))?,
                 node,
             },
             KIND_LOOKUP => Message::Lookup {
+                id: a,
                 name: String::from_utf8(data)
                     .map_err(|_| anyhow::anyhow!("a name must be UTF-8"))?,
             },
             KIND_FOUND => Message::Found {
+                id: c,
                 handle: a,
                 node,
                 owner: b,
@@ -254,6 +388,43 @@ impl Message {
         };
         Ok((message, fd_count))
     }
+}
+
+/// The data of a message and the argument refs in it, given how many trailing
+/// twelve byte refs the body carries.
+fn split_refs(body: Vec<u8>, count: u32) -> (Vec<u8>, Vec<ArgumentRef>) {
+    let count = count as usize;
+    if count == 0 || body.len() < count * 12 {
+        return (body, Vec::new());
+    }
+    let at = body.len() - count * 12;
+    let objects = body[at..]
+        .chunks_exact(12)
+        .map(|ref_| ArgumentRef {
+            offset: u32::from_be_bytes([ref_[0], ref_[1], ref_[2], ref_[3]]),
+            node: u64::from_be_bytes(ref_[4..12].try_into().unwrap_or([0; 8])),
+        })
+        .collect();
+    let mut data = body;
+    data.truncate(at);
+    (data, objects)
+}
+
+/// The data of a message and the offsets of the binder objects in it, given how
+/// many of the body's trailing four byte words are offsets.
+fn split_objects(body: Vec<u8>, count: u32) -> (Vec<u8>, Vec<u32>) {
+    let count = count as usize;
+    if count == 0 || body.len() < count * 4 {
+        return (body, Vec::new());
+    }
+    let at = body.len() - count * 4;
+    let objects = body[at..]
+        .chunks_exact(4)
+        .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+    let mut data = body;
+    data.truncate(at);
+    (data, objects)
 }
 
 /// A message and the descriptors that came with it.
@@ -440,10 +611,12 @@ mod tests {
         let mut server = Conn::new(b.as_raw_fd());
 
         let sent = Message::Transaction {
+            id: 5,
             handle: 12,
             code: 3,
             flags: 0,
             data: b"parcel".to_vec(),
+            objects: Vec::new(),
         };
         client.send(&sent, &[]).unwrap();
 
@@ -464,10 +637,12 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let sent = Message::Transaction {
+            id: 6,
             handle: 1,
             code: 9,
             flags: 0,
             data: Vec::new(),
+            objects: Vec::new(),
         };
         client.send(&sent, &[file.as_raw_fd()]).unwrap();
 
@@ -489,10 +664,12 @@ mod tests {
         let mut server = Conn::new(b.as_raw_fd());
 
         let bytes = Message::Transaction {
+            id: 7,
             handle: 7,
             code: 1,
             flags: 0,
             data: b"split frame".to_vec(),
+            objects: Vec::new(),
         }
         .encode(0);
 
@@ -506,10 +683,12 @@ mod tests {
         assert_eq!(
             frame.message,
             Message::Transaction {
+                id: 7,
                 handle: 7,
                 code: 1,
                 flags: 0,
                 data: b"split frame".to_vec(),
+                objects: Vec::new(),
             }
         );
     }
@@ -550,8 +729,10 @@ mod tests {
     #[test]
     fn a_negative_status_survives_the_header() {
         let reply = Message::Reply {
+            id: 8,
             status: -38,
             data: b"nope".to_vec(),
+            objects: vec![4, 28],
         };
         let (decoded, fds) = Message::decode(&reply.encode(0)).unwrap();
         assert_eq!(decoded, reply);

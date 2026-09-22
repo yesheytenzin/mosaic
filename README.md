@@ -20,10 +20,13 @@ ship.
 
 ## Status
 
-Design and scaffolding. The architecture is recorded in `CONTEXT.md` and
-`docs/adr/`. The first executable milestone is running a single DEX on a
-host-native ART and Bionic build with no Android OS, which is the gate for
-everything else.
+Design and scaffolding, with the first executable milestone met and well past it.
+The architecture is recorded in `CONTEXT.md` and `docs/adr/`. A single DEX runs on
+a host-native ART and Bionic build with no Android OS; `com.android.server.SystemServer`
+boots its real services through `startBootstrapServices` to `StartDisplayManager`;
+a userspace Binder carries a transaction between two processes, including one that
+runs the framework. What is left, in dependency order, is
+[`docs/remaining-work.md`](docs/remaining-work.md).
 
 ## Build
 

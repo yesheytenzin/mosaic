@@ -157,8 +157,9 @@ struct binder_transaction_data {
 /* The service-manager dispatch, in android-binder.so. Both doors must share one
  * registry, and the Android linker puts every LD_PRELOAD library in the global
  * group, so the symbol resolves there. */
-extern int mosaic_binder_reply(unsigned int code, const unsigned char *request,
-                               unsigned long request_size, unsigned char **out_data,
+extern int mosaic_binder_reply(unsigned int handle, unsigned int code, const unsigned char *request,
+                               unsigned long request_size, const unsigned long *argument_offsets,
+                               unsigned long argument_count, unsigned char **out_data,
                                unsigned long *out_size, unsigned long **out_objects,
                                unsigned long *out_objects_count);
 
@@ -214,44 +215,34 @@ static void release(unsigned char *data) {
 
 /* Answer one transaction.
  *
- * target.handle 0 is the service manager, which is what every Java binder call
- * to a missing service reaches. Any other handle would name an object in another
- * process: this shim hands back *local* objects, so a Java caller never holds a
- * handle of ours, and one arriving here is a service the broker has to carry. */
+ * The handle decides who answers it: 0 is the service manager, which the shim
+ * does itself, and anything else names an object in another process -- a handle
+ * this process was handed by the broker, since the shim is the only thing here
+ * that creates them. Those go to the broker, which carries the call to the
+ * process that owns the object and relays the answer, exactly as the kernel does
+ * on a device. Answering them here with EX_SERVICE_SPECIFIC, which this did, made
+ * every service the broker hosts findable by name and then fail on the first
+ * call. */
 static void answer(struct binder_transaction_data *tr) {
     pending.have = 0;
     pending.code = tr->code;
     pending.flags = tr->flags;
 
-    if (tr->target_handle != 0) {
-        unsigned char *data = (unsigned char *)malloc(4);
-        int code = -8; /* EX_SERVICE_SPECIFIC: this side cannot reach it */
-        if (data) {
-            __builtin_memcpy(data, &code, 4);
-            hold(data, 0);
-        }
-        pending.have = 1;
-        pending.data = data;
-        pending.size = data ? 4 : 0;
-        pending.objects = 0;
-        pending.objects_count = 0;
-        emit("binder-shim: transaction to handle ");
-        emit_dec((long)tr->target_handle);
-        emit(" code ");
-        emit_dec((long)tr->code);
-        emit(" has no local object\n");
-        flush_log();
-        return;
-    }
-
     unsigned char *data = 0;
     unsigned long data_size = 0;
     unsigned long *objects = 0;
     unsigned long objects_count = 0;
-    int produced = mosaic_binder_reply(tr->code, (const unsigned char *)tr->data_buffer,
-                                       tr->data_size, &data, &data_size, &objects,
-                                       &objects_count);
-    emit("binder-shim: transaction code ");
+    /* The objects among the arguments: libbinder fills `offsets` for an outgoing
+     * transaction from the sending Parcel's own object table, which is the only
+     * place that knows where they are -- the bytes alone cannot say. */
+    int produced = mosaic_binder_reply(tr->target_handle, tr->code,
+                                       (const unsigned char *)tr->data_buffer, tr->data_size,
+                                       (const unsigned long *)tr->data_offsets,
+                                       tr->offsets_size / sizeof(unsigned long), &data,
+                                       &data_size, &objects, &objects_count);
+    emit("binder-shim: transaction handle ");
+    emit_dec((long)tr->target_handle);
+    emit(" code ");
     emit_dec((long)tr->code);
     emit(" -> ");
     emit_dec((long)data_size);

@@ -5,6 +5,7 @@ pub mod args;
 pub mod binder;
 pub mod broker;
 pub mod config;
+pub mod device;
 pub mod helpers;
 pub mod runtime;
 

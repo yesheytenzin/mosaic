@@ -351,6 +351,56 @@ service instead of a crash. Holding a reference at registration is the fix, and 
 attempt to do it through `RefBase::incStrong` made registrations *worse*, so it was
 backed out rather than kept half-working.
 
+## An answer that hands back an object
+
+A name lookup hands back a handle, but not every object is reachable by name. A
+wake lock exists because a call returned it: `ISystemSuspend.acquireWakeLock`
+answers with an `IWakeLock` that the caller holds until it releases it, and no
+name resolves to it. That is the *reply* direction, and it took four pieces:
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| The answer names objects | `src/binder/mod.rs` (`Answer`, `Handed`) | The object that answers says "at this offset there is an object", either a node that exists or a new object the broker should host |
+| The handle is the caller's | `src/binder/broker.rs` | A handle names an entry in *one* process's table, and the object answering does not know which process asked; the transport substitutes the caller's handle and writes the object word |
+| The wire carries the offsets | `src/binder/wire.rs` | The offsets are appended after the data and counted in the header, so a reader that knows nothing of objects reads the same first `size - 4 * count` bytes |
+| The caller registers it | `tools/binder-shim/android-binder.c` | Each object is written through libbinder's own writer (`write_object_into`), which is what puts it in the parcel's object table; an object the reader cannot find in that table is refused, so the raw-words path is a fallback and not an equivalent |
+
+The offsets are the part that is easy to get wrong: a binder object word is
+28 bytes (type, flags, a 64-bit value, a 64-bit cookie, then the stability word),
+and a reader that is not told where it starts reads an object's cookies as the
+caller's next argument. Verified with `tools/broker-object.py`, which asks a
+running broker for the suspend hal, takes the handle `acquireWakeLock` answers
+with, and confirms that handle reports the lock's descriptor rather than the hal's.
+
+### And an argument that is an object
+
+The mirror direction -- a caller *passing* an object into a transaction, which is
+what a callback registration is -- is carried the same way, with one extra thing
+to decide: what the caller's object *is*.
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| The caller finds its objects | `tools/binder-shim/android-binder.c` | From libbinder's own object table (`ipcObjects`), which is the only thing that knows where they are: a request's bytes cannot say which of them is an object |
+| A local object is exported | the same, `remember_object` | An object the caller owns has no name -- nobody looks it up, the callee is handed it -- so it is exported unnamed and named in the ref by its node |
+| A handle is left alone | the same | A handle the caller merely holds needs no naming: the broker has the caller's table, so a node of zero says "look it up there" |
+| The callee's handle is minted | `src/binder/broker.rs` (`resolve_arguments`) | Each ref becomes a node; a node the sender is not entitled to is refused; then the *callee's* handle is written into the object word |
+| The callee registers it | the shim's `broker_serve` | Written through libbinder's writer as the request parcel is rebuilt, so the callee's object table holds it and `readStrongBinder` finds it |
+| Its own object comes back whole | the same | The node travels in the word's cookie: a process handed a handle to an object *it* owns gets the local binder, not a proxy that would call itself through the broker |
+
+Verified with `tools/two-process-argument.py` and `tools/two-process-owner.py`,
+across three processes: the caller passes the suspend hal's handle to another
+process's object, that process calls it back, and the hal's descriptor comes
+home. The number the owner uses is not the caller's -- it could not be.
+
+An object handed back can also be *the same object* rather than a new one that
+means the same thing: `Handed::new(key, object)` gives it an identity, and the
+broker hosts it once per key. A display token needs that -- the framework keeps the
+token from `getPhysicalDisplayToken` and hands it back to ask about that display --
+and two tokens for one display would be two answers to the same question. The key
+is also what the receiving side recognizes its own objects by: the node travels in
+the object word's cookie, so a process handed a handle to an object *it* owns gets
+the local binder instead of a proxy that would call itself through the broker.
+
 ## What is left for Phase 3
 
 The shim answers the service manager and hands back local objects, so a caller in
