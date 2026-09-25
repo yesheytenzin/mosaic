@@ -30,8 +30,8 @@
 #    uses initial-exec TLS. Hence one section, named system, default visible.
 #
 #  * ART reads public.libraries.txt relative to ANDROID_ROOT and preloads every
-#    entry, aborting on the first failure. That path is not exercised yet and is
-#    left disabled in the bundle (see "Known gaps" in docs/runtime-bundle.md).
+#    entry. The bundle carries the system list and an explicit empty vendor list
+#    so SystemConfig and ART see the same device contract on every build.
 
 set -uo pipefail
 
