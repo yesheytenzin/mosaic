@@ -96,11 +96,28 @@ pub struct Answer {
     pub data: Vec<u8>,
     /// Binder objects inside that data, which the caller's side has to register.
     pub objects: Vec<ObjectRef>,
+    /// Calls to make after this answer is delivered.
+    ///
+    /// A service that is handed an object by its caller -- a health callback, a
+    /// listener -- has to be able to call it back, and this is how it asks. The
+    /// handle is the *caller's*, because the object came from the caller and only
+    /// the caller's table knows what it means. The broker routes each one the way
+    /// it routes any transaction.
+    pub calls: Vec<PendingCall>,
     /// Descriptors inside that data, by offset: the word at each is written with
     /// the *receiving* process's descriptor number, which only the side holding it
     /// knows. A `BitTube` is two of these, which is how a display event connection
     /// hands its caller the channel events arrive on.
     pub fds: Vec<ObjectFd>,
+}
+
+/// A call a hosted service wants made once its answer has been delivered.
+#[derive(Debug)]
+pub struct PendingCall {
+    /// A handle in the caller's table: the object the caller passed in.
+    pub handle: u32,
+    pub code: u32,
+    pub data: Vec<u8>,
 }
 
 /// A descriptor in an answer: where its word sits, and the descriptor itself.
@@ -114,6 +131,7 @@ impl From<Vec<u8>> for Answer {
         Self {
             data,
             objects: Vec::new(),
+            calls: Vec::new(),
             fds: Vec::new(),
         }
     }
@@ -138,6 +156,22 @@ impl Answer {
 /// bytes at this layer; the per-interface codecs sit above it.
 pub trait BinderObject: Send {
     fn transact(&mut self, code: u32, data: &[u8]) -> anyhow::Result<Answer>;
+
+    /// The same call, with the objects the caller passed as arguments.
+    ///
+    /// Each entry is the *caller's* handle for one of the objects in `data`, in
+    /// the order they appear. A service that only reads values keeps the simple
+    /// form above and never sees this; one that has to call its caller back --
+    /// which is what a callback registration is -- needs the handle, and this is
+    /// the only place that can hand it over.
+    fn transact_with(
+        &mut self,
+        code: u32,
+        data: &[u8],
+        _arguments: &[u32],
+    ) -> anyhow::Result<Answer> {
+        self.transact(code, data)
+    }
 
     /// The interface this object is, as `IBinder::getInterfaceDescriptor` returns
     /// it. A proxy asks for it over the wire before it will use the object, so an
@@ -173,11 +207,23 @@ impl ServiceRegistry {
 
     /// Dispatch a transaction to a registered service.
     pub fn transact(&mut self, name: &str, code: u32, data: &[u8]) -> anyhow::Result<Answer> {
+        self.transact_with(name, code, data, &[])
+    }
+
+    /// The same call, with the caller's handles for the objects among the
+    /// arguments.
+    pub fn transact_with(
+        &mut self,
+        name: &str,
+        code: u32,
+        data: &[u8],
+        arguments: &[u32],
+    ) -> anyhow::Result<Answer> {
         let object = self
             .objects
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("no such service: {}", name))?;
-        Self::answer_itself(object.as_mut(), code, data)
+        Self::answer_itself(object.as_mut(), code, data, arguments)
     }
 
     /// One object's answer, including the two codes that belong to the protocol
@@ -187,6 +233,7 @@ impl ServiceRegistry {
         object: &mut dyn BinderObject,
         code: u32,
         data: &[u8],
+        arguments: &[u32],
     ) -> anyhow::Result<Answer> {
         // Two codes belong to the protocol rather than to any interface
         // (`IBinder.h`), and every object answers them: a ping, which is answered
@@ -202,7 +249,7 @@ impl ServiceRegistry {
             reply.string16(object.descriptor());
             return Ok(reply.into_bytes().into());
         }
-        object.transact(code, data)
+        object.transact_with(code, data, arguments)
     }
 }
 

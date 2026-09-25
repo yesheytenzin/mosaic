@@ -14,6 +14,10 @@
 //! `libandroid_servers` is `LOG_ALWAYS_FATAL_IF(gSuspendControl == nullptr)`.
 //! What each one actually does is stated where it is implemented.
 
+pub mod apex;
+pub mod display;
+pub mod health;
+pub mod idmap;
 pub mod installd;
 pub mod surfaceflinger;
 pub mod suspend;
@@ -39,6 +43,19 @@ pub fn host_all(binder: &Transport, root: &str) {
     // The package manager waits for this one, and asks it about every package it
     // scans: `Installer: installd not found; trying again` repeats until it exists.
     binder.host(installd::NAME, Box::new(installd::Installd::new(root)));
+    // The apex service, which the package manager asks what is installed: without
+    // it an apex package the bundle carries is unknown to it, and the boot aborts
+    // on `Required services extension package is missing`.
+    binder.host(apex::NAME, Box::new(apex::ApexService::new(root)));
+    // This machine's battery, which `BatteryService` asks for and refuses to start
+    // without: `IHealth service instance default isn't available`.
+    binder.host(health::NAME, Box::new(health::Health::new()));
+    // The overlay manager asks for this during `startCoreServices` and blocks on
+    // `nextFabricatedOverlayInfos`. The image's own `idmap2d` answers that method
+    // `UNKNOWN_TRANSACTION` -- it implements five of the interface's ten methods and
+    // the framework declares ten -- so the service is hosted here instead, answering
+    // the methods this system can answer truthfully and refusing the rest.
+    binder.host(idmap::NAME, Box::new(idmap::Idmap::new()));
     // The system server waits for this one before it starts anything else
     // (`DisplayManagerService`), the way it waits for `installd`.
     binder.host(
@@ -52,5 +69,15 @@ pub fn host_all(binder: &Transport, root: &str) {
         Box::new(surfaceflinger::SurfaceFlinger::reporting(
             surfaceflinger::AIDL,
         )),
+    );
+    // `display` is the display *manager*, not the SurfaceFlinger composer: the framework's
+    // `android.hardware.display.IDisplayManager` is what is behind that name, and it has to be a
+    // display manager. Hosting SurfaceFlinger there made the display manager's first call -- code
+    // 40, `setTemporaryAutoBrightnessAdjustment` -- fall through to a refusal whose
+    // `EX_UNSUPPORTED_OPERATION` came back where `ResourcesManager` wanted a value, and it read
+    // the `-7` as an array index.
+    binder.host(
+        display::NAME,
+        Box::new(display::DisplayManager::reporting()),
     );
 }

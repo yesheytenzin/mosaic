@@ -41,11 +41,14 @@
 
 set -euo pipefail
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "this needs root: the priority limit cannot be raised from a user session" >&2
-  echo "try: sudo $0" >&2
-  exit 2
-fi
+# The limit has to be *in effect* for the run, and there are two ways to get there:
+# raise it here, which needs root, or find it already granted -- `LimitNICE` on the
+# user manager reaches every process in the session, which is what the package
+# installs and what a user can have without sudo. The second is the case on an
+# installed machine, and requiring root made the one command that verifies this
+# refuse to run exactly where it would have worked.
+as_root=0
+[ "$(id -u)" -eq 0 ] && as_root=1
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
@@ -91,8 +94,15 @@ else
 fi
 
 say "3. what the user manager reports"
-reported=$(runuser -u "$user" -- systemctl --user show mosaic-broker.service -p LimitNICE 2>/dev/null |
-  sed -n 's/^LimitNICE=//p')
+# Asked through the session's own manager. As root that means `runuser`; as the
+# user it is simply `systemctl --user`, which is the same manager.
+if [ "$as_root" -eq 1 ]; then
+  reported=$(runuser -u "$user" -- systemctl --user show mosaic-broker.service -p LimitNICE 2>/dev/null |
+    sed -n 's/^LimitNICE=//p')
+else
+  reported=$(systemctl --user show mosaic-broker.service -p LimitNICE 2>/dev/null |
+    sed -n 's/^LimitNICE=//p')
+fi
 if [ "${reported:-0}" != "0" ] && [ -n "${reported:-}" ]; then
   ok "LimitNICE=$reported"
 else
@@ -114,6 +124,18 @@ say "4. can a child of the broker lower its niceness?"
 nice_limit_of() { # <pid> -> the soft Max nice priority, or empty
   awk -F' ' '/Max nice priority/ {print $4}' "/proc/$1/limits" 2>/dev/null
 }
+
+if [ "$as_root" -eq 0 ]; then
+  mine=$(nice_limit_of $$)
+  if [ -z "$mine" ] || [ "$mine" = "0" ]; then
+    echo "the priority limit is not in effect for this session (Max nice ${mine:-unknown})." >&2
+    echo "raise it for one run with: sudo $0" >&2
+    echo "or log out and back in, so the installed drop-in takes effect" >&2
+    exit 2
+  fi
+  say "0. this session already has the limit"
+  ok "Max nice $mine in effect for this process, so nothing has to be raised"
+fi
 
 manager_pid=$(systemctl show -p MainPID "user@$(id -u "$user").service" 2>/dev/null |
   sed 's/^MainPID=//')
@@ -162,18 +184,11 @@ if [ -n "$bundle" ]; then
     # refuse on that: the artifacts are gitignored, so cleaning the tree deletes
     # them.
 
-    # Created as root by this script, so the framework's output lands here through
-    # an inherited descriptor, and handed to the invoking user afterwards: a log
-    # nobody but root can read is not much use to the person reading the verdict,
-    # which a first run of this made clear.
+    # A log the person reading the verdict can open: as root it is handed to the
+    # invoking user afterwards, and as a user it is theirs already.
     log=$(mktemp /tmp/mosaic-priority-XXXXXX.log)
-    # Root raises the limit here and hands the process to the invoking user with
-    # setpriv, rather than sudo -u: sudo resets resource limits to the target
-    # user's defaults, which would undo exactly the thing under test.
-    (
-      ulimit -e 40
-      exec setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --init-groups \
-        env "HOME=$(getent passwd "$user" | cut -d: -f6)" \
+    run_framework() {
+      env "HOME=$(getent passwd "$user" | cut -d: -f6)" \
         "MOSAIC_TIMEOUT=${MOSAIC_TIMEOUT:-90}" "MOSAIC_MAX_OUTPUT=900000" \
         "MOSAIC_ANDROID_ROOT=$bundle" "MOSAIC_PROPERTY_DIR=$bundle/properties" \
         "MOSAIC_BINDER_BROKER=0" "MOSAIC_PRELOAD=$preload" \
@@ -182,13 +197,27 @@ if [ -n "$bundle" ]; then
         sh -c 'cd "$MOSAIC_ANDROID_ROOT" && exec "$0" "$MOSAIC_ANDROID_ROOT/run.sh" dalvikvm64 \
                  -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)"' \
         "$root/tools/bundle/with-logd.sh"
-    ) >"$log" 2>&1 || true
+    }
+    if [ "$as_root" -eq 1 ]; then
+      # Root raises the limit here and hands the process to the invoking user with
+      # setpriv, rather than sudo -u: sudo resets resource limits to the target
+      # user's defaults, which would undo exactly the thing under test.
+      (
+        ulimit -e 40
+        exec setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --init-groups \
+          run_framework
+      ) >"$log" 2>&1 || true
+    else
+      # Nothing to raise: this process already has the limit, and the framework run
+      # below is the one it was granted for.
+      run_framework >"$log" 2>&1 || true
+    fi
 
     # Both of these are pipelines that legitimately find nothing, so both need
     # their status dropped: with `set -o pipefail` a no-match grep is a non-zero
     # status, and `set -e` then aborts the script before it can report anything,
     # which is exactly what a first run of this did.
-    chown "$(id -u "$user"):$(id -g "$user")" "$log" 2>/dev/null || true
+    [ "$as_root" -eq 1 ] && chown "$(id -u "$user"):$(id -g "$user")" "$log" 2>/dev/null || true
     reached=$(grep -a -o 'SystemServerTiming: StartActivityManager' "$log" | head -1 || true)
     refused=$(grep -ac 'SecurityException' "$log" || true)
     if [ -n "$reached" ]; then

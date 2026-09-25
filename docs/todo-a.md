@@ -224,7 +224,7 @@ resolution is in `docs/remaining-work.md` under "Where the system server is now"
 `a_transaction_crosses_between_two_connections`, and end to end by the framework's
 own process serving a call from a second one.
 
-## A6. One privileged step ✅ (except one unverifiable gate)
+## A6. One privileged step ✅ (gate verified)
 
 - [x] `LimitNICE` on the broker's user unit
 - [x] The same grant system side (`system/user@.service.d/mosaic.conf`), because a
@@ -234,6 +234,40 @@ own process serving a call from a second one.
       redirected
 - [x] A test that the two limits agree, so a drift cannot silently reintroduce the
       failure
+- [x] The install carries it: a staged install (`make install DESTDIR=...`, no
+      root) lands all fourteen files, including
+      `usr/lib/systemd/system/user@.service.d/mosaic.conf` (the grant) and
+      `usr/lib/systemd/user/mosaic-broker.{service,socket}` (the unit that repeats
+      it). The drift test passes: both say `LimitNICE=40`.
+- [x] Re-checked as the user, which is where the failure would show: the grant is
+      in `/usr/lib/systemd/system/user@.service.d/mosaic.conf`, the broker's unit
+      repeats it, `systemctl --user show mosaic-broker.service -p LimitNICE`
+      reports `40` for the *running* manager, and a transient unit with the limit
+      lowers its niceness to `-20` while the same unit with `LimitNICE=0` is
+      refused (`[Errno 13] Permission denied`). The last check is the control the
+      first three need: they say the setting is there, it says the setting works.
+- [x] Verify without the harness stand-ins, **as a user**. `make verify-priority`
+      was the one command that needed root, because it raised the limit itself with
+      `ulimit`/`setpriv`. But on an installed machine the limit is *already* in
+      effect -- `LimitNICE` on the user manager reaches every process in the session
+      -- so raising it was never necessary, and requiring root made the one command
+      that verifies this refuse to run exactly where it would have worked. The script
+      now checks `/proc/self/limits` first and, when the limit is already there, runs
+      the framework directly. As this user:
+
+      ```
+      3. what the user manager reports
+        ok    LimitNICE=40
+      4. can a child of the broker lower its niceness?
+        ok    Max nice 40 in effect for this process, so nothing has to be raised
+      5. the framework, without pretend-nice.so
+        ok    reached StartActivityManager with no priority stand-ins
+      everything is in place: the session's limit, and the framework running
+      without the priority stand-ins.
+      ```
+
+      The root path is still there for a machine where the limit is not yet in
+      effect, and it says which of the two to do.
 - [x] Verify without the harness stand-ins. **Verified.** With `LimitNICE=40`
       granted for one run -- `sudo tools/verify-priority-limit.sh <bundle>`, which
       raises it and hands the process to the invoking user with `setpriv` -- and

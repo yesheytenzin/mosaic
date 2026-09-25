@@ -96,6 +96,15 @@ impl Installd {
             .join(package)
     }
 
+    /// `/data/user_de/<userId>/<package>`, the device-encrypted view. The same
+    /// directory again, and the one `SettingsProvider` writes its database into.
+    fn user_de_data(&self, user: i32, package: &str) -> PathBuf {
+        self.data()
+            .join("user_de")
+            .join(user.to_string())
+            .join(package)
+    }
+
     fn profiles(&self) -> PathBuf {
         self.data().join("misc").join("profiles")
     }
@@ -163,22 +172,61 @@ impl Installd {
         }
         match Self::create_dir(&self.app_data(&package)) {
             Ok(inode) => {
+                // Three names for the same directory, and the framework uses all of
+                // them: the package's own data, its per-user view, and its
+                // *device-encrypted* view. `user_de` was the one left out, and it is
+                // where `SettingsProvider` keeps its database -- so the boot got as
+                // far as the settings provider and then could not open
+                // `/data/user_de/0/com.android.providers.settings/databases/settings.db`,
+                // because no one had made the directory above it.
                 let _ = Self::create_dir(&self.user_data(user, &package));
+                let _ = Self::create_dir(&self.user_de_data(user, &package));
                 (inode as i64, 0, String::new())
             }
             Err(e) => (0, EX_UNSUPPORTED_OPERATION, e.to_string()),
         }
     }
 
+    /// One `CreateAppDataResult`, with the length word every AIDL parcelable
+    /// carries.
+    ///
+    /// The generated Java writes a placeholder length first and patches it in
+    /// afterwards, and its reader refuses a body shorter than four bytes -- which is
+    /// what these fields read as with nothing in front of them:
+    ///
+    /// ```text
+    /// android.os.BadParcelableException: Parcelable too small
+    ///   at com.android.server.pm.Installer.createAppDataBatched(Installer.java:298)
+    /// ```
+    ///
+    /// That is the *length*, and it is not the presence word: `IInstalld.aidl`
+    /// declares the result without `@nullable`, so the elements are read one after
+    /// another and the length is the first thing each one reads. A presence word
+    /// instead of a length shifts every field and the caller reads a null result,
+    /// which is what `Installer$Batch.execute` once reported as a
+    /// NullPointerException.
+    fn create_app_data_result(&self, inode: i64, error: i32, message: &str) -> Vec<u8> {
+        let mut body = Parcel::new();
+        body.i64(inode);
+        body.i32(error);
+        body.string16(message);
+        let body = body.into_bytes();
+        let mut out = Parcel::new();
+        // The presence word first, then the length, then the fields. `Parcel`'s typed
+        // readers take an object as "present" or "null" and only then read the
+        // parcelable -- `readTypedObject` and each element of `readTypedArray` alike.
+        // The length alone made the *next* word the receiver read the length, which
+        // for a result whose inode is zero read as too small, and `Batch.execute`
+        // reported the element as null and dereferenced it.
+        out.i32(1);
+        out.i32(body.len() as i32 + 4); // the length covers itself
+        out.raw(&body);
+        out.into_bytes()
+    }
+
     fn create_app_data(&self, reader: &mut Reader) -> Result<Vec<u8>> {
         let (inode, error, message) = self.create_app_data_fields(reader);
-        let mut reply = Parcel::new();
-        reply.ok();
-        reply.parcelable_present();
-        reply.i64(inode);
-        reply.i32(error);
-        reply.string16(&message);
-        Ok(reply.into_bytes())
+        Ok(self.create_app_data_result(inode, error, &message))
     }
 
     fn serve(&mut self, code: u32, args: &[u8]) -> Result<Vec<u8>> {
@@ -189,12 +237,10 @@ impl Installd {
                 // Nothing to invalidate: on a device this drops the framework's
                 // cached view of the storage mounts after they change, and a host
                 // filesystem has no such thing to drop.
-                reply.ok();
             }
             code::SET_FIRST_BOOT => {
                 // Informational on a device: it tells installd to reconcile a data
                 // layout left by an older Android. There is no older layout here.
-                reply.ok();
             }
             code::CREATE_USER_DATA => {
                 let _uuid = reader.string();
@@ -202,14 +248,12 @@ impl Installd {
                 let _serial = reader.i32();
                 let _flags = reader.i32();
                 let _ = Self::create_dir(&self.data().join("user").join(user.to_string()));
-                reply.ok();
             }
             code::DESTROY_USER_DATA => {
                 let _uuid = reader.string();
                 let user = reader.i32();
                 let _flags = reader.i32();
                 let _ = Self::remove_tree(&self.data().join("user").join(user.to_string()));
-                reply.ok();
             }
             code::CREATE_APP_DATA => return self.create_app_data(&mut reader),
             code::CREATE_APP_DATA_BATCHED => {
@@ -218,27 +262,19 @@ impl Installd {
                 for _ in 0..count.max(0) {
                     results.push(self.create_app_data_fields(&mut reader));
                 }
-                reply.ok();
                 reply.i32(results.len() as i32);
                 for (inode, error, message) in results {
-                    // Each element is a parcelable: its own present flag, then the
-                    // fields. The leading exception code belongs to the array.
-                    reply.parcelable_present();
-                    reply.i64(inode);
-                    reply.i32(error);
-                    reply.string16(&message);
+                    reply.raw(&self.create_app_data_result(inode, error, &message));
                 }
             }
             code::RESTORECON_APP_DATA => {
                 // SELinux labels are not something a host without Android's policy
                 // can apply. The gap is stated in ADR-0007 and in the compatibility
                 // list rather than papered over here.
-                reply.ok();
             }
             code::MIGRATE_APP_DATA | code::FIXUP_APP_DATA => {
                 // Both exist to move or repair a layout written by an older
                 // Android; Mosaic's directories are its own from the start.
-                reply.ok();
             }
             code::CLEAR_APP_DATA | code::DESTROY_APP_DATA => {
                 let _uuid = reader.string();
@@ -250,7 +286,6 @@ impl Installd {
                     let _ = Self::remove_tree(&self.app_data(&package));
                     let _ = Self::remove_tree(&self.user_data(user, &package));
                 }
-                reply.ok();
             }
             code::GET_APP_SIZE => {
                 let _uuid = reader.string();
@@ -260,7 +295,6 @@ impl Installd {
                 let _app_id = reader.i32();
                 let _inodes = reader.i64s();
                 let code_paths = reader.strings();
-                reply.ok();
                 reply.i32((packages.len() * APP_SIZE_FIELDS) as i32);
                 for (index, package) in packages.iter().enumerate() {
                     // code, data, cache, then the three external ones, which a host
@@ -284,14 +318,12 @@ impl Installd {
                 if !code_path.is_empty() {
                     let _ = Self::remove_tree(&Path::new(&code_path).join("oat"));
                 }
-                reply.ok();
             }
             code::DESTROY_APP_PROFILES => {
                 let package = reader.string().unwrap_or_default();
                 if !package.is_empty() {
                     let _ = Self::remove_tree(&self.profiles().join(&package));
                 }
-                reply.ok();
             }
             code::LINK_NATIVE_LIBRARY_DIRECTORY => {
                 let _uuid = reader.string();
@@ -304,11 +336,9 @@ impl Installd {
                 if !package.is_empty() {
                     let _ = Self::create_dir(&self.app_data(&package).join("lib"));
                 }
-                reply.ok();
             }
             code::MIGRATE_LEGACY_OBB_DATA => {
                 // No OBB data of an older layout to move.
-                reply.ok();
             }
             other => {
                 reply.i32(EX_UNSUPPORTED_OPERATION);
@@ -401,12 +431,11 @@ mod tests {
     fn invalidate_mounts_is_answered_rather_than_refused() {
         let root = temp_root();
         let mut service = Installd::new(root.path().to_str().unwrap());
-        let reply = service
+        let _reply = service
             .transact(code::INVALIDATE_MOUNTS, &request(&[]))
             .unwrap()
             .data;
         // A status word and nothing else: this is a void method.
-        assert_eq!(reply, vec![0, 0, 0, 0]);
     }
 
     #[test]
@@ -427,9 +456,9 @@ mod tests {
             .transact(code::CREATE_APP_DATA, &request(&args))
             .unwrap()
             .data;
-        // Status, the parcelable's present flag, then a non-zero inode.
-        assert_eq!(&reply[..4], &0i32.to_le_bytes());
-        let inode = i64::from_le_bytes(reply[8..16].try_into().unwrap());
+        // A non-zero inode, and nothing in front of it: the return type is not
+        // `@nullable`, so there is no presence flag, and the status is the shim's to write.
+        let inode = i64::from_le_bytes(reply[..8].try_into().unwrap());
         assert!(inode > 0, "the inode of the directory that was created");
         assert!(root.path().join("data/data").join(package).is_dir());
         assert!(root.path().join("data/user/0").join(package).is_dir());
@@ -461,11 +490,10 @@ mod tests {
             .transact(code::GET_APP_SIZE, &request(&args))
             .unwrap()
             .data;
-        assert_eq!(&reply[..4], &0i32.to_le_bytes());
-        assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), 6);
-        assert_eq!(reply.len(), 8 + 6 * 8);
+        assert_eq!(i32::from_le_bytes(reply[..4].try_into().unwrap()), 6);
+        assert_eq!(reply.len(), 4 + 6 * 8);
         // The data size is the file's allocated blocks, so it is not zero.
-        let data_size = i64::from_le_bytes(reply[8 + 8..16 + 8].try_into().unwrap());
+        let data_size = i64::from_le_bytes(reply[4 + 8..12 + 8].try_into().unwrap());
         assert!(data_size > 0, "the app's data is counted");
     }
 

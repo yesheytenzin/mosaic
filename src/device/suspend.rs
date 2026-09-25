@@ -94,7 +94,6 @@ impl BinderObject for SuspendControl {
 
     fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
         let mut reply = Parcel::new();
-        reply.ok();
         match code {
             control::REGISTER_CALLBACK | control::REGISTER_WAKELOCK_CALLBACK => {
                 reply.boolean(true);
@@ -116,7 +115,6 @@ impl BinderObject for SuspendControlInternal {
 
     fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
         let mut reply = Parcel::new();
-        reply.ok();
         match code {
             // The token the caller passes is a binder it wants to hear from when
             // autosuspend changes state. Accepted, and nothing is ever sent: the
@@ -198,7 +196,6 @@ impl BinderObject for SystemSuspend {
 
     fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
         let mut reply = Parcel::new();
-        reply.ok();
         if code != hal::ACQUIRE_WAKE_LOCK {
             reply.boolean(false);
             return Ok(reply.into_bytes().into());
@@ -257,7 +254,7 @@ mod tests {
             .data;
         // Status 0, then true. The framework's `isRegistered` is read from here,
         // and a false makes it log that the callback could not be registered.
-        assert_eq!(reply, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(reply, vec![1, 0, 0, 0], "the value alone");
     }
 
     #[test]
@@ -267,9 +264,13 @@ mod tests {
             .transact(internal::ENABLE_AUTOSUSPEND, &[])
             .unwrap()
             .data;
-        assert_eq!(enabled, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(enabled, vec![1, 0, 0, 0], "the value alone");
         let forced = service.transact(internal::FORCE_SUSPEND, &[]).unwrap().data;
-        assert_eq!(forced, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            forced,
+            vec![0, 0, 0, 0],
+            "four bytes, and no status in front"
+        );
     }
 
     #[test]
@@ -280,15 +281,15 @@ mod tests {
             .transact(internal::GET_WAKELOCK_STATS, &[])
             .unwrap()
             .data;
-        assert_eq!(locks, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(locks, vec![0, 0, 0, 0], "the value alone");
         // A parcelable is the AIDL present-flag and then its fields, so a reader
         // gets ten zeros rather than reading past the end of the parcel.
         let stats = service
             .transact(internal::GET_SUSPEND_STATS, &[])
             .unwrap()
             .data;
-        assert_eq!(stats.len(), 4 + 4 + SUSPEND_INFO_FIELDS * 8);
-        assert_eq!(&stats[4..8], &[1, 0, 0, 0]);
+        assert_eq!(stats.len(), 4 + SUSPEND_INFO_FIELDS * 8);
+        assert_eq!(&stats[..4], &[1, 0, 0, 0], "the value alone");
         assert!(stats[8..].iter().all(|byte| *byte == 0));
     }
 
@@ -296,14 +297,14 @@ mod tests {
     fn a_wake_lock_is_handed_back_as_an_object() {
         let mut service = SystemSuspend::default();
         let answer = service.transact(hal::ACQUIRE_WAKE_LOCK, &[]).unwrap();
-        // Status, then a transaction-sized object word: a handle, which the side
-        // holding the caller's table fills in, then the stability word.
-        assert_eq!(answer.data.len(), 4 + 24 + 4);
-        assert_eq!(&answer.data[..4], &0i32.to_le_bytes());
+        // A transaction-sized object word: a handle, which the side holding the
+        // caller's table fills in, then the stability word -- and no status in front,
+        // because the shim writes that.
+        assert_eq!(answer.data.len(), 28, "24 bytes and the stability word");
         assert_eq!(answer.objects.len(), 1);
-        assert_eq!(answer.objects[0].offset, 4);
+        assert_eq!(answer.objects[0].offset, 0);
         assert_eq!(
-            &answer.data[4..8],
+            &answer.data[..4],
             &crate::binder::parcel::BINDER_TYPE_HANDLE.to_le_bytes()
         );
         // And the object is the lock itself, which the framework calls `release`

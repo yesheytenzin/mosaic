@@ -122,8 +122,12 @@ do_closure() {
   while :; do
     round=$((round + 1))
     local missing
+    # The bundle's own binaries are scanned too. A library that only a *program*
+    # needs is invisible to a scan of lib64 alone -- `idmap2d` needs
+    # `libidmap2.so` and `libidmap2_policies.so`, and the linker refuses to start
+    # it without them ("CANNOT LINK EXECUTABLE ... not found").
     missing=$(
-      for so in "$out"/lib64/*.so "$out"/lib64/bionic/*.so; do
+      for so in "$out"/lib64/*.so "$out"/lib64/bionic/*.so "$out"/bin/*; do
         [ -f "$so" ] || continue
         for need in $(needed_of "$so"); do present "$out" "$need" || echo "$need"; done
       done | sort -u
@@ -391,6 +395,98 @@ stage_classpath() { # <image> <bootclasspath|systemserverclasspath> <output file
   echo "  $want: $(tr ':' '\n' < "$list" | wc -l) jars"
 }
 
+# The system apps. The package manager scans these and then *requires* them: it
+# looks for exactly one privileged app handling ACTION_INSTALL_PACKAGE and aborts
+# the boot without one ("There must be exactly one installer; found []"). The
+# bundle's root is what the framework sees as /system, so they land at the top
+# level, which is where its paths point.
+# What this runtime provides, in the form the framework looks for it. Written by
+# the bundle rather than taken from the image: it declares the HALs *this side*
+# hosts, and a HAL listed here that is missing is worse than one absent, because
+# `ServiceManager.waitForDeclaredService` would then wait for it.
+do_vintf() { # <bundle>
+  local out="$1"
+  mkdir -p "$out/etc/vintf"
+  cat > "$out/etc/vintf/manifest.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.health</name>
+        <version>1</version>
+        <fqname>IHealth/default</fqname>
+    </hal>
+</manifest>
+XML
+  # Both places the framework reads: the file and the directory of fragments, which
+  # is where this image keeps its own HAL declarations.
+  mkdir -p "$out/etc/vintf/manifest" "$out/vendor/etc/vintf/manifest"
+  cp "$out/etc/vintf/manifest.xml" "$out/etc/vintf/manifest/android.hardware.health-service.xml"
+  cp "$out/etc/vintf/manifest.xml" "$out/vendor/etc/vintf/manifest.xml"
+  cp "$out/etc/vintf/manifest.xml" "$out/vendor/etc/vintf/manifest/android.hardware.health-service.xml"
+  echo "  + etc/vintf/manifest.xml (the health HAL)"
+}
+
+do_apps() { # <image> <bundle>
+  local img="$1" out="$2" dir
+  # The package manager's own record of what it scanned. It is state, not a build
+  # product, and a stale one is worse than none: a bundle whose apps changed but
+  # whose packages.xml did not makes PMS answer from the old scan and report a
+  # package it now has as missing ("Required services extension package is missing").
+  rm -rf "$out/data/system/packages.xml" "$out/data/system/packages.list" "$out/data/system/package_cache"
+  # The apexes too, and not as an afterthought: this image ships them *flattened*,
+  # as directories under /system/apex, which is what makes `ApexManagerFlattenedApex`
+  # the implementation the framework uses -- it lists /apex itself and never asks the
+  # apex service. Several packages the package manager *requires* live inside them
+  # (the extension services and the permission controller), so without this the boot
+  # aborts on a package that is right there in the image.
+  # The overlay compiler and its daemon. The framework asks for the `idmap`
+  # service at boot (the overlay manager creates the system overlays' idmaps), and
+  # `idmap2d` is the daemon that registers it -- so it is a *program* the bundle
+  # has to carry and run, not something to answer from Rust.
+  for tool in idmap2 idmap2d hwservicemanager; do
+    dump_path "$img" "/system/bin/$tool" "$out/bin/$tool" || true
+    # The same interpreter rewrite the other binaries get. Without it these keep
+    # `/system/bin/linker64` in PT_INTERP, which the kernel resolves itself -- no
+    # path shim can help -- and the binary fails to start with "cannot execute:
+    # required file not found". `idmap2d` doing that is silent: it is the daemon
+    # that registers `idmap`, so the service is simply absent and every call to it
+    # waits out its timeout.
+    if [ -x "$out/bin/$tool" ] && command -v patchelf >/dev/null && [ -x "$out/linker64" ]; then
+      patchelf --set-interpreter "$out/linker64" "$out/bin/$tool" 2>/dev/null || true
+    fi
+  done
+
+  # Apps are not all under /system on a modern image. The Lineage settings
+  # provider that DisplayPolicy asks for lives in /system_ext/priv-app, so
+  # extracting only /system leaves a real provider missing from the package
+  # manager's scan. /system_ext and /product are symlinks in the image; read
+  # their canonical /system/... directories, but keep the logical partition
+  # names in the bundle because the framework's path rules redirect them.
+  for spec in "system:/system" "system_ext:/system/system_ext" "product:/system/product"; do
+    partition=${spec%%:*}
+    source=${spec#*:}
+    for dir in app priv-app; do
+      target="$out"
+      [ "$partition" = system ] || target="$out/$partition"
+      mkdir -p "$target"
+      rm -rf "$target/$dir"
+      debugfs -R "rdump $source/$dir $target" "$img" >/dev/null 2>&1 || true
+      if [ -d "$target/$dir" ]; then
+        echo "  + $partition/$dir/ ($(find "$target/$dir" -name '*.apk' 2>/dev/null | wc -l) apks)"
+      else
+        echo "  --  $partition/$dir/: not in the image, so nothing to scan" >&2
+      fi
+    done
+  done
+  rm -rf "$out/apex"
+  debugfs -R "rdump /system/apex $out" "$img" >/dev/null 2>&1 || true
+  if [ -d "$out/apex" ]; then
+    echo "  + apex/ ($(find "$out/apex" -name '*.apk' 2>/dev/null | wc -l) apks)"
+  else
+    echo "  --  apex/: not in the image, so nothing to scan" >&2
+  fi
+}
+
 do_jars() { # <image> <bundle>
   local img="$1" out="$2" entry src rel
   mkdir -p "$out/framework"
@@ -413,6 +509,21 @@ do_jars() { # <image> <bundle>
   # FileInputStream when the file is absent, because the descriptor is null.
   mkdir -p "$out/etc" "$out/fonts"
   local conf
+  mkdir -p "$out/etc/compatconfig" "$out/system_ext/etc/compatconfig"
+  # Compatibility configuration is part of the device contract. The bundle
+  # already redirects /system_ext and /apex, but without these XML files the
+  # framework's SystemConfig has no arrays to initialize and aborts before
+  # PlatformCompat starts.
+  for conf in $(debugfs -R "ls -l /system/etc/compatconfig" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /-compat-config\.xml$/ { print $NF }'); do
+    dump_path "$img" "/system/etc/compatconfig/$conf" "$out/etc/compatconfig/$conf"
+  done
+  mkdir -p "$out/system_ext/etc/compatconfig"
+  for conf in $(debugfs -R "ls -l /system/system_ext/etc/compatconfig" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /-compat-config\.xml$/ { print $NF }'); do
+    dump_path "$img" "/system/system_ext/etc/compatconfig/$conf" \
+      "$out/system_ext/etc/compatconfig/$conf"
+  done
   for conf in $(debugfs -R "ls -l /system/etc" "$img" 2>/dev/null \
       | awk '$1 ~ /^[0-9]+$/ && $NF ~ /^fonts.*\.xml$/ { print $NF }'); do
     dump_path "$img" "/system/etc/$conf" "$out/etc/$conf"
@@ -496,6 +607,31 @@ libstats_jni.so
 libandroid_servers.so
 libjavacrypto.so
 libhwui.so
+# The services' own JNI libraries. `System.loadLibrary` reaches these with a
+# dlopen, so a DT_NEEDED walk cannot see them, and they are not `lib*_jni.so`
+# under an apex either -- they sit in /system/lib64 unremarked. Each one is
+# needed by exactly one service:
+#
+#   libalarm_jni.so        AlarmManagerService   (the first to be asked for)
+#   libmedia_jni.so        MediaPlayer, AudioSystem
+#   librs_jni.so           RenderScript
+#   librtp_jni.so          the RTP stack
+#   libdrmframework_jni.so DrmManagerService
+#   libaudioeffect_jni.so  AudioEffect
+#   libprintspooler_jni.so PrintSpooler
+#   libhidcommand_jni.so   the input command queue
+#   libuinputcommand_jni.so
+#   libnfc_nci_jni.so      NfcService
+libalarm_jni.so
+libaudioeffect_jni.so
+libdrmframework_jni.so
+libhidcommand_jni.so
+libmedia_jni.so
+libnfc_nci_jni.so
+libprintspooler_jni.so
+librs_jni.so
+librtp_jni.so
+libuinputcommand_jni.so
 SEED
 
   # ART preloads every entry in the device's public library list, so the bundle
@@ -511,6 +647,12 @@ SEED
 
   echo "staging the boot classpath and data files..."
   do_jars "$img" "$out"
+
+  echo "staging the system apps..."
+  do_apps "$img" "$out"
+
+  echo "declaring the HALs this side hosts..."
+  do_vintf "$out"
 
   echo "building the property area..."
   do_properties "$img" "$out"
@@ -771,6 +913,8 @@ do_run() { # <bundle> <binary> [args...]
 # started (ADR-0012).
 case "$cmd" in
   index)   do_index "${2:?image}" "${3:?bundle}" ;;
+  apps)    do_apps "${2:?image}" "${3:?bundle}" ;;
+  vintf)   do_vintf "${2:?bundle}" ;;
   closure) do_closure "${2:?image}" "${3:?bundle}" ;;
   stage)   do_stage "${2:?image}" "${3:?bundle}" "${4:?inode}" "${5:?name}" "${@:6}" ;;
   jars)    do_jars "${2:?image}" "${3:?bundle}" ;;

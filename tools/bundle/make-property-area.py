@@ -122,6 +122,24 @@ DEFAULT_PROPERTIES = {
     "dalvik.vm.isa.x86.variant": "default",
     "dalvik.vm.isa.x86.features": "default",
     "dalvik.vm.dex2oat-filter": "verify",
+    # `PackageManagerServiceCompilerMapping.checkProperties` validates every one of
+    # these at startup and aborts on an empty value, so they are the framework's
+    # requirement rather than a choice about optimisation. `verify` everywhere is
+    # the honest setting for a host that has not run dex2oat yet.
+    "pm.dexopt.first-boot": "verify",
+    "pm.dexopt.boot-after-ota": "verify",
+    "pm.dexopt.cmdline": "verify",
+    "pm.dexopt.post-boot": "verify",
+    "pm.dexopt.install": "verify",
+    "pm.dexopt.install-fast": "verify",
+    "pm.dexopt.install-bulk": "verify",
+    "pm.dexopt.install-bulk-secondary": "verify",
+    "pm.dexopt.install-bulk-downgraded": "verify",
+    "pm.dexopt.install-bulk-secondary-downgraded": "verify",
+    "pm.dexopt.bg-dexopt": "verify",
+    "pm.dexopt.ab-ota": "verify",
+    "pm.dexopt.inactive": "verify",
+    "pm.dexopt.shared": "verify",
     "dalvik.vm.image-dex2oat-filter": "verify",
     "dalvik.vm.heapsize": "512m",
     "dalvik.vm.heapgrowthlimit": "256m",
@@ -462,9 +480,16 @@ def main() -> int:
 
     # The image's own build.prop is the authority on the product identity and
     # the SDK level, so where it defines a property Mosaic also defines, its
-    # value wins. Only those keys are taken: an entire build.prop would not fit
-    # in one 128 KiB area, and the rest read as unset, which is what a property
-    # with no value does anyway.
+    # value wins. Only those keys are taken: the area holds what Mosaic declares
+    # plus room for the properties the system server writes during boot, and
+    # taking the image's whole build.prop as well left too little of that room --
+    # the first write past the end of the mapping is a bus error in the process
+    # that made it, which is how a first attempt at this announced itself.
+    #
+    # What a name the framework reads and Mosaic does not declare does is read as
+    # unset, so the names it needs have to be declared here: `pm.dexopt.*` is the
+    # set `PackageManagerServiceCompilerMapping` validates, and an empty one aborts
+    # the package manager before it starts.
     properties = dict(DEFAULT_PROPERTIES)
     for path in args.build_prop:
         from_image = read_build_prop(path)

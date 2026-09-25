@@ -79,19 +79,26 @@ mod aidl {
 }
 
 /// `android::ISurfaceComposer`, in the order of `ISurfaceComposer.h`'s tag enum.
+///
+/// The numbers are the position of each name in that enum, counted from
+/// `IBinder::FIRST_CALL_TRANSACTION`. They are not the ones an eye lands on: the
+/// list has seventy-one entries and reading down it by hand missed five, which is
+/// how `getDynamicDisplayInfo` came to be sent as 52 when the framework sends 55.
+/// The framework's own request settled it -- and then counting the enum
+/// programmatically agreed.
 mod legacy {
     pub const BOOT_FINISHED: u32 = 1;
     pub const CREATE_CONNECTION: u32 = 2;
     pub const GET_STATIC_DISPLAY_INFO: u32 = 3;
     pub const CREATE_DISPLAY_EVENT_CONNECTION: u32 = 4;
     pub const GET_COMPOSITION_PREFERENCE: u32 = 27;
-    pub const GET_PROTECTED_CONTENT_SUPPORT: u32 = 31;
-    pub const GET_DISPLAY_NATIVE_PRIMARIES: u32 = 33;
-    pub const GET_DESIRED_DISPLAY_MODE_SPECS: u32 = 37;
-    pub const GET_GPU_CONTEXT_PRIORITY: u32 = 50;
-    pub const GET_MAX_ACQUIRED_BUFFER_COUNT: u32 = 51;
-    pub const GET_DYNAMIC_DISPLAY_INFO: u32 = 52;
-    pub const GET_DISPLAY_DECORATION_SUPPORT: u32 = 63;
+    pub const GET_PROTECTED_CONTENT_SUPPORT: u32 = 32;
+    pub const GET_DISPLAY_NATIVE_PRIMARIES: u32 = 34;
+    pub const GET_DESIRED_DISPLAY_MODE_SPECS: u32 = 39;
+    pub const GET_GPU_CONTEXT_PRIORITY: u32 = 53;
+    pub const GET_MAX_ACQUIRED_BUFFER_COUNT: u32 = 54;
+    pub const GET_DYNAMIC_DISPLAY_INFO: u32 = 55;
+    pub const GET_DISPLAY_DECORATION_SUPPORT: u32 = 67;
 }
 
 /// `ui::ColorMode::NATIVE`: the display's own mode, which is the only one a host
@@ -219,6 +226,83 @@ impl BinderObject for DisplayToken {
         Ok(reply.into_bytes().into())
     }
 }
+/// The identity returned for a surface created before the compositor exists.
+/// It deliberately has no drawing or transaction implementation.
+pub struct SurfaceHandle;
+/// The connection returned by `createConnection`.
+///
+/// `SurfaceComposerClient` requires a non-null `ISurfaceComposerClient` before
+/// it will construct a `SurfaceControl`. Returning null made `nativeCreate` fail
+/// with `NO_INIT`; this is the smallest object that lets the framework finish
+/// constructing its display surfaces. It carries an identity, not a compositor:
+/// the object below refuses the operations that would require a real layer tree.
+pub struct SurfaceComposerConnection;
+
+impl BinderObject for SurfaceComposerConnection {
+    fn descriptor(&self) -> &str {
+        "android.ui.ISurfaceComposerClient"
+    }
+
+    fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
+        match code {
+            // `createSurfaceChecked` writes the returned surface binder, the
+            1 => {
+                let mut reply = Parcel::new();
+                let handle = reply.handle_binder(0);
+                let producer = reply.handle_binder(0);
+                reply.i32(1); // generated layer id
+                reply.i32(0); // transform hint
+                reply.i32(0); // status
+                Ok(Answer::from(reply.into_bytes())
+                    .handing(handle, Handed::fresh(Box::new(SurfaceHandle)))
+                    .handing(producer, Handed::fresh(Box::new(BufferProducer))))
+            }
+            other => {
+                let mut reply = Parcel::new();
+                reply.i32(EX_UNSUPPORTED_OPERATION);
+                reply.string16(&format!(
+                    "ISurfaceComposerClient method {other} is not implemented"
+                ));
+                reply.i32(0);
+                Ok(reply.into_bytes().into())
+            }
+        }
+    }
+}
+
+impl BinderObject for SurfaceHandle {
+    fn descriptor(&self) -> &str {
+        "android.gui.ISurfaceControl"
+    }
+
+    fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
+        let mut reply = Parcel::new();
+        reply.i32(EX_UNSUPPORTED_OPERATION);
+        reply.string16(&format!("ISurfaceControl method {code} is not implemented"));
+        reply.i32(0);
+        Ok(reply.into_bytes().into())
+    }
+}
+
+/// A producer identity is part of the surface-creation reply. No buffers are
+/// queued through it until the Wayland compositor is implemented.
+pub struct BufferProducer;
+
+impl BinderObject for BufferProducer {
+    fn descriptor(&self) -> &str {
+        "android.gui.IGraphicBufferProducer"
+    }
+
+    fn transact(&mut self, code: u32, _data: &[u8]) -> Result<Answer> {
+        let mut reply = Parcel::new();
+        reply.i32(EX_UNSUPPORTED_OPERATION);
+        reply.string16(&format!(
+            "IGraphicBufferProducer method {code} is not implemented"
+        ));
+        reply.i32(0);
+        Ok(reply.into_bytes().into())
+    }
+}
 
 /// `android.gui.IDisplayEventConnection`, in declaration order.
 mod event {
@@ -274,7 +358,6 @@ impl BinderObject for DisplayEventConnection {
             // `BitTube::writeToParcel` writes them.
             event::STEAL_RECEIVE_CHANNEL => {
                 let mut reply = Parcel::new();
-                reply.ok();
                 // A parcelable argument is written with a presence word in front of
                 // it -- the reader is `Parcel::readParcelable`, which reads one and
                 // then hands the rest to `BitTube::readFromParcel`. Without it the
@@ -299,8 +382,7 @@ impl BinderObject for DisplayEventConnection {
             // rate-limit. `requestNextVsync` is oneway and likewise has nothing to
             // answer.
             event::SET_VSYNC_RATE | event::REQUEST_NEXT_VSYNC => {
-                let mut reply = Parcel::new();
-                reply.ok();
+                let reply = Parcel::new();
                 Ok(reply.into_bytes().into())
             }
             other => {
@@ -370,12 +452,6 @@ impl SurfaceFlinger {
         }
     }
 
-    fn ok(&self) -> Parcel {
-        let mut reply = Parcel::new();
-        reply.ok();
-        reply
-    }
-
     fn refuse(&self, code: u32, interface: &str) -> Answer {
         let mut reply = Parcel::new();
         reply.i32(EX_UNSUPPORTED_OPERATION);
@@ -403,10 +479,10 @@ impl SurfaceFlinger {
         // One mode: the host's preferred one. DRM's sysfs has the resolution and
         // nothing else, so the timings below are the ones a display that reports
         // no timing gets.
-        out.extend_from_slice(&1i32.to_le_bytes()); // supportedDisplayModes: count
+        out.extend_from_slice(&1u64.to_le_bytes()); // supportedDisplayModes: count
         out.extend_from_slice(&self.display_mode(display, 0));
         out.extend_from_slice(&0i32.to_le_bytes()); // activeDisplayModeId
-        out.extend_from_slice(&1i32.to_le_bytes()); // supportedColorModes: count
+        out.extend_from_slice(&1u64.to_le_bytes()); // supportedColorModes: count
         out.extend_from_slice(&COLOR_MODE_NATIVE.to_le_bytes());
         out.extend_from_slice(&COLOR_MODE_NATIVE.to_le_bytes()); // activeColorMode
                                                                  // HdrCapabilities: no types, and zero luminance means unknown.
@@ -414,8 +490,8 @@ impl SurfaceFlinger {
         out.extend_from_slice(&0f32.to_le_bytes());
         out.extend_from_slice(&0f32.to_le_bytes());
         out.extend_from_slice(&0f32.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes()); // autoLowLatencyModeSupported
-        out.extend_from_slice(&0i32.to_le_bytes()); // gameContentTypeSupported
+        out.push(0); // autoLowLatencyModeSupported
+        out.push(0); // gameContentTypeSupported
         out.extend_from_slice(&(-1i32).to_le_bytes()); // preferredBootDisplayMode: none
         out
     }
@@ -493,14 +569,15 @@ impl SurfaceFlinger {
             // userspace compositor waits on, and the framework only uses this to
             // let the compositor know it may start drawing.
             legacy::BOOT_FINISHED => Answer::default(),
-            // The surface half. A client connection is what surfaces hang off, and
-            // there are none: null says so, and a caller that needs one will have
-            // to wait for the windowing phase rather than get a connection that
-            // cannot create a surface.
+            // A client connection is required before SurfaceComposerClient can
+            // construct a SurfaceControl. It is an identity-only object here:
+            // the framework's display setup can finish, while drawing remains
+            // the windowing phase.
             legacy::CREATE_CONNECTION => {
                 let mut reply = Parcel::new();
-                reply.null_binder();
-                reply.into_bytes().into()
+                let offset = reply.handle_binder(0);
+                Answer::from(reply.into_bytes())
+                    .handing(offset, Handed::fresh(Box::new(SurfaceComposerConnection)))
             }
             // A display event connection, whose receive channel is a socketpair.
             // Without one the framework's receiver fails to initialize and
@@ -524,9 +601,14 @@ impl SurfaceFlinger {
             },
             legacy::GET_STATIC_DISPLAY_INFO => match self.named_display(args) {
                 Some(display) => {
+                    let info = self.static_display_info(display);
                     let mut reply = Parcel::new();
                     reply.i32(0);
-                    reply.raw(&self.static_display_info(display));
+                    // `Parcel::write(const Flattenable&)` writes the flattened size
+                    // before the fields, and `Parcel::read` reads it back the same
+                    // way. Without it the reader takes the first field for the size.
+                    reply.i32(info.len() as i32);
+                    reply.raw(&info);
                     reply.into_bytes().into()
                 }
                 None => {
@@ -537,9 +619,11 @@ impl SurfaceFlinger {
             },
             legacy::GET_DYNAMIC_DISPLAY_INFO => match self.named_display(args) {
                 Some(display) => {
+                    let info = self.dynamic_display_info(display);
                     let mut reply = Parcel::new();
                     reply.i32(0);
-                    reply.raw(&self.dynamic_display_info(display));
+                    reply.i32(info.len() as i32);
+                    reply.raw(&info);
                     reply.into_bytes().into()
                 }
                 None => {
@@ -588,10 +672,13 @@ impl SurfaceFlinger {
             // The mode the display is running in, and the refresh rates it may use.
             // A host compositor chooses the mode; what this can honestly say is
             // that there is one mode and no group switching.
+            // The reply has no status word of its own: the handler in
+            // `ISurfaceComposer.cpp` writes `defaultMode` first and signals failure
+            // by returning an error, so a result word here shifts every field after
+            // it and the JNI's reader gives up with a null.
             legacy::GET_DESIRED_DISPLAY_MODE_SPECS => match self.named_display(args) {
                 Some(display) => {
                     let mut reply = Parcel::new();
-                    reply.i32(0); // NO_ERROR
                     reply.i32(0); // defaultMode
                     reply.boolean(false); // allowGroupSwitching
                     for _ in 0..4 {
@@ -634,7 +721,7 @@ impl SurfaceFlinger {
     fn aidl_transact(&mut self, code: u32, args: &[u8]) -> Answer {
         match code {
             aidl::GET_PHYSICAL_DISPLAY_IDS => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.i32(self.displays.len() as i32);
                 for display in &self.displays {
                     reply.i64(display.id as i64);
@@ -642,7 +729,7 @@ impl SurfaceFlinger {
                 reply.into_bytes().into()
             }
             aidl::GET_PRIMARY_PHYSICAL_DISPLAY_ID => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.i64(self.displays.first().map(|d| d.id as i64).unwrap_or(0));
                 reply.into_bytes().into()
             }
@@ -654,7 +741,7 @@ impl SurfaceFlinger {
                 ) as u64;
                 match self.display_for(id) {
                     Some(display) => {
-                        let mut reply = self.ok();
+                        let mut reply = Parcel::new();
                         let offset = reply.handle_binder(0);
                         let key = format!("{NAME}:token:{}", display.id);
                         Answer::from(reply.into_bytes()).handing(
@@ -665,14 +752,14 @@ impl SurfaceFlinger {
                     // A display that is not there is a null token, which is what
                     // the interface's `@nullable` means.
                     None => {
-                        let mut reply = self.ok();
+                        let mut reply = Parcel::new();
                         reply.null_binder();
                         reply.into_bytes().into()
                     }
                 }
             }
             aidl::GET_DISPLAY_STATE => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.i32(match self.named_display(args) {
                     Some(_) => DISPLAY_STATE_ON,
                     None => 1, // OFF, for a display that is not there
@@ -687,7 +774,7 @@ impl SurfaceFlinger {
                 let period = display
                     .map(|display| (1e9 / display.refresh_hz) as i64)
                     .unwrap_or(0);
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.i64(0); // vsyncTime: no frame clock to report
                 reply.i64(period);
                 reply.into_bytes().into()
@@ -695,27 +782,27 @@ impl SurfaceFlinger {
             // Powering a display is the desktop's business: the host compositor
             // owns the panel, and a system server asking this to turn it off would
             // be asking for something that is not its to do. Accepted, not obeyed.
-            aidl::SET_POWER_MODE => self.ok().into_bytes().into(),
+            aidl::SET_POWER_MODE => Answer::from(Vec::new()),
             aidl::CLEAR_BOOT_DISPLAY_MODE
             | aidl::SET_AUTO_LOW_LATENCY_MODE
             | aidl::SET_GAME_CONTENT_TYPE
-            | aidl::NOTIFY_POWER_BOOST => self.ok().into_bytes().into(),
+            | aidl::NOTIFY_POWER_BOOST => Answer::from(Vec::new()),
             // False for both: the host has no boot-time display mode of its own, and
             // its output is sRGB rather than wide color.
             aidl::GET_BOOT_DISPLAY_MODE_SUPPORT => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.boolean(false);
                 reply.into_bytes().into()
             }
             aidl::IS_WIDE_COLOR_DISPLAY => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.boolean(false);
                 reply.into_bytes().into()
             }
             // Brightness belongs to the desktop, and the framework asks this first
             // precisely so it can leave it alone: false is the honest answer.
             aidl::GET_DISPLAY_BRIGHTNESS_SUPPORT => {
-                let mut reply = self.ok();
+                let mut reply = Parcel::new();
                 reply.boolean(false);
                 reply.into_bytes().into()
             }
@@ -781,11 +868,21 @@ mod tests {
 
     #[test]
     fn the_legacy_codes_are_the_tags_in_the_header() {
+        // The positions of these names in `ISurfaceComposer.h`'s tag enum, counted
+        // programmatically from the header. `getDynamicDisplayInfo` is 55 and the
+        // framework's own request said so; the rest are the same count.
         assert_eq!(legacy::BOOT_FINISHED, 1);
         assert_eq!(legacy::CREATE_CONNECTION, 2);
         assert_eq!(legacy::GET_STATIC_DISPLAY_INFO, 3);
+        assert_eq!(legacy::CREATE_DISPLAY_EVENT_CONNECTION, 4);
         assert_eq!(legacy::GET_COMPOSITION_PREFERENCE, 27);
-        assert_eq!(legacy::GET_DYNAMIC_DISPLAY_INFO, 52);
+        assert_eq!(legacy::GET_PROTECTED_CONTENT_SUPPORT, 32);
+        assert_eq!(legacy::GET_DISPLAY_NATIVE_PRIMARIES, 34);
+        assert_eq!(legacy::GET_DESIRED_DISPLAY_MODE_SPECS, 39);
+        assert_eq!(legacy::GET_GPU_CONTEXT_PRIORITY, 53);
+        assert_eq!(legacy::GET_MAX_ACQUIRED_BUFFER_COUNT, 54);
+        assert_eq!(legacy::GET_DYNAMIC_DISPLAY_INFO, 55);
+        assert_eq!(legacy::GET_DISPLAY_DECORATION_SUPPORT, 67);
     }
 
     #[test]
@@ -796,7 +893,6 @@ mod tests {
             .unwrap()
             .data;
         let mut reader = Reader::new(&reply);
-        assert_eq!(reader.i32(), 0); // the exception word
         assert_eq!(reader.i32(), 1); // one display
         assert_eq!(reader.i64(), 1 << 32);
 
@@ -805,7 +901,7 @@ mod tests {
             .unwrap()
             .data;
         let mut reader = Reader::new(&reply);
-        assert_eq!(reader.i32(), 0);
+        // The display id alone: no status in front of it.
         assert_eq!(reader.i64(), 1 << 32);
     }
 
@@ -817,9 +913,12 @@ mod tests {
             .transact(aidl::GET_PHYSICAL_DISPLAY_TOKEN, &request(AIDL, &args))
             .unwrap();
         // The status, then the object word the broker fills in.
-        assert_eq!(answer.data.len(), 4 + 28);
+        assert_eq!(answer.data.len(), 28);
         assert_eq!(answer.objects.len(), 1);
-        assert_eq!(answer.objects[0].offset, 4);
+        assert_eq!(
+            answer.objects[0].offset, 0,
+            "the status word is the shim's, not the service's"
+        );
         // Two calls for the same display give the same object, not two that mean
         // the same thing: the framework keeps the token and hands it back.
         let again = service
@@ -837,12 +936,12 @@ mod tests {
             .unwrap();
         assert!(answer.objects.is_empty());
         // A null binder: the object word is there, and says it is nothing.
-        assert_eq!(answer.data.len(), 4 + 28);
+        assert_eq!(answer.data.len(), 28);
         assert_eq!(
-            &answer.data[4..8],
+            &answer.data[..4],
             &crate::binder::parcel::BINDER_TYPE_BINDER.to_le_bytes()
         );
-        assert!(answer.data[8..].iter().all(|byte| *byte == 0));
+        assert!(answer.data[4..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -883,7 +982,7 @@ mod tests {
         let display = &service.displays[0];
         let bytes = service.dynamic_display_info(display);
         let mut reader = Reader::new(&bytes);
-        assert_eq!(reader.i32(), 1); // one supported mode
+        assert_eq!(reader.i64(), 1); // one supported mode, counted in eight bytes
         assert_eq!(reader.i32(), 0); // its id
         assert_eq!(reader.i32(), 1920);
         assert_eq!(reader.i32(), 1080);
@@ -895,15 +994,15 @@ mod tests {
         assert_eq!(reader.i64(), 0);
         assert_eq!(reader.i32(), 0); // group
         assert_eq!(reader.i32(), 0); // activeDisplayModeId
-        assert_eq!(reader.i32(), 1); // one color mode
+        assert_eq!(reader.i64(), 1); // one color mode, counted in eight bytes
         assert_eq!(reader.i32(), COLOR_MODE_NATIVE);
         assert_eq!(reader.i32(), COLOR_MODE_NATIVE); // active
         assert_eq!(reader.i32(), 0); // no HDR types
         assert_eq!(reader.f32(), 0.0); // maxLuminance
         assert_eq!(reader.f32(), 0.0); // maxAverageLuminance
         assert_eq!(reader.f32(), 0.0); // minLuminance
-        assert_eq!(reader.i32(), 0); // auto low latency
-        assert_eq!(reader.i32(), 0); // game content type
+        assert_eq!(reader.i8(), 0); // auto low latency, one byte
+        assert_eq!(reader.i8(), 0); // game content type, one byte
         assert_eq!(reader.i32(), -1); // no preferred boot mode
     }
 
@@ -914,17 +1013,22 @@ mod tests {
             .transact(event::STEAL_RECEIVE_CHANNEL, &[])
             .unwrap();
         // The status, the presence word a parcelable argument carries, then two
-        // descriptor words: the receive channel and the send one, in the order
-        // `BitTube::writeToParcel` writes them.
-        assert_eq!(answer.data.len(), 4 + 4 + 28 + 28);
+        // descriptor objects: the receive channel and the send one, in the order
+        // `BitTube::writeToParcel` writes them. A descriptor object is 24 bytes.
+        assert_eq!(answer.data.len(), 4 + 24 + 24);
         assert_eq!(
             answer.objects.len(),
             0,
             "a descriptor is not a binder object"
         );
         assert_eq!(answer.fds.len(), 2);
-        assert_eq!(answer.fds[0].offset, 8);
-        assert_eq!(answer.fds[1].offset, 36);
+        // The status and the presence word, then two 24-byte descriptor objects:
+        // a descriptor carries no stability word, so the second lands at 32.
+        assert_eq!(
+            answer.fds[0].offset, 4,
+            "the presence word, then the first descriptor"
+        );
+        assert_eq!(answer.fds[1].offset, 28);
         // A second steal gets nothing: the channel has one read end.
         let again = connection
             .transact(event::STEAL_RECEIVE_CHANNEL, &[])

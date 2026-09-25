@@ -38,6 +38,9 @@ pub enum Dispatch {
         /// each offset is written by the side that holds the descriptor, which is
         /// the only one that knows its number there.
         fds: Vec<(u32, OwnedFd)>,
+        /// Calls to make once the answer is delivered: a hosted service asking for
+        /// its caller to be called back, which is what a callback registration is.
+        calls: Vec<crate::binder::PendingCall>,
     },
     /// The caller owns the target. It runs it itself; the broker only had to
     /// say so.
@@ -67,11 +70,34 @@ struct Node {
     name: Option<String>,
 }
 
+/// Whether the process is still running.
+///
+/// A connection closing is not the same as a process exiting: the shim reopens
+/// its socket and the process is still there, with the services it exported still
+/// published. This is the question that tells the two apart, and it has one known
+/// limit worth stating: a pid that has been reused by a new process reads as
+/// alive, so the nodes of the process that held it linger. Nothing in the design
+/// depends on that being impossible, and the alternative -- a heartbeat -- costs
+/// more than the leak.
+fn process_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
 struct Client {
     pid: u32,
     table: HandleTable,
     /// Handles this client asked to be told about, and who owns each.
     links: Vec<(u32, ClientId)>,
+    /// Whether a connection is open right now.
+    ///
+    /// A client is not its connection. The shim holds its handle table in the
+    /// process, and the table survives a socket being closed and reopened -- so
+    /// the broker's copy has to as well, or a process that reconnects is handed a
+    /// fresh empty table while still holding the numbers it was given before, and
+    /// every transaction on them is unroutable. That is what the framework did:
+    /// `client 3 sent a transaction that cannot be routed: no handle 43 in client
+    /// 3`, and the caller saw a string read where a status belongs.
+    connected: bool,
 }
 
 /// An object word: the type, the flags, a 64-bit value, a 64-bit cookie, then the
@@ -85,12 +111,16 @@ struct Client {
 /// A descriptor word. The *number* is left zero: it is an index into the
 /// receiving process's table, and the side that holds the descriptor is the one
 /// that writes it.
+/// A descriptor object: 24 bytes, and no stability word.
+///
+/// A binder object carries a stability word; a file descriptor does not, and the
+/// reader advances by what the type says. Writing 28 made the second descriptor
+/// sit four bytes past where it is looked for.
 pub(crate) fn write_fd(data: &mut [u8], at: usize) {
     data[at..at + 4].copy_from_slice(&crate::binder::parcel::BINDER_TYPE_FD.to_le_bytes());
     data[at + 4..at + 8].copy_from_slice(&0u32.to_le_bytes());
     data[at + 8..at + 16].copy_from_slice(&0u64.to_le_bytes());
     data[at + 16..at + 24].copy_from_slice(&0u64.to_le_bytes());
-    data[at + 24..at + 28].copy_from_slice(&(STABILITY_SYSTEM as u32).to_le_bytes());
 }
 
 pub(crate) fn write_handle(data: &mut [u8], at: usize, handle: u32, node: u64) {
@@ -111,6 +141,13 @@ pub struct BinderBroker {
     clients: HashMap<ClientId, Client>,
     next_client: ClientId,
     next_hosted_node: u64,
+    /// Whether the process behind a client is still running.
+    ///
+    /// A field rather than a direct call so it can be decided in a test. The
+    /// question is real -- a connection closing is not a process exiting -- and a
+    /// test that wants a death has to be able to say so, rather than depending on
+    /// whether some pid happens to be in use on the machine running it.
+    liveness: fn(u32) -> bool,
 }
 
 impl Default for BinderBroker {
@@ -129,7 +166,15 @@ impl BinderBroker {
             clients: HashMap::new(),
             next_client: 1,
             next_hosted_node: HOSTED_NODE_BASE,
+            liveness: process_is_alive,
         }
+    }
+
+    /// Decide process liveness another way. Tests use this; nothing else should
+    /// need to.
+    #[cfg(test)]
+    pub fn set_liveness(&mut self, liveness: fn(u32) -> bool) {
+        self.liveness = liveness;
     }
 
     /// Host an object in the broker, so every process can reach it. Returns the
@@ -138,6 +183,7 @@ impl BinderBroker {
         let node = self.next_hosted_node;
         self.next_hosted_node += 1;
         self.hosted.register(name, object);
+        log::info!("broker hosts {} as node {}", name, node);
         self.nodes.insert(
             node,
             Node {
@@ -184,6 +230,27 @@ impl BinderBroker {
 
     /// A new connection. The pid is the peer's, from the kernel.
     pub fn connect(&mut self, pid: u32) -> ClientId {
+        // A process is one client, however many connections it has.
+        //
+        // Its handle table is what it holds, and the shim keeps that table in the
+        // process -- across a socket being closed and reopened, and across a second
+        // socket being opened while the first is still up. Two connections from one
+        // pid getting two tables is how `checkService idmap found in the broker,
+        // handle 43` was followed by `no handle 43 in client 2`: the lookup was
+        // answered on one connection and the call made on the other.
+        if let Some((&id, client)) = self.clients.iter_mut().find(|(_, c)| c.pid == pid) {
+            if !client.connected {
+                client.connected = true;
+                log::debug!("Binder client {} reconnected (pid {})", id, pid);
+            } else {
+                log::debug!(
+                    "Binder client {} reused for a second connection (pid {})",
+                    id,
+                    pid
+                );
+            }
+            return id;
+        }
         let id = self.next_client;
         self.next_client += 1;
         self.clients.insert(
@@ -192,6 +259,7 @@ impl BinderBroker {
                 pid,
                 table: HandleTable::new(),
                 links: Vec::new(),
+                connected: true,
             },
         );
         log::debug!("Binder client {} connected (pid {})", id, pid);
@@ -204,38 +272,62 @@ impl BinderBroker {
     /// and whoever asked to hear about it gets a notice. That is the case
     /// reference counting exists for: a process can disappear at any moment.
     pub fn disconnect(&mut self, client: ClientId) -> Vec<DeathNotice> {
-        let owned: Vec<u64> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.owner == client)
-            .map(|(node, _)| *node)
-            .collect();
+        // A process that is still alive has lost a connection, not gone away.
+        // Ownership is by process -- the node id carries the pid for exactly this
+        // reason -- so its nodes are still its own, and its handle table is still
+        // what it holds. Only a process that has exited takes its nodes with it.
+        // A socket closing is the only signal there is, so the process itself is
+        // asked.
+        let alive = self
+            .clients
+            .get(&client)
+            .map(|client| (self.liveness)(client.pid))
+            .unwrap_or(false);
 
         let mut notices = Vec::new();
-        for node in owned {
-            for holder in self.holders_of(node) {
-                if holder == client {
-                    continue;
-                }
-                let Some(record) = self.clients.get_mut(&holder) else {
-                    continue;
-                };
-                let linked = record.links.iter().any(|(_, owner)| *owner == client);
-                let dropped = record.table.drop_owner(client);
-                for (handle, _) in dropped {
-                    if linked {
-                        notices.push(DeathNotice {
-                            client: holder,
-                            handle,
-                        });
+        if !alive {
+            let owned: Vec<u64> = self
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.owner == client)
+                .map(|(node, _)| *node)
+                .collect();
+            for node in owned {
+                for holder in self.holders_of(node) {
+                    if holder == client {
+                        continue;
                     }
+                    let Some(record) = self.clients.get_mut(&holder) else {
+                        continue;
+                    };
+                    let linked = record.links.iter().any(|(_, owner)| *owner == client);
+                    let dropped = record.table.drop_owner(client);
+                    for (handle, _) in dropped {
+                        if linked {
+                            notices.push(DeathNotice {
+                                client: holder,
+                                handle,
+                            });
+                        }
+                    }
+                    record.links.retain(|(_, owner)| *owner != client);
                 }
-                record.links.retain(|(_, owner)| *owner != client);
+                self.nodes.remove(&node);
             }
-            self.nodes.remove(&node);
         }
-        self.clients.remove(&client);
-        log::debug!("Binder client {} disconnected", client);
+        // The record stays, marked disconnected: the process may reconnect, and
+        // what it holds is still what it holds. Its nodes stay too when it is still
+        // running, because ownership is by process and the process has not gone
+        // anywhere -- a service it exported is still published, and the next
+        // connection picks it up by looking the name up again.
+        if let Some(client) = self.clients.get_mut(&client) {
+            client.connected = false;
+        }
+        log::debug!(
+            "Binder client {} disconnected{}",
+            client,
+            if alive { " (still running)" } else { "" }
+        );
         notices
     }
 
@@ -334,10 +426,15 @@ impl BinderBroker {
         data: Vec<u8>,
         arguments: Vec<ArgumentRef>,
     ) -> anyhow::Result<Dispatch> {
-        let target = self
+        let caller = self
             .clients
             .get(&client)
-            .ok_or_else(|| anyhow::anyhow!("no such client: {}", client))?
+            .ok_or_else(|| anyhow::anyhow!("no such client: {}", client))?;
+        // A record now outlives its connection, so this has to be said out loud:
+        // a client with no connection cannot make a call. Its table is kept for
+        // the reconnect, not for use while it is away.
+        anyhow::ensure!(caller.connected, "client {} is not connected", client);
+        let target = caller
             .table
             .target(handle)
             .ok_or_else(|| anyhow::anyhow!("no handle {} in client {}", handle, client))?;
@@ -346,7 +443,16 @@ impl BinderBroker {
             Target::Local(node) => Ok(Dispatch::Local { node }),
             Target::ServiceManager => anyhow::bail!("the service manager is the shim's to answer"),
             Target::Remote { node, owner } if owner == SERVICE_MANAGER => {
-                Ok(self.hosted_reply(client, node, code, &data))
+                // The objects the caller passed, as handles in the *caller's* table.
+                // A hosted service that has to call its caller back needs these, and
+                // only the caller's table can say what they mean.
+                let mut handles = Vec::with_capacity(arguments.len());
+                for argument in &arguments {
+                    if let Some(handle) = self.handle_for(client, argument.node) {
+                        handles.push(handle);
+                    }
+                }
+                Ok(self.hosted_reply(client, node, code, &data, &handles))
             }
             Target::Remote { node, owner } => {
                 // The objects among the arguments: what the sender has, the callee
@@ -384,10 +490,17 @@ impl BinderBroker {
     /// caller needs is a handle in its own table, and this is where that exists.
     /// Each one is looked up (or created) for the caller and written into the
     /// answer's data, followed by the stability word a binder object carries.
-    fn hosted_reply(&mut self, client: ClientId, node: u64, code: u32, data: &[u8]) -> Dispatch {
+    fn hosted_reply(
+        &mut self,
+        client: ClientId,
+        node: u64,
+        code: u32,
+        data: &[u8],
+        arguments: &[u32],
+    ) -> Dispatch {
         let name = self.nodes.get(&node).and_then(|entry| entry.name.clone());
         let answer = match (name, self.hosted_unnamed.get_mut(&node)) {
-            (Some(name), _) => match self.hosted.transact(&name, code, data) {
+            (Some(name), _) => match self.hosted.transact_with(&name, code, data, arguments) {
                 Ok(answer) => answer,
                 Err(e) => {
                     return Dispatch::Reply {
@@ -395,11 +508,17 @@ impl BinderBroker {
                         data: e.to_string().into_bytes(),
                         objects: Vec::new(),
                         fds: Vec::new(),
+                        calls: Vec::new(),
                     }
                 }
             },
             (None, Some(object)) => {
-                match crate::binder::ServiceRegistry::answer_itself(object.as_mut(), code, data) {
+                match crate::binder::ServiceRegistry::answer_itself(
+                    object.as_mut(),
+                    code,
+                    data,
+                    arguments,
+                ) {
                     Ok(answer) => answer,
                     Err(e) => {
                         return Dispatch::Reply {
@@ -407,6 +526,7 @@ impl BinderBroker {
                             data: e.to_string().into_bytes(),
                             objects: Vec::new(),
                             fds: Vec::new(),
+                            calls: Vec::new(),
                         }
                     }
                 }
@@ -417,9 +537,11 @@ impl BinderBroker {
                     data: b"no such object".to_vec(),
                     objects: Vec::new(),
                     fds: Vec::new(),
+                    calls: Vec::new(),
                 }
             }
         };
+        let calls = answer.calls;
         let mut data = answer.data;
         let fds: Vec<(u32, OwnedFd)> = answer
             .fds
@@ -429,7 +551,9 @@ impl BinderBroker {
         let mut objects = Vec::with_capacity(answer.objects.len() + fds.len());
         for (offset, _) in &fds {
             let at = *offset as usize;
-            if at + 28 <= data.len() {
+            // A descriptor object is 24 bytes; requiring 28 skipped every one
+            // whose word was the last thing in the answer.
+            if at + 24 <= data.len() {
                 write_fd(&mut data, at);
                 // The offset goes in the same list as the binder objects: the side
                 // that writes the caller's Parcel needs to know where every word
@@ -466,6 +590,7 @@ impl BinderBroker {
             data,
             objects,
             fds,
+            calls,
         }
     }
 
@@ -531,6 +656,19 @@ impl BinderBroker {
             Target::Remote { node, owner }
         };
         Some(record.table.handle_for(target))
+    }
+
+    /// The client that owns the object a caller's handle names, and the node.
+    ///
+    /// A hosted service that asks for a call to be made -- a callback registration
+    /// -- names an object by the handle its *caller* has for it, and only the
+    /// caller's table can turn that into something the owner recognises. This is
+    /// that turn: the object may be the caller's own, or one it was given a handle
+    /// to, and the node is what the owner's process runs a transaction against.
+    pub fn call_target(&self, client: ClientId, handle: u32) -> Option<(ClientId, u64)> {
+        let node = self.clients.get(&client)?.table.target(handle)?.node()?;
+        let owner = self.nodes.get(&node)?.owner;
+        Some((owner, node))
     }
 
     /// A weak reference taken by a client, as `BC_INCREFS` carries it.
@@ -616,10 +754,22 @@ impl BinderBroker {
         self.clients.get(&client)?.table.target(handle)
     }
 
+    /// The node a name resolves to.
+    ///
+    /// A name the broker hosts wins over one a client exported, and that is a rule rather than
+    /// a preference: the broker is the party that is always there, and `host` is how this side
+    /// provides a service the image's own daemon does not. Without the rule this scan is a
+    /// `HashMap` iteration, so which of two registrations of one name wins is arbitrary -- and
+    /// `idmap` is registered twice in a boot, once here and once by `idmap2d`.
     fn node_named(&self, name: &str) -> Option<(u64, ClientId)> {
-        self.nodes
-            .iter()
-            .find(|(_, node)| node.name.as_deref() == Some(name))
+        let matching = || {
+            self.nodes
+                .iter()
+                .filter(|(_, node)| node.name.as_deref() == Some(name))
+        };
+        matching()
+            .find(|(_, node)| node.owner == SERVICE_MANAGER)
+            .or_else(|| matching().next())
             .map(|(node, entry)| (*node, entry.owner))
     }
 
@@ -770,6 +920,7 @@ mod tests {
             data,
             objects,
             fds: _,
+            calls: _,
         } = answer
         else {
             panic!("expected an answer from the hal")
@@ -900,6 +1051,7 @@ mod tests {
                 data,
                 objects: _,
                 fds: _,
+                calls: _,
             } => {
                 assert_eq!(status, 0);
                 assert_eq!(&data[..4], &9u32.to_be_bytes());
@@ -964,6 +1116,7 @@ mod tests {
     #[test]
     fn references_keep_a_node_alive() {
         let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| false);
         let owner = broker.connect(1000);
         let caller = broker.connect(2000);
         let node = node_for(1000, 9);
@@ -1004,6 +1157,7 @@ mod tests {
     #[test]
     fn a_dead_owner_notifies_the_processes_using_it() {
         let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| false);
         let owner = broker.connect(1000);
         let caller = broker.connect(2000);
         let node = node_for(1000, 11);
@@ -1033,6 +1187,7 @@ mod tests {
     #[test]
     fn an_unlinked_client_is_not_notified() {
         let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| false);
         let owner = broker.connect(1000);
         let caller = broker.connect(2000);
         let node = node_for(1000, 12);
@@ -1045,8 +1200,8 @@ mod tests {
             .is_err());
 
         // And unlink means the linker stops hearing about it too.
-        let owner = broker.connect(1001);
-        let node = node_for(1001, 13);
+        let owner = broker.connect(1000);
+        let node = node_for(1000, 13);
         broker.export(owner, "svc2", node).unwrap();
         let (handle, _, _) = broker.lookup(caller, "svc2").unwrap();
         broker.link_to_death(caller, handle).unwrap();
@@ -1072,6 +1227,7 @@ mod tests {
     #[test]
     fn disconnect_settles_the_accounts() {
         let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| false);
         let owner = broker.connect(1000);
         let caller = broker.connect(2000);
         let node = node_for(1000, 16);
@@ -1092,9 +1248,88 @@ mod tests {
             .is_err());
     }
 
+    /// A process that reconnects is the same client. Its handles are kept, because
+    /// the shim holds them in the process and still holds them when the socket is
+    /// reopened -- handing it a fresh table leaves it holding numbers this side no
+    /// longer knows, which is what the framework hit.
+    #[test]
+    fn a_reconnect_keeps_its_handles() {
+        let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| true);
+        let owner = broker.connect(1000);
+        let caller = broker.connect(2000);
+        let node = node_for(1000, 17);
+        broker.export(owner, "svc", node).unwrap();
+        let (handle, _, _) = broker.lookup(caller, "svc").unwrap();
+
+        broker.disconnect(caller);
+        let again = broker.connect(2000);
+        assert_eq!(again, caller, "the same process is the same client");
+        assert!(
+            broker
+                .transact(again, handle, 1, 0, Vec::new(), Vec::new())
+                .is_ok(),
+            "a handle taken before a reconnect still resolves after it"
+        );
+    }
+
+    /// A second connection from a process that is already connected is the *same*
+    /// client. Two tables for one pid is what made a handle found by one lookup
+    /// unroutable on the next call: the lookup was answered on one connection and
+    /// the call made on the other.
+    #[test]
+    fn a_second_connection_from_one_process_is_the_same_client() {
+        let mut broker = BinderBroker::new();
+        let first = broker.connect(1000);
+        let second = broker.connect(1000);
+        assert_eq!(first, second, "one process, one table");
+    }
+
+    /// A process that is still running keeps what it exported when its connection
+    /// drops. Ownership is by process, and the process has not gone anywhere -- the
+    /// framework's `activity` and `window` are published this way, and losing them
+    /// on every reconnect would unpublish services that are still running.
+    #[test]
+    fn a_live_process_keeps_its_nodes_across_a_disconnect() {
+        let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| true);
+        let me = 4242;
+        let owner = broker.connect(me);
+        let caller = broker.connect(2000);
+        let node = node_for(me, 18);
+        broker.export(owner, "svc", node).unwrap();
+        let (handle, _, _) = broker.lookup(caller, "svc").unwrap();
+
+        broker.disconnect(owner);
+
+        assert_eq!(broker.owner_of(node), Some(owner), "the node survives");
+        assert!(
+            broker
+                .transact(caller, handle, 1, 0, Vec::new(), Vec::new())
+                .is_ok(),
+            "and is still reachable by whoever held a handle to it"
+        );
+    }
+
+    /// A process that has exited takes its nodes with it, which is the case the
+    /// death notices exist for.
+    #[test]
+    fn an_exited_process_takes_its_nodes() {
+        let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| false);
+        let owner = broker.connect(999_999_999);
+        let node = node_for(999_999_999, 19);
+        broker.export(owner, "svc", node).unwrap();
+
+        broker.disconnect(owner);
+
+        assert_eq!(broker.owner_of(node), None, "the node is gone");
+    }
+
     #[test]
     fn a_weak_reference_does_not_outlive_a_strong_one() {
         let mut broker = BinderBroker::new();
+        broker.set_liveness(|_| true);
         let owner = broker.connect(1000);
         let caller = broker.connect(2000);
         let node = node_for(1000, 17);

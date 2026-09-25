@@ -41,11 +41,20 @@ shim="$root/tools/binder-shim/out"
 launcher="$root/tools/launcher/out/launcher.so"
 preload="$launcher $shim/probe.so $shim/pretend-nice.so $shim/pretend-cgroups.so"
 preload="$preload $shim/android-binder.so $shim/android-properties.so $shim/alloc-trace.so"
+# libandroid_servers.so has a DT_NEEDED entry for libandroid_runtime.so. The
+# launcher must register JNI through that same instance; loading the runtime
+# again by absolute path creates a second copy with a separate MessageQueue
+# field-ID cache.
+preload="$preload $bundle/lib64/libandroid_runtime.so"
 
 pkill -f "mosaic.*daemon" 2>/dev/null
 rm -f "$socket" "$broker_log"
-MOSAIC_SOCKET="$socket" "$root/target/debug/mosaic" -l "$broker_log" -w /tmp/mosaic-bootwork \
-  daemon >/dev/null 2>&1 &
+# The bundle the framework will run from, so the services the broker hosts answer
+# about the same tree: the apex service lists what is in its apex/ directory, and
+# with no root it answers "none" and the package manager aborts on a package that
+# is right there.
+MOSAIC_SOCKET="$socket" MOSAIC_ANDROID_ROOT="$bundle" "$root/target/debug/mosaic" \
+  -v -l "$broker_log" -w /tmp/mosaic-bootwork daemon >/dev/null 2>&1 &
 broker=$!
 for _ in $(seq 1 100); do [ -S "$socket" ] && break; sleep 0.05; done
 if [ ! -S "$socket" ]; then
@@ -53,7 +62,27 @@ if [ ! -S "$socket" ]; then
   exit 1
 fi
 
+# The overlay compiler's daemon, before the framework: it registers the `idmap`
+# service itself, and `IdmapDaemon` looks it up with `getService` rather than
+# waiting, so it has to be there first. It is a Bionic program from the image,
+# run the same way the framework is.
 cd "$bundle" || exit 1
+# The bundle's own runner resolves a binary *name* against `$out/bin`, so a path
+# here is joined to that directory and the result does not exist:
+# `bin//home/.../bin/idmap2d: No such file or directory`. It failed quietly -- the
+# overlay compiler never started, `idmap` was never registered, and what surfaced
+# much later was `OverlayManagerService: failed to get all fabricated overlays`.
+MOSAIC_BINDER_BROKER=1 MOSAIC_BINDER_SOCKET="$socket" \
+MOSAIC_ANDROID_ROOT=$PWD MOSAIC_PROPERTY_DIR=$PWD/properties \
+MOSAIC_PRELOAD="$preload" \
+"$root/tools/bundle/with-logd.sh" "$PWD/run.sh" idmap2d \
+  > /tmp/mosaic-idmap2d.log 2>&1 &
+idmap2d=$!
+for _ in $(seq 1 100); do
+  grep -aq "registered idmap" "$broker_log" 2>/dev/null && break
+  sleep 0.05
+done
+
 MOSAIC_BINDER_BROKER=1 MOSAIC_BINDER_SOCKET="$socket" \
 MOSAIC_ANDROID_ROOT=$PWD MOSAIC_PROPERTY_DIR=$PWD/properties \
 MOSAIC_TIMEOUT=${MOSAIC_TIMEOUT:-180} MOSAIC_MAX_OUTPUT=${MOSAIC_MAX_OUTPUT:-6000000} \
@@ -64,7 +93,18 @@ MOSAIC_LAUNCH_RUNTIME=$PWD/lib64/libandroid_runtime.so \
   -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)" \
   > "$log" 2>&1
 status=$?
-kill $broker 2>/dev/null
+# The same cleanup on every way out. A run that is killed by its own timeout does not
+# reach the line below, and the daemon it started outlives it -- four were still running
+# after a few rounds of debugging, and `pgrep` kept handing back the oldest, so a
+# debugger attached to a process from a boot that had already ended and saw nothing.
+cleanup() {
+  kill $broker $idmap2d 2>/dev/null
+  # `$idmap2d` is the wrapper the bundle's runner is started under; the daemon itself
+  # is its child, and killing the wrapper leaves it. Matching by path takes both.
+  pkill -f "$bundle/bin/idmap2d" 2>/dev/null
+}
+trap cleanup EXIT
+cleanup
 
 clean=$(tr -d '\000' < "$log")
 echo "exit=$status  lines=$(echo "$clean" | wc -l)  log=$log"
