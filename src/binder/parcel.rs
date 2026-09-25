@@ -24,7 +24,11 @@ const PARCELABLE_PRESENT: i32 = 1;
 /// A file descriptor inside a Parcel: an object word whose value is the number of
 /// a descriptor in the receiving process's table. `Parcel::writeDupFileDescriptor`
 /// writes one, and `readFileDescriptor` reads it back.
-pub const BINDER_TYPE_FD: u32 = 0x73662a85;
+/// `B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE)`, which is 'f', 'd', '*' and the type
+/// byte. This was `0x73662a85` -- 's', 'f', '*' -- which is the handle pattern with
+/// the middle letter changed, and the framework rejects it as an invalid object
+/// type, so a descriptor written with it is dropped rather than taken.
+pub const BINDER_TYPE_FD: u32 = 0x66642a85;
 pub const STABILITY_UNDECLARED: i32 = 0;
 pub const STABILITY_SYSTEM: i32 = 12; /* 0b001100 */
 pub const STABILITY_VINTF: i32 = 63; /* 0b111111 */
@@ -98,7 +102,12 @@ impl Parcel {
     /// the shape and nothing else. Returns where the word begins.
     pub fn fd_placeholder(&mut self) -> u32 {
         let offset = self.bytes.len() as u32;
-        for _ in 0..28 {
+        // A descriptor object is 24 bytes, not 28: the stability word a binder
+        // object carries is written for handles and binders, and a file descriptor
+        // is neither. Reserving 28 put the *second* descriptor four bytes past
+        // where the reader looks for it, and what the reader said was
+        // "offset 32 that is not in the object list".
+        for _ in 0..24 {
             self.bytes.push(0);
         }
         offset
@@ -130,6 +139,39 @@ impl Parcel {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+}
+
+/// A Java AIDL *call*'s parcel: the header a Java `Parcel` begins with, the
+/// interface descriptor, then the arguments.
+///
+/// This shape is not optional in either direction. A Java receiver's `onTransact`
+/// starts with `enforceInterface`, and a parcel that does not begin with the header
+/// is refused before a single argument is read -- `Expecting header 0x53595354 but
+/// found 0x0. Mixing copies of libbinder?` and then `Binder invocation to an
+/// incorrect interface`.
+///
+/// The header is twelve bytes -- two words the Java `Parcel` writes for itself and
+/// the `TSYS` marker -- and then the descriptor as a count of UTF-16 units
+/// *including* its terminator, the units themselves, the terminator, and padding to
+/// four. Services have been *reading* this shape since the request layout was
+/// worked out; a service that has to *call back* into Java has to write it, and the
+/// health HAL's callback is the first that does.
+pub fn java_call(descriptor: &str, args: &[u8]) -> Vec<u8> {
+    let mut data = vec![0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff];
+    data.extend_from_slice(b"TSYS");
+    // The count is the units *without* the terminator, which is what the platform's
+    // own writer puts on the wire: a forty-character descriptor goes out with forty.
+    let units = descriptor.encode_utf16().count();
+    data.extend_from_slice(&(units as i32).to_le_bytes());
+    for unit in descriptor.encode_utf16() {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    data.extend_from_slice(&[0, 0]);
+    while data.len() % 4 != 0 {
+        data.push(0);
+    }
+    data.extend_from_slice(args);
+    data
 }
 
 /// Where the arguments start, found rather than counted.
@@ -184,6 +226,16 @@ impl<'a> Reader<'a> {
         f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 
+    /// One byte, which is what a bool is in a flattened stream (a *Parcel* writes
+    /// four, and the two are different conventions).
+    pub fn i8(&mut self) -> i8 {
+        let bytes = self.take(1);
+        if bytes.is_empty() {
+            return 0;
+        }
+        bytes[0] as i8
+    }
+
     pub fn i64(&mut self) -> i64 {
         let bytes = self.take(8);
         if bytes.len() < 8 {
@@ -220,6 +272,31 @@ impl<'a> Reader<'a> {
             return Vec::new();
         }
         (0..count).map(|_| self.i64()).collect()
+    }
+
+    /// An array of ints: a count and then the ints.
+    pub fn i32s(&mut self) -> Vec<i32> {
+        let count = self.i32();
+        if count <= 0 {
+            return Vec::new();
+        }
+        (0..count).map(|_| self.i32()).collect()
+    }
+
+    /// A `String8`, which is not the same shape as a Java string: a *byte* length, then the bytes
+    /// and their terminator, padded out to four. `Parcel::writeString8` and `readString8` are the
+    /// pair, and a service that answers one to a caller that reads the other is off by the padding.
+    pub fn string8(&mut self) -> Option<String> {
+        let len = self.i32();
+        if len < 0 {
+            return None;
+        }
+        let bytes = self.take(len as usize);
+        self.take(1); // the terminator
+        while self.at % 4 != 0 {
+            self.at += 1;
+        }
+        Some(String::from_utf8_lossy(bytes).into_owned())
     }
 
     /// An array of strings: a count and then the strings.

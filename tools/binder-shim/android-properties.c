@@ -28,6 +28,7 @@ extern long syscall(long, ...);
 
 extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
+extern void *dlsym(void *, const char *);
 
 #define SYS_close 3
 #define SYS_write 1
@@ -63,7 +64,70 @@ static void say(const char *s) {
  * same way the harness bounds its output. */
 static int logged = 0;
 
+/* A diagnostic: read the names the package manager needs, with the same libc the
+ * framework reads them with, and say what comes back. Interposing
+ * `__system_property_get` did not work -- the callers reach it inside their own
+ * library -- but calling it from here is the same question asked of the same code. */
+static int reads_logged = 0;
+
+/* What the callback reader reports, so the two can be compared. */
+static void property_callback(void *cookie, const char *name, const char *value, unsigned int serial) {
+    (void)cookie;
+    (void)serial;
+    say("android-properties: callback ");
+    say(name);
+    say(" -> ");
+    say(value ? value : "(null)");
+    say("\n");
+}
+
+static void check_property_reads(void) {
+    static int (*real_get)(const char *, char *);
+    if (!real_get) real_get = (int (*)(const char *, char *))dlsym((void *)-1L, "__system_property_get");
+    if (!real_get || reads_logged) return;
+    reads_logged = 1;
+    static const char *names[] = {"pm.dexopt.first-boot", "pm.dexopt.bg-dexopt", "ro.build.version.sdk",
+                                  "fw.free_cache_v2", "persist.sys.preloads.file_cache_expired"};
+    for (unsigned long i = 0; i < 5; i++) {
+        char value[128];
+        for (int j = 0; j < 128; j++) value[j] = 0;
+        int got = real_get(names[i], value);
+        say("android-properties: reading ");
+        say(names[i]);
+        say(" -> ");
+        say(value);
+        say("\n");
+        (void)got;
+    }
+    /* The other reader: `__system_property_find` walks the trie, and that is what
+     * the JNI's property callbacks use. A name the old path finds and this one does
+     * not is a trie entry the builder got wrong. */
+    static void *(*find)(const char *);
+    if (!find) find = (void *(*)(const char *))dlsym((void *)-1L, "__system_property_find");
+    if (find) {
+        for (unsigned long i = 0; i < 5; i++) {
+            void *found = find(names[i]);
+            say("android-properties: find ");
+            say(names[i]);
+            say(found ? " -> found\n" : " -> NOT FOUND\n");
+        }
+    }
+    /* And the callback reader, which is the one `libbase`'s GetProperty uses in
+     * this branch: it reads through the serial and the prop_info rather than the
+     * old map, so a name the two above find can still come back empty here. */
+    static void (*read_cb)(const void *, void (*)(void *, const char *, const char *, unsigned int), void *);
+    if (!read_cb) read_cb = (void (*)(const void *, void (*)(void *, const char *, const char *, unsigned int), void *))dlsym((void *)-1L, "__system_property_read_callback");
+    if (read_cb && find) {
+        for (unsigned long i = 0; i < 5; i++) {
+            void *found = find(names[i]);
+            if (!found) continue;
+            read_cb(found, property_callback, 0);
+        }
+    }
+}
+
 int __system_property_set(const char *key, const char *value) {
+    check_property_reads();
     if (!key || !*key) return -1;
     if (!value) value = "";
 

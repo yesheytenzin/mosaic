@@ -28,11 +28,14 @@ extern void free(void *);
 #define SYS_poll 7
 #define SYS_mmap 9
 #define SYS_nanosleep 35
+#define SYS_getpid 39
 #define SYS_ioctl 16
 #define SYS_ftruncate 77
 #define SYS_epoll_ctl 233
 #define SYS_openat 257
 #define SYS_memfd_create 319
+#define SYS_getuid 102
+#define SYS_geteuid 107
 
 #define AT_FDCWD -100
 #define O_RDONLY 0
@@ -131,7 +134,44 @@ static long log_length = 0;
 #define BC_TRANSACTION BC(0, 64)
 #define BC_REPLY BC(1, 64)
 #define BC_FREE_BUFFER BC(3, 8)
-#define BR_TRANSACTION_COMPLETE BR(4, 4)
+/* Taking and giving back a reference to an object in another process. These were
+ * consumed and forgotten, which is why an object died while a holder still
+ * believed in it: the count was kept on one side of the socket only.
+ * _IOW('c', 5, __u32) and _IOW('c', 6, __u32) -- the operand is the handle. */
+#define BC_ACQUIRE BC(5, 4)
+#define BC_RELEASE BC(6, 4)
+/* The weak pair. `RefBase` keeps a strong count and a weak one, `BC_INCREFS` and
+ * `BC_DECREFS` are how the weak one crosses processes, and dropping them is what
+ * `RefBase: decWeak called on ... too many times` means: the object was
+ * destroyed while a holder still had a weak reference to it. _IOW('c', 4) and
+ * _IOW('c', 7). */
+#define BC_INCREFS BC(4, 4)
+#define BC_DECREFS BC(7, 4)
+/* _IOW('c', 14, struct binder_ptr_cookie): a handle and the cookie to report it
+ * with. The cookie is the caller's, and it is the whole point of the pair. */
+#define BC_REQUEST_DEATH_NOTIFICATION BC(14, 16)
+#define BC_CLEAR_DEATH_NOTIFICATION BC(15, 16)
+/* The values below are checked against the image's own libbinder rather than the
+ * kernel's header: it is the reader that decides, and it was compiled against its
+ * own. `_IOR('r', 2, struct binder_transaction_data)` is present at size 64 and at
+ * size 72 -- the second is the variant carrying a security context -- and
+ * `_IOR('r', 3, ...)` is present at 64, which is what this sends for a reply. */
+/* 64, and this time the number is backed by a measurement rather than a guess:
+ * trying 72 makes the boot worse (`no answer for node` goes from 1 to 2), so this
+ * reader walks the plain transaction data. The image's libbinder carries the command
+ * at both sizes because it also handles the security-context variant; this build
+ * reads the smaller one, which is the one the header describes as the default. */
+#define BR_TRANSACTION BR(2, 64)
+/* `_IO('r', 6)`: direction NONE, not READ. `BR(nr, size)` builds with the READ
+ * direction, which is right for commands that carry a payload and wrong for the
+ * ones that do not -- `_IO` has no direction at all, and the reader compares the
+ * whole word. `BAD COMMAND -2147454458` is 0x80007206, which is this value built
+ * with READ; the driver's is 0x00007206. `BR_NOOP` below is built with
+ * `IOC(0, 'r', 12, 0)` for the same reason. */
+#define BR_TRANSACTION_COMPLETE IOC(0, 'r', 6, 0)
+/* _IOR('r', 15, binder_uintptr_t): the argument is the cookie the caller handed
+ * to linkToDeath, which is what tells it *which* death this is. */
+#define BR_DEAD_BINDER BR(15, 8)
 #define BR_NOOP IOC(0, 'r', 12, 0)
 #define BR_REPLY BR(3, 64)
 
@@ -281,6 +321,244 @@ static void dump_stream(const char *what, unsigned char *bytes, unsigned long si
     flush_log();
 }
 
+/* Death notification, which the driver would do.
+ *
+ * A caller asks to hear about a handle dying and gives a cookie to be told with.
+ * When the process on the other end goes away the driver hands that cookie back
+ * as BR_DEAD_BINDER, on the reading thread. Nothing here is optional: a caller
+ * that is not told keeps using a handle that no longer routes, and the failure
+ * surfaces far away as a garbage status in the middle of an unrelated call.
+ *
+ * The cookie is the caller's and opaque, so it is carried, never interpreted. */
+#define MAX_DEATHS 32
+
+static struct {
+    unsigned int handle;
+    unsigned long long cookie;
+} deaths[MAX_DEATHS];
+static int death_count;
+static unsigned int deaths_pending[MAX_DEATHS];
+static int death_pending_count;
+
+/* Told to the broker from the other half of the shim, which speaks its protocol.
+ * The broker only needs the handle: it reports the death by handle, and the
+ * cookie is the caller's and stays here. */
+void shim_death_requested(unsigned int handle);
+void shim_reference_taken(unsigned int handle);
+void shim_reference_released(unsigned int handle);
+/* The weak pair, which `RefBase` keeps for death notification. */
+void shim_weak_reference_taken(unsigned int handle);
+void shim_weak_reference_released(unsigned int handle);
+void shim_death_cleared(unsigned int handle);
+
+static void death_remember(unsigned int handle, unsigned long long cookie) {
+    for (int i = 0; i < death_count; i++) {
+        if (deaths[i].handle == handle) {
+            deaths[i].cookie = cookie;
+            return;
+        }
+    }
+    if (death_count < MAX_DEATHS) {
+        deaths[death_count].handle = handle;
+        deaths[death_count].cookie = cookie;
+        death_count++;
+    }
+}
+
+static void death_forget(unsigned int handle) {
+    for (int i = 0; i < death_count; i++) {
+        if (deaths[i].handle != handle) continue;
+        deaths[i] = deaths[death_count - 1];
+        death_count--;
+        return;
+    }
+}
+
+/* An incoming transaction: the broker asking this process to serve a call on an
+ * object it owns.
+ *
+ * It has to reach the process's own binder thread as BR_TRANSACTION, which is what
+ * the driver would write -- the object is the caller's, its cookie is the only
+ * thing that finds it, and the framework's Binder is the only thing that can run
+ * it. Serving it here instead, which this did, leaves the framework's binder
+ * thread with nothing to read and no way to be called back. */
+#define MAX_INCOMING 8
+
+/* The strong hold a transaction takes on its target, which the driver takes and
+ * this side did not.
+ *
+ * On a device the kernel keeps the target alive for the duration of the call and
+ * drops it after, and that is the reference that makes the difference between an
+ * object being destroyed inside its own transaction and being destroyed when the
+ * last holder lets go. Without it, `IPCThreadState`'s own balanced `sp<BBinder>`
+ * around the call is the *last* reference, the object dies at the end of the
+ * call, and the weak release that follows is against a count already gone:
+ * `RefBase: decWeak called on ... too many times`. */
+static void *strong_hold;
+typedef void (*strong_fn)(void *);
+static strong_fn refbase_inc_strong;
+static strong_fn refbase_dec_strong;
+
+void shim_resolve_refbase(void *incref_symbol, void *decref_symbol) {
+    refbase_inc_strong = (strong_fn)incref_symbol;
+    refbase_dec_strong = (strong_fn)decref_symbol;
+}
+
+/* A reference kept for good, by a side that will never give it back: what a
+ * registry does for a service it now owns, and what the fallback reader needed --
+ * it returned an object with no reference at all, so anything the framework
+ * registered from a temporary died underneath the registry. */
+void shim_hold_object(void *object) {
+    if (object && refbase_inc_strong) refbase_inc_strong(object);
+}
+
+/* The driver holds a strong reference on a transaction's target for the duration of
+ * the call, and this tried to mirror that by calling `RefBase::incStrong` on the
+ * object directly. That crashes: the pointer is not always a `RefBase` -- it depends
+ * on what the publisher put in the word -- and `incStrong` on it faults inside
+ * libutils, which is a worse failure than the one it was there to prevent.
+ *
+ * It was written for `decWeak called ... too many times`, and the core later showed
+ * that message is a static object's destructor during `exit`: shutdown noise, not a
+ * live count. So the emulation is not needed, and a crash it introduces is not a
+ * trade worth making. If it is ever wanted, the object has to be *known* to be a
+ * `RefBase` first, which means the publisher saying so rather than this side
+ * guessing from a word that sometimes is one. */
+static void hold_target(void *object, unsigned int flags) {
+    (void)object;
+    (void)flags;
+}
+
+/* The call has been answered. See `hold_target`: there is nothing to release. */
+void shim_release_target(void) {}
+
+static struct {
+    void *object;
+    unsigned long long cookie;
+    unsigned int code;
+    unsigned int flags;
+    unsigned char *data;
+    unsigned long size;
+    /// How many of the body's trailing words are object offsets, which the reader
+    /// needs: it walks them to find the objects among the arguments, and a count of
+    /// zero over a body that has them is what it cannot survive.
+    unsigned int objects;
+} incoming[MAX_INCOMING];
+static int incoming_count;
+
+void shim_incoming(void *object, unsigned long long cookie, unsigned int code,
+                   unsigned int flags, const unsigned char *data, unsigned long size,
+                   unsigned int objects) {
+    if (incoming_count >= MAX_INCOMING) return;
+    unsigned char *copy = (unsigned char *)malloc(size ? size : 1);
+    if (!copy) return;
+    if (size) __builtin_memcpy(copy, data, size);
+    /* Held rather than freed after the read: the reader keeps the pointer and
+     * frees it when it is done with the parcel, by sending BC_FREE_BUFFER -- the
+     * same way a reply's buffer is handled. */
+    hold(copy, 0);
+    incoming[incoming_count].object = object;
+    incoming[incoming_count].cookie = cookie;
+    incoming[incoming_count].code = code;
+    incoming[incoming_count].flags = flags;
+    incoming[incoming_count].data = copy;
+    incoming[incoming_count].size = size;
+    incoming[incoming_count].objects = objects;
+    incoming_count++;
+}
+
+/* Write one incoming transaction, if there is one and there is room.
+ *
+ * The command stream is commands only: the reader advances by the size each
+ * command's word carries, so the parcel cannot live inline. `data.ptr.buffer`
+ * points at the parcel and the reader follows it, which is what the reply path
+ * already does with a buffer it holds. Writing the data after the struct and
+ * counting it in `read_consumed`, which this did, put the reader's next command
+ * wherever the arithmetic landed -- and what it read there was a pointer. */
+static long incoming_write(unsigned char *out, long capacity) {
+    if (incoming_count == 0) return 0;
+    if (capacity < 4 + 64) return 0;
+    unsigned int command = BR_TRANSACTION;
+    __builtin_memcpy(out, &command, 4);
+    unsigned char *tr = out + 4;
+    for (int i = 0; i < 64; i++) tr[i] = 0;
+    /* `target.ptr` is the object itself -- the reader calls a virtual method on it
+     * -- and `cookie` is the publishing process's cookie, which its `onTransact`
+     * sees. Putting the cookie in both, which this did, is a virtual call through
+     * a value that is not a vtable. */
+    if (tracing_on() == 0 && incoming[0].object) {
+        emit("binder-shim: target 0x");
+        {
+            unsigned long v = (unsigned long)incoming[0].object;
+            char digit[2];
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                digit[0] = "0123456789abcdef"[(v >> shift) & 0xf];
+                digit[1] = 0;
+                emit(digit);
+            }
+        }
+        emit("\n");
+        flush_log();
+    }
+    hold_target(incoming[0].object, incoming[0].flags);
+    unsigned long long object = (unsigned long long)incoming[0].object;
+    __builtin_memcpy(tr + 0, &object, 8);   /* target.ptr */
+
+    unsigned long long cookie = incoming[0].cookie;
+    __builtin_memcpy(tr + 8, &cookie, 8);   /* cookie */
+    unsigned int code = incoming[0].code;
+    __builtin_memcpy(tr + 16, &code, 4);
+    /* Only the flags the driver defines. The framework sends `2` for this call and
+     * the kernel has no such value -- TF_ONE_WAY 0x01, TF_ACCEPT_FDS 0x10,
+     * TF_CLEAR_BUF 0x20, TF_UPDATE_TXN 0x40 -- so a real driver would never deliver
+     * it, and a vendored handler that acts on the word rather than ignoring it is a
+     * handler that never answers. Stripping what cannot exist is what the driver
+     * does; passing it through is what this did. */
+    unsigned int flags = incoming[0].flags & 0x71u;
+    __builtin_memcpy(tr + 20, &flags, 4);
+    unsigned long size = incoming[0].size;
+    __builtin_memcpy(tr + 32, &size, 8);    /* data_size */
+    /* The sender, which the reader reports to the object it calls. Zero is not a
+     * pid, and the object this is going to is the framework's own. */
+    unsigned int pid = (unsigned int)syscall(SYS_getpid);
+    __builtin_memcpy(tr + 24, &pid, 4);     /* sender_pid */
+    unsigned long long buffer = (unsigned long long)incoming[0].data;
+    __builtin_memcpy(tr + 48, &buffer, 8);  /* data.ptr.buffer */
+    /* The object offsets ride at the end of the body, four bytes each, and the
+     * size of that table is part of what the reader walks. */
+    unsigned long offsets_size = (unsigned long)incoming[0].objects * 4;
+    __builtin_memcpy(tr + 40, &offsets_size, 8);   /* offsets_size */
+    unsigned long long offsets = (unsigned long long)(incoming[0].data + size -
+                                                      offsets_size);
+    __builtin_memcpy(tr + 56, &offsets, 8);        /* data.ptr.offsets */
+    incoming_count--;
+    for (int i = 0; i < incoming_count; i++) incoming[i] = incoming[i + 1];
+    return 4 + 64;
+}
+
+/* A death the broker reported. Delivered on the next read, because that is when
+ * the caller is listening. */
+void shim_death_arrived(unsigned int handle) {
+    if (death_pending_count < MAX_DEATHS) deaths_pending[death_pending_count++] = handle;
+}
+
+static long death_write(unsigned char *out, long capacity) {
+    if (death_pending_count == 0) return 0;
+    unsigned int handle = deaths_pending[0];
+    death_pending_count--;
+    for (int i = 0; i < death_pending_count; i++) deaths_pending[i] = deaths_pending[i + 1];
+    if (capacity < 12) return 0;
+    unsigned int command = BR_DEAD_BINDER;
+    __builtin_memcpy(out, &command, 4);
+    unsigned long long cookie = 0;
+    for (int i = 0; i < death_count; i++) {
+        if (deaths[i].handle == handle) cookie = deaths[i].cookie;
+    }
+    __builtin_memcpy(out + 4, &cookie, 8);
+    death_forget(handle);
+    return 12;
+}
+
 static void run_commands(unsigned char *buffer, unsigned long size) {
     unsigned long offset = 0;
     while (offset + 4 <= size) {
@@ -310,6 +588,43 @@ static void run_commands(unsigned char *buffer, unsigned long size) {
             flush_log();
             if (dumps < 2) dump_stream("stream", buffer, size);
             answer(tr);
+        } else if (command == BC_INCREFS || command == BC_DECREFS) {
+            unsigned int handle;
+            __builtin_memcpy(&handle, buffer + offset, 4);
+            if (command == BC_INCREFS) {
+                shim_weak_reference_taken(handle);
+            } else {
+                shim_weak_reference_released(handle);
+            }
+        } else if (command == BC_REPLY) {
+            /* The call has been answered: the target's hold goes, which is what the
+             * driver does when the transaction completes. */
+            shim_release_target();
+        } else if (command == BC_ACQUIRE || command == BC_RELEASE) {
+            /* A reference to an object another process owns. The count belongs to
+             * the side that can see every holder, so it is forwarded rather than
+             * kept here -- and it used to be dropped, which is how an object came
+             * to be destroyed while someone still believed they held it. */
+            unsigned int handle;
+            __builtin_memcpy(&handle, buffer + offset, 4);
+            if (command == BC_ACQUIRE) {
+                shim_reference_taken(handle);
+            } else {
+                shim_reference_released(handle);
+            }
+        } else if (command == BC_REQUEST_DEATH_NOTIFICATION ||
+                   command == BC_CLEAR_DEATH_NOTIFICATION) {
+            unsigned int handle;
+            unsigned long long cookie;
+            __builtin_memcpy(&handle, buffer + offset, 4);
+            __builtin_memcpy(&cookie, buffer + offset + 4, 8);
+            if (command == BC_REQUEST_DEATH_NOTIFICATION) {
+                death_remember(handle, cookie);
+                shim_death_requested(handle);
+            } else {
+                death_forget(handle);
+                shim_death_cleared(handle);
+            }
         } else if (command == BC_FREE_BUFFER) {
             unsigned long data;
             __builtin_memcpy(&data, buffer + offset, 8);
@@ -375,7 +690,41 @@ static void wait_for_work(void) {
     syscall(SYS_nanosleep, &step, 0);
 }
 
-static int binder_fd = -1;
+/* The binder devices, each with its own placeholder descriptor.
+ *
+ * One `binder_fd` was enough while only /dev/binder mattered. With hwbinder and
+ * vndbinder in play the *last* device opened took the slot, so the shim answered
+ * the wrong device's ioctls afterwards -- including the service manager's, which is
+ * `/dev/binder`'s alone. The health HAL is HIDL and goes through /dev/hwbinder, so
+ * this is where that showed up.
+ *
+ * `is_hwbinder` is what the routing needs next: handle 0 on that device is the HIDL
+ * service manager, which is a daemon of its own (`hwservicemanager`), not the
+ * registry this shim keeps for /dev/binder. */
+#define MAX_BINDER_DEVICES 4
+static struct binder_device {
+    int fd;
+    int is_hwbinder;
+} binder_devices[MAX_BINDER_DEVICES];
+static int binder_device_count = 0;
+
+static struct binder_device *device_for(int fd) {
+    for (int i = 0; i < binder_device_count; i++) {
+        if (binder_devices[i].fd == fd) return &binder_devices[i];
+    }
+    return 0;
+}
+
+static int is_binder_device(int fd) { return device_for(fd) != 0; }
+
+static int remember_device(int fd, int is_hwbinder) {
+    if (binder_device_count < MAX_BINDER_DEVICES) {
+        binder_devices[binder_device_count].fd = fd;
+        binder_devices[binder_device_count].is_hwbinder = is_hwbinder;
+        binder_device_count++;
+    }
+    return fd;
+}
 
 /* Constructors run before the program, so a log line here distinguishes "the
  * shim never loaded" from "it loaded and nothing called it". */
@@ -494,6 +843,21 @@ static const char *redirect(const char *path) {
          * /vendor/etc/x resolves to <bundle>/vendor/etc/x. */
         prefix = "";
         rest = path + 1;
+    } else if (strcmp(path, "/data") == 0) {
+        /* The directory itself, which is what `statvfs` and `stat` are asked about
+         * when the framework starts a provider -- with no trailing slash, so the rule
+         * above does not match it, and the host has no `/data`:
+         *
+         *   java.lang.IllegalArgumentException: Invalid path: /data
+         *   Caused by: android.system.ErrnoException: statvfs failed: ENOENT
+         */
+        prefix = "/data";
+        rest = "data";
+    } else if (strcmp(path, "/apex") == 0) {
+        /* The directory itself, which the framework opens to list the apexes --
+         * with no trailing slash, so the rule below does not match it. */
+        prefix = "/apex";
+        rest = "apex";
     } else if (strncmp(path, "/apex/", 6) == 0) {
         /* /apex/<module>/javalib/<file> and .../lib64/<file> both live in the
          * bundle's flat framework and lib64 directories. */
@@ -506,7 +870,14 @@ static const char *redirect(const char *path) {
             prefix = "/apex-lib64";
             rest = lib64 + 7;
         } else {
-            return path;
+            /* Anything else under an apex -- its priv-app, its etc, its bin --
+             * is carried in the bundle under apex/, so it resolves there. The
+             * framework looks for the extension package's apk under its apex's
+             * priv-app directory and refuses to finish the boot when the package
+             * it names is not there: "Required services extension package is
+             * missing". */
+            prefix = "/apex";
+            rest = path + 1;
         }
     } else {
         return path;
@@ -527,6 +898,47 @@ static const char *redirect(const char *path) {
     strcat(buffer, rest);
     report(path, buffer);
     return buffer;
+}
+
+/* The uid the framework is told this process has.
+ *
+ * `Process.myUid()` is `getuid()`, and the framework checks it against Android's
+ * `SYSTEM_UID` (1000) in a great many places. The first one to run refuses the
+ * boot outright:
+ *
+ *   PackageManager: Non System Server process reporting dex loads as system server. uid=0
+ *   java.lang.SecurityException: Non-system caller
+ *     at IPackageManagerBase.getSetupWizardPackageName(IPackageManagerBase.java:769)
+ *
+ * The harness runs the framework as the user namespace's *root*, because it needs
+ * the namespace's capabilities: a private /dev from a mount, and the property area's
+ * files, which libc requires to be owned by root -- and the namespace maps one uid,
+ * so root and 1000 cannot both be had.
+ *
+ * On a device the process *is* the system uid, so reporting it is what the harness
+ * means; MOSAIC_UID names it. The real uid is untouched: only these two calls lie,
+ * so file access is still the kernel's business and nothing about permissions
+ * changes.
+ */
+static unsigned int reported_uid(unsigned int real) {
+    static int configured = -1;
+    static unsigned int value = 0;
+    if (configured < 0) {
+        const char *v = getenv("MOSAIC_UID");
+        unsigned int parsed = 0;
+        for (const char *p = v; p && *p >= '0' && *p <= '9'; p++) parsed = parsed * 10 + (unsigned)(*p - '0');
+        value = parsed;
+        configured = value ? 1 : 0;
+    }
+    return configured ? value : real;
+}
+
+unsigned int getuid(void) {
+    return reported_uid((unsigned int)syscall(SYS_getuid));
+}
+
+unsigned int geteuid(void) {
+    return reported_uid((unsigned int)syscall(SYS_geteuid));
 }
 
 static int name_is_binder(const char *path) {
@@ -558,19 +970,87 @@ static int make_placeholder_fd(void) {
     return fd;
 }
 
+/* ---- ashmem, which no host has ------------------------------------------ */
+
+/* Android allocates shared memory through `/dev/ashmem`, and there is no such
+ * device here and no node to make: the region is a kernel driver's. What the
+ * device gives is a file descriptor that can be sized and mapped, and a memfd is
+ * exactly that -- the same substitution the binder device gets, one caller over.
+ *
+ * `ashmem_create_region` is the caller, and it does not stop at the open: it sets
+ * the name and the size with ioctls and gives up if either fails, so those have to
+ * be answered too. The size is the one that matters -- it is what makes the region
+ * as large as the caller asked before it maps it.
+ *
+ *   ashmem: Unable to open ashmem device /dev/ashmem<name> ... and /dev/ashmem
+ *   java.io.IOException: ashmem creation failed
+ *     at android.util.MemoryIntArray.nativeCreate
+ */
+#define ASHMEM_NAME_LEN 256
+#define __ASHMEMIOC 0x77
+#define ASHMEM_SET_NAME (1u << 30 | (ASHMEM_NAME_LEN << 16) | (__ASHMEMIOC << 8) | 1)
+#define ASHMEM_GET_NAME (2u << 30 | (ASHMEM_NAME_LEN << 16) | (__ASHMEMIOC << 8) | 2)
+#define ASHMEM_SET_SIZE (1u << 30 | (8 << 16) | (__ASHMEMIOC << 8) | 3)
+#define ASHMEM_GET_SIZE (__ASHMEMIOC << 8 | 4)
+#define ASHMEM_SET_PROT_MASK (1u << 30 | (8 << 16) | (__ASHMEMIOC << 8) | 5)
+#define ASHMEM_GET_PROT_MASK (__ASHMEMIOC << 8 | 6)
+#define ASHMEM_PIN (1u << 30 | (8 << 16) | (__ASHMEMIOC << 8) | 7)
+#define ASHMEM_UNPIN (1u << 30 | (8 << 16) | (__ASHMEMIOC << 8) | 8)
+#define ASHMEM_GET_PIN_STATUS (__ASHMEMIOC << 8 | 9)
+#define ASHMEM_PURGE_ALL_CACHES (__ASHMEMIOC << 8 | 10)
+
+#define MAX_ASHMEM 8
+static int ashmem_fds[MAX_ASHMEM];
+static long ashmem_sizes[MAX_ASHMEM];
+static int ashmem_count = 0;
+
+static void remember_ashmem(int fd) {
+    if (ashmem_count < MAX_ASHMEM) {
+        ashmem_fds[ashmem_count] = fd;
+        ashmem_sizes[ashmem_count] = 0;
+        ashmem_count++;
+    }
+}
+
+static int ashmem_index(int fd) {
+    for (int i = 0; i < ashmem_count; i++) {
+        if (ashmem_fds[i] == fd) return i;
+    }
+    return -1;
+}
+
+static int is_ashmem(int fd) { return ashmem_index(fd) >= 0; }
+
 /* Bionic's <fcntl.h> defines open() as an inline wrapper around __openat, so a
  * preloaded open() is never called. These are the symbols that matter. */
 int __openat(int dirfd, const char *path, int flags, int mode) {
     /* The framework hardcodes paths that cannot be configured, so they are
      * rewritten first; then the binder device is intercepted. */
     path = redirect(path);
+    if (strncmp(path, "/dev/ashmem", 11) == 0) {
+        int fd = make_placeholder_fd();
+        if (fd < 0) return fd;
+        remember_ashmem(fd);
+        emit_prefixed("open ", path);
+        emit("binder-shim:   -> ashmem placeholder fd ");
+        emit_dec(fd);
+        emit("\n");
+        flush_log();
+        return fd;
+    }
     if (name_is_binder(path)) {
-        binder_fd = make_placeholder_fd();
+        int fd = make_placeholder_fd();
+        /* Which device it is decides what handle 0 means on it. */
+        int hwbinder = 0;
+        for (const char *p = path; *p; p++) {
+            if (p[0] == 'h' && p[1] == 'w' && p[2] == 'b') hwbinder = 1;
+        }
+        remember_device(fd, hwbinder);
         emit_prefixed("open ", path);
         emit("binder-shim:   -> placeholder fd ");
-        emit_dec(binder_fd);
-        emit("\n");
-        return binder_fd;
+        emit_dec(fd);
+        emit(hwbinder ? " (hwbinder)\n" : "\n");
+        return fd;
     }
     return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
@@ -598,6 +1078,47 @@ int __openat_2(int dirfd, const char *path, int flags) {
     int name(__VA_ARGS__)
 
 extern int __statx(int, const char *, int, unsigned int, void *);
+
+/* What a memfd has to *look* like. `libcutils` does not stop at opening the
+ * region: it checks that what it opened is the device.
+ *
+ *   if (!S_ISCHR(st.st_mode) || !st.st_rdev) { close(fd); errno = ENOTTY; return -1; }
+ *
+ * A memfd is a regular file, so that check refuses it and every caller sees
+ * "ashmem creation failed" even though the open succeeded. `fstat` on a descriptor
+ * this side handed out as ashmem therefore reports a character device with a
+ * nonzero device number -- any one will do: the caller remembers the first it sees
+ * and compares later opens against it.
+ *
+ * No headers here. probe is built `-nostdlib` against no sysroot, so the two fields
+ * are addressed by their offsets in Bionic's LP64 `struct stat`, which is the struct
+ * the caller reads: `st_mode` at 16, four bytes; `st_rdev` at 32, eight. */
+/* The GNU C library and Bionic agree here: `st_dev` and `st_ino` are eight bytes
+ * each and `st_nlink` is eight too, so `st_mode` sits at 24 and `st_rdev` at 40. The
+ * first version of this patched 16 and 32 -- the *link count* and *gid* -- which is
+ * how you prove to yourself that an offset with no name is a number. */
+#define BIONIC_STAT_MODE_OFFSET 24
+#define BIONIC_STAT_RDEV_OFFSET 40
+#define S_IFCHR_VALUE 0020000
+#define ASHMEM_RDEV_VALUE 0x0a37ul /* makedev(10, 55), the misc device ashmem uses */
+
+int fstat(int fd, void *buf) {
+    typedef int (*real_fn)(int, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "fstat");
+    if (!real) return -1;
+    int status = real(fd, buf);
+    if (status == 0 && buf && is_ashmem(fd)) {
+        unsigned char *bytes = (unsigned char *)buf;
+        unsigned int mode = 0;
+        __builtin_memcpy(&mode, bytes + BIONIC_STAT_MODE_OFFSET, 4);
+        mode = (mode & ~0170000u) | S_IFCHR_VALUE;
+        __builtin_memcpy(bytes + BIONIC_STAT_MODE_OFFSET, &mode, 4);
+        unsigned long rdev = ASHMEM_RDEV_VALUE;
+        __builtin_memcpy(bytes + BIONIC_STAT_RDEV_OFFSET, &rdev, 8);
+    }
+    return status;
+}
 
 int stat(const char *path, void *buf) {
     typedef int (*real_fn)(const char *, void *);
@@ -627,11 +1148,170 @@ int lstat64(const char *path, void *buf) {
     return real ? real(redirect(path), buf) : -1;
 }
 
+/* `statvfs` and `statfs`, which is how the framework asks how much room a directory
+ * has. `PackageManagerService` starts a provider by checking the space on its data
+ * directory, and `statvfs("/data")` without a redirect finds nothing:
+ *
+ *   java.lang.IllegalArgumentException: Invalid path: /data
+ *   Caused by: android.system.ErrnoException: statvfs failed: ENOENT
+ *
+ * The other path-taking calls were covered; these two were not, and the provider is
+ * the first thing that asks. */
+/* Files and directories are made, not only asked about. `DropBoxManagerService`
+ * keeps crash logs under /data/system/dropbox, which the boot never got far enough to
+ * make, and it creates its own directory -- but everything under /data lives in the
+ * bundle, so the open that makes it has to be rewritten before the kernel sees it,
+ * the same as every other path here. The rest of the directory calls ride along on
+ * the same shape: small, loud when missing, and not worth a second round each. */
+int mkdir(const char *path, unsigned int mode) {
+    typedef int (*real_fn)(const char *, unsigned int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "mkdir");
+    return real ? real(redirect(path), mode) : -1;
+}
+
+int mkdirat(int dirfd, const char *path, unsigned int mode) {
+    typedef int (*real_fn)(int, const char *, unsigned int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "mkdirat");
+    return real ? real(dirfd, redirect(path), mode) : -1;
+}
+
+int rename(const char *from, const char *to) {
+    typedef int (*real_fn)(const char *, const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "rename");
+    return real ? real(redirect(from), redirect(to)) : -1;
+}
+
+int renameat(int fromfd, const char *from, int tofd, const char *to) {
+    typedef int (*real_fn)(int, const char *, int, const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "renameat");
+    return real ? real(fromfd, redirect(from), tofd, redirect(to)) : -1;
+}
+
+int renameat2(int fromfd, const char *from, int tofd, const char *to, unsigned int flags) {
+    typedef int (*real_fn)(int, const char *, int, const char *, unsigned int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "renameat2");
+    return real ? real(fromfd, redirect(from), tofd, redirect(to), flags) : -1;
+}
+
+int unlink(const char *path) {
+    typedef int (*real_fn)(const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "unlink");
+    return real ? real(redirect(path)) : -1;
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+    typedef int (*real_fn)(int, const char *, int);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "unlinkat");
+    return real ? real(dirfd, redirect(path), flags) : -1;
+}
+
+int statvfs(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statvfs");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int statvfs64(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statvfs64");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int statfs(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statfs");
+    return real ? real(redirect(path), buf) : -1;
+}
+
+int statfs64(const char *path, void *buf) {
+    typedef int (*real_fn)(const char *, void *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statfs64");
+    return real ? real(redirect(path), buf) : -1;
+}
+
 int statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf) {
     typedef int (*real_fn)(int, const char *, int, unsigned int, void *);
     static real_fn real;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statx");
     return real ? real(dirfd, redirect(path), flags, mask, buf) : -1;
+}
+
+/* The call the Java `waitForService` makes. `ServiceManager.waitForService` is
+ * `Binder.allowBlocking(waitForServiceNative(name))`, and this is the NDK function
+ * behind it. Interposed for the same reason as the check above: the health HAL is
+ * declared now and the framework waits a second for the service, and this says
+ * whether the wait arrives here at all. */
+void *AServiceManager_waitForService(const char *instance) {
+    typedef void *(*real_fn)(const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "AServiceManager_waitForService");
+    void *result = real ? real(instance) : 0;
+    emit("android-binder: waitForService(");
+    emit(instance ? instance : "(null)");
+    emit(result ? ") -> found\n" : ") -> null\n");
+    flush_log();
+    return result;
+}
+
+/* What `ServiceManager.waitForDeclaredService` actually asks, and what it is told.
+ *
+ * The AIDL health HAL is not found even though it is declared in the manifest this
+ * side carries, and the check that decides is this one. A name that arrives and a
+ * "no" that comes back says the manifest is not being read; nothing arriving says
+ * the check is somewhere else entirely. */
+int AServiceManager_isDeclared(const char *instance) {
+    typedef int (*real_fn)(const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "AServiceManager_isDeclared");
+    int result = real ? real(instance) : 0;
+    emit("android-binder: isDeclared(");
+    emit(instance ? instance : "(null)");
+    emit(result ? ") -> yes\n" : ") -> no\n");
+    flush_log();
+    return result;
+}
+
+/* `fopen`, because a library that reads a file through it does not come through
+ * `open` at all: `fopen` calls `open` *inside libc*, and a preloaded `open` is not
+ * called for an internal call. That is why the framework could not find the VINTF
+ * manifest this side carries -- `libvintf` uses `fopen`, the path was never
+ * redirected, and the file it looked for does not exist on a host. */
+void *fopen(const char *path, const char *mode) {
+    typedef void *(*real_fn)(const char *, const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "fopen");
+    return real ? real(redirect(path), mode) : 0;
+}
+
+void *fopen64(const char *path, const char *mode) {
+    typedef void *(*real_fn)(const char *, const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "fopen64");
+    return real ? real(redirect(path), mode) : 0;
+}
+
+/* The one that matters for a *directory*: `File.listFiles()` is `opendir` and
+ * `readdir`, and a path this shim redirects for `open` and `stat` is not redirected
+ * for `opendir` unless it is named here. That is what kept the apex list empty:
+ * `ApexManagerFlattenedApex` -- the implementation a *flattened* apex build uses,
+ * which never asks the apex service -- lists `/apex` itself, found nothing, and the
+ * package manager went on to abort on a package sitting in the bundle. */
+void *opendir(const char *path) {
+    typedef void *(*real_fn)(const char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "opendir");
+    return real ? real(redirect(path)) : 0;
 }
 
 int access(const char *path, int mode) {
@@ -672,7 +1352,7 @@ int open64(const char *path, int flags, ...) {
 }
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (binder_fd >= 0 && fd == binder_fd) {
+    if (is_binder_device(fd)) {
         emit("binder-shim: mmap of the binder fd, length ");
         emit_dec((long)length);
         emit("\n");
@@ -686,13 +1366,42 @@ int ioctl(int fd, unsigned long request, ...) {
     void *arg = __builtin_va_arg(args, void *);
     __builtin_va_end(args);
 
-    if (binder_fd < 0 || fd != binder_fd) {
+    if (is_ashmem(fd)) {
+        int index = ashmem_index(fd);
+        if (request == ASHMEM_SET_NAME || request == ASHMEM_SET_PROT_MASK) return 0;
+        if (request == ASHMEM_SET_SIZE) {
+            long size = (long)arg;
+            if (syscall(SYS_ftruncate, fd, size) < 0) return -1;
+            ashmem_sizes[index] = size;
+            return 0;
+        }
+        if (request == ASHMEM_GET_SIZE) return (int)ashmem_sizes[index];
+        if (request == ASHMEM_GET_PROT_MASK) return 3; /* PROT_READ | PROT_WRITE */
+        if (request == ASHMEM_GET_NAME) {
+            if (arg) ((char *)arg)[0] = 0;
+            return 0;
+        }
+        /* This side has no pinning and nothing to purge: a region is ordinary
+         * memory here, and the calls that manage the driver's cache are answered
+         * rather than refused, because a caller that fails them treats the region
+         * as unusable. */
+        return 0;
+    }
+
+    if (!is_binder_device(fd)) {
         return (int)syscall(SYS_ioctl, fd, request, arg);
     }
 
-    emit("binder-shim: ioctl 0x");
-    emit_hex(request, 8);
-    emit(" ");
+    /* Every ioctl, which is the loudest thing here and the least useful once the
+     * surface is known: it fills the log's line budget, and a line written after
+     * the budget runs out is simply dropped, so an instrument added to answer a
+     * later question never appears. Behind MOSAIC_BINDER_DEBUG with the rest of
+     * the tracing. */
+    if (tracing_on()) {
+        emit("binder-shim: ioctl 0x");
+        emit_hex(request, 8);
+        emit(" ");
+    }
     if (request == BINDER_VERSION) {
         emit("BINDER_VERSION -> 8\n");
         *(int *)arg = BINDER_CURRENT_PROTOCOL_VERSION;
@@ -703,18 +1412,26 @@ int ioctl(int fd, unsigned long request, ...) {
         return 0;
     }
     if (request == BINDER_SET_CONTEXT_MGR) {
-        emit("BINDER_SET_CONTEXT_MGR -> ok\n");
+        struct binder_device *device = device_for(fd);
+        emit(device && device->is_hwbinder ? "BINDER_SET_CONTEXT_MGR (hwbinder) -> ok\n"
+                                           : "BINDER_SET_CONTEXT_MGR -> ok\n");
         return 0;
     }
     if (request == BINDER_WRITE_READ) {
         struct binder_write_read *bwr = (struct binder_write_read *)arg;
 
         if (bwr->write_size > 0 && bwr->write_buffer) {
-            emit("binder-shim: write=");
-            emit_dec(bwr->write_size);
-            emit(" read=");
-            emit_dec(bwr->read_size);
-            emit("\n");
+            /* Behind the trace flag with the ioctl line: this is the second loudest
+             * thing here, and the log's line budget is finite -- a line written after
+             * it runs out is dropped, so an instrument added to answer a later
+             * question never appears. That has cost this work several rounds. */
+            if (tracing_on()) {
+                emit("binder-shim: write=");
+                emit_dec(bwr->write_size);
+                emit(" read=");
+                emit_dec(bwr->read_size);
+                emit("\n");
+            }
             run_commands((unsigned char *)bwr->write_buffer, (unsigned long)bwr->write_size);
             bwr->write_consumed = bwr->write_size;
         } else {
@@ -730,6 +1447,23 @@ int ioctl(int fd, unsigned long request, ...) {
 
         bwr->read_consumed = 0;
         if (bwr->read_size > 0 && bwr->read_buffer) {
+            /* A death comes first: it is what the caller is waiting for, and a
+             * thread that has gone to sleep waiting for work will not ask again
+             * until something arrives. */
+            long death = death_write((unsigned char *)bwr->read_buffer, bwr->read_size);
+            if (death > 0) {
+                bwr->read_consumed = death;
+                flush_log();
+                return 0;
+            }
+            /* An incoming transaction comes before a reply: it is work, and the
+             * thread reading is the one that has to do it. */
+            long arriving = incoming_write((unsigned char *)bwr->read_buffer, bwr->read_size);
+            if (arriving > 0) {
+                bwr->read_consumed = arriving;
+                flush_log();
+                return 0;
+            }
             if (pending.have) {
                 bwr->read_consumed =
                     write_reply((unsigned char *)bwr->read_buffer, bwr->read_size);
@@ -771,9 +1505,9 @@ long poll(void *fds, unsigned long nfds, int timeout) {
 }
 
 int close(int fd) {
-    if (binder_fd >= 0 && fd == binder_fd) {
+    if (is_binder_device(fd)) {
         emit("binder-shim: close of the binder fd\n");
-        binder_fd = -1;
+        /* Nothing to clear: the device table holds the placeholders. */
         return (int)syscall(SYS_close, fd);
     }
     return (int)syscall(SYS_close, fd);

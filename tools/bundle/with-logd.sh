@@ -47,10 +47,38 @@ if [ -n "${MOSAIC_PRELOAD:-}" ]; then
   done
 fi
 
+# The framework's `Process.myUid()` is this process's own uid, and it checks it
+# against Android's `SYSTEM_UID` (1000). `unshare -r` maps the user to the
+# namespace's *root*, so the framework sees 0 and every check fails:
+#
+#   PackageManager: Non System Server process reporting dex loads as system server. uid=0
+#   java.lang.SecurityException: Non-system caller
+#     at IPackageManagerBase.getSetupWizardPackageName(IPackageManagerBase.java:769)
+#
+# Mapping to 1000 instead is not a swap: the mapping is one uid, and with root
+# given up `mount -t tmpfs none /dev` cannot be done at all -- the capability
+# comes with being the namespace's root. Running the framework as a system uid
+# therefore needs a private /dev that does not come from a mount, which is how
+# the paths are already handled for /system (tools/binder-shim/android-paths.c).
 exec unshare -rm --propagation private bash -c '
   set -uo pipefail
   mount -t tmpfs none /dev || exit 1
   mkdir -p /dev/socket || exit 1
+
+  # The framework is told it is the system uid. Process.myUid() is getuid(), and the
+  # framework checks that against SYSTEM_UID, 1000, in many places -- the first of
+  # which refuses the boot outright:
+  #
+  #   PackageManager: Non System Server process reporting dex loads as system server. uid=0
+  #   java.lang.SecurityException: Non-system caller
+  #     at IPackageManagerBase.getSetupWizardPackageName, line 769 of that file
+  #
+  # It is 0 here because the namespace this runs in makes us root, and root is needed:
+  # the private /dev above is a mount, and the property area files must be owned by
+  # root for libc to read them. A user namespace maps one uid, so root and 1000 cannot
+  # both be had. On a device the process is the system uid, so this is what the harness
+  # means by running the framework.
+  export MOSAIC_UID=1000
 
   # Android has a filesystem layout and the framework refers to it by absolute
   # path in places that cannot be configured -- AssetManager inlines

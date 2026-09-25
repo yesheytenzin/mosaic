@@ -30,7 +30,10 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 /// The broker's Binder state and the connections attached to it.
 pub struct Transport {
     broker: Mutex<BinderBroker>,
-    peers: Mutex<HashMap<ClientId, Arc<Peer>>>,
+    /// Every connection a client has, because one process may have more than one
+    /// and they share a handle table. Notices and forwards go to all of them; a
+    /// reply goes to the one that asked, which is carried with the call.
+    peers: Mutex<HashMap<ClientId, Vec<Arc<Peer>>>>,
     /// Where an answer from a process goes when it comes back. Keyed by the
     /// process that was asked, the node it was asked about, *and the request*:
     /// one node can have several transactions in flight, and a node on its own
@@ -42,7 +45,7 @@ pub struct Transport {
 }
 
 /// In-flight forwarded calls, by the node, the owner and the request.
-type Pending = HashMap<(ClientId, u64, u32), (ClientId, SyncSender<Frame>)>;
+type Pending = HashMap<(ClientId, u64, u32), (ClientId, Arc<Peer>, SyncSender<Frame>)>;
 
 struct Peer {
     writer: Mutex<Writer>,
@@ -99,18 +102,45 @@ impl Transport {
         let peer = Arc::new(Peer {
             writer: Mutex::new(writer),
         });
-        self.peers.lock().insert(client, peer);
+        self.peers
+            .lock()
+            .entry(client)
+            .or_default()
+            .push(peer.clone());
 
-        let result = self.session(client, reader);
+        let result = self.session(client, peer.clone(), reader);
+
+        // Only if this connection still owns the client. A process that reconnects
+        // while this session is unwinding has a newer peer in the map, and tearing
+        // down here would mark the *live* connection dead: every call it makes is
+        // then refused, which is the same failure the reconnect fix was for. The
+        // peer is the identity of a connection, so that is what is compared.
+        let mine = self
+            .peers
+            .lock()
+            .get(&client)
+            .is_some_and(|current| current.iter().any(|existing| Arc::ptr_eq(existing, &peer)));
+        if !mine {
+            log::debug!(
+                "Binder session for client {} ended after it reconnected",
+                client
+            );
+            return result;
+        }
 
         let notices = self.broker.lock().disconnect(client);
-        self.peers.lock().remove(&client);
+        // Only this connection goes: the process may have another one open, and
+        // removing the client outright would take it with it.
+        self.peers.lock().retain(|_, peers| {
+            peers.retain(|existing| !Arc::ptr_eq(existing, &peer));
+            !peers.is_empty()
+        });
         self.pending
             .lock()
             .retain(|(owner, _, _), _| *owner != client);
         for notice in notices {
-            let target = self.peers.lock().get(&notice.client).cloned();
-            if let Some(target) = target {
+            let targets = self.peers.lock().get(&notice.client).cloned();
+            for target in targets.into_iter().flatten() {
                 let _ = target.writer.lock().send(
                     &Message::Dead {
                         handle: notice.handle,
@@ -120,14 +150,41 @@ impl Transport {
             }
         }
         log::debug!("Binder session for client {} ended", client);
+        if let Err(e) = &result {
+            log::warn!(
+                "Binder session for client {} ended with an error: {}",
+                client,
+                e
+            );
+        }
         result
     }
 
-    fn session(&self, client: ClientId, mut reader: Reader) -> anyhow::Result<()> {
+    /// Serve one connection.
+    ///
+    /// `peer` is *this* connection's writer, and it is passed rather than looked up
+    /// because a process may have more than one. The peer map holds the latest, so
+    /// answering through it sent a reply to whichever connection came last -- and a
+    /// process with two of them heard nothing on the one it asked from.
+    #[allow(clippy::too_many_arguments)]
+    fn session(&self, client: ClientId, peer: Arc<Peer>, mut reader: Reader) -> anyhow::Result<()> {
         loop {
-            let frame = reader.recv()?;
+            let frame = match reader.recv() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    // Which way a connection ends matters and is not visible from
+                    // the outside: a peer that closed looks the same in the log as
+                    // a frame this side could not read, and the fix is different
+                    // for each.
+                    log::warn!("Binder client {}: reading failed: {}", client, e);
+                    return Err(e);
+                }
+            };
             match frame.message {
-                Message::Bye => return Ok(()),
+                Message::Bye => {
+                    log::debug!("Binder client {} said goodbye", client);
+                    return Ok(());
+                }
 
                 Message::Transaction {
                     id,
@@ -136,9 +193,8 @@ impl Transport {
                     flags,
                     data,
                     objects,
-                } => self.transaction(
-                    client,
-                    Call {
+                } => {
+                    let call = Call {
                         id,
                         handle,
                         code,
@@ -146,8 +202,34 @@ impl Transport {
                         data,
                         objects,
                         fds: frame.fds,
-                    },
-                )?,
+                    };
+                    // `id` and `flags` are copied out because the call itself
+                    // carries descriptors, which cannot be duplicated -- and the
+                    // failed reply needs both after the call has been consumed.
+                    // Any failure to answer a transaction is the caller's problem,
+                    // not the connection's. This is the one place that decides it,
+                    // and it matters for more than a handle that does not route: a
+                    // *forwarded* call whose owner has died waits out the timeout
+                    // and fails, and when that error ended the session it took the
+                    // whole connection with it -- one dead service cost the caller
+                    // every other service it was using, for the rest of its life.
+                    // A failed reply is what a driver gives, and the session lives.
+                    if let Err(e) = self.transaction(client, peer.clone(), call) {
+                        log::warn!("client {}: a transaction failed: {}", client, e);
+                        if flags & TF_ONE_WAY == 0 {
+                            self.to_peer(
+                                client,
+                                Message::Reply {
+                                    id,
+                                    status: -129, // EX_TRANSACTION_FAILED
+                                    data: e.to_string().into_bytes(),
+                                    objects: Vec::new(),
+                                },
+                                &[],
+                            )?;
+                        }
+                    }
+                }
 
                 // Matched by the request it answers, not by the node: one node
                 // can have several transactions in flight, and the node alone
@@ -161,7 +243,7 @@ impl Transport {
                 } => {
                     let waiter = self.pending.lock().remove(&(client, node, id));
                     match waiter {
-                        Some((caller, waiter)) => {
+                        Some((caller, _asked_from, waiter)) => {
                             let (data, objects) = self.reply_objects(client, caller, data, objects);
                             let _ = waiter.send(Frame {
                                 message: Message::Reply {
@@ -187,7 +269,7 @@ impl Transport {
                 }
                 Message::Release { handle } => {
                     let released = self.broker.lock().release(client, handle)?;
-                    log::trace!(
+                    log::info!(
                         "client {} released handle {} ({:?})",
                         client,
                         handle,
@@ -218,6 +300,10 @@ impl Transport {
                 }
 
                 Message::Lookup { id, name } => {
+                    // Logged because a lookup that never arrives and a lookup that
+                    // answers "no such name" look identical from the framework's
+                    // side, and telling them apart is the whole question.
+                    log::info!("client {} looked up {}", client, name);
                     let found = self.broker.lock().lookup(client, &name);
                     let answer = match found {
                         Some((handle, node, owner)) => Message::Found {
@@ -233,7 +319,10 @@ impl Transport {
                             owner: 0,
                         },
                     };
-                    self.to_peer(client, answer, &[])?;
+                    // An answer, so it goes back the way the question came. A
+                    // process with two connections would otherwise hear it on
+                    // whichever one came last, and the one that asked would wait.
+                    peer.writer.lock().send(&answer, &[])?;
                 }
 
                 other => anyhow::bail!("a client may not send {:?}", other),
@@ -275,7 +364,7 @@ impl Transport {
         (data, rewritten)
     }
 
-    fn transaction(&self, client: ClientId, call: Call) -> anyhow::Result<()> {
+    fn transaction(&self, client: ClientId, peer: Arc<Peer>, call: Call) -> anyhow::Result<()> {
         let dispatch = match self.broker.lock().transact(
             client,
             call.handle,
@@ -297,19 +386,7 @@ impl Transport {
                     client,
                     e
                 );
-                if call.flags & TF_ONE_WAY == 0 {
-                    self.to_peer(
-                        client,
-                        Message::Reply {
-                            id: call.id,
-                            status: -129, // EX_TRANSACTION_FAILED
-                            data: e.to_string().into_bytes(),
-                            objects: Vec::new(),
-                        },
-                        &[],
-                    )?;
-                }
-                return Ok(());
+                return Err(e);
             }
         };
 
@@ -319,6 +396,7 @@ impl Transport {
                 data,
                 objects,
                 fds,
+                calls,
             } => {
                 if call.flags & TF_ONE_WAY == 0 {
                     // The descriptors go with the frame: the answer says where
@@ -335,6 +413,51 @@ impl Transport {
                             objects,
                         },
                         &raw,
+                    )?;
+                }
+                // What the service asked to have called, now that its answer is
+                // on its way. The handle is in the caller's table, so this is a
+                // transaction *to* the caller, and it goes the same way any
+                // forwarded call does -- which is what makes a callback
+                // registration work: the framework hands the HAL an object, the
+                // HAL calls it, and the framework's own Binder thread serves it.
+                for pending in calls {
+                    // A call *to* a client rather than a request from one, so it goes
+                    // as `Incoming` -- the kind the receiving side runs on its own
+                    // binder thread. Sending it as a transaction, which is what this
+                    // did, puts it in the half of the protocol the receiver only ever
+                    // writes to, and nothing reads it there: the callback the service
+                    // asked for is never made, and `BatteryService` waits sixty
+                    // seconds a boot for a health registration it has already been
+                    // promised.
+                    //
+                    // The handle belongs to the caller's table, so the owner has to be
+                    // found through it -- the object may be the caller's own or one it
+                    // was handed a proxy for.
+                    let Some((owner, node)) =
+                        self.broker.lock().call_target(client, pending.handle)
+                    else {
+                        log::warn!(
+                            "client {} asked for a call on handle {}, which is not in its table",
+                            client,
+                            pending.handle
+                        );
+                        continue;
+                    };
+                    // One-way, which is what a callback is: nothing waits for an
+                    // answer, so the id is the request's and means nothing to the
+                    // caller.
+                    self.to_peer(
+                        owner,
+                        Message::Incoming {
+                            id: call.id,
+                            node,
+                            code: pending.code,
+                            flags: TF_ONE_WAY,
+                            data: pending.data,
+                            objects: Vec::new(),
+                        },
+                        &[],
                     )?;
                 }
             }
@@ -359,24 +482,31 @@ impl Transport {
                     )?;
                 }
             }
-            Dispatch::Forward { owner, node, .. } => self.forward(client, owner, node, call)?,
+            Dispatch::Forward { owner, node, .. } => {
+                self.forward(client, peer.clone(), owner, node, call)?
+            }
         }
         Ok(())
     }
 
     /// Ask the process that owns a node to run a transaction, and relay the
     /// answer to whoever asked.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         caller: ClientId,
+        caller_peer: Arc<Peer>,
         owner: ClientId,
         node: u64,
         call: Call,
     ) -> anyhow::Result<()> {
         let (sender, receiver) = sync_channel(1);
-        self.pending
-            .lock()
-            .insert((owner, node, call.id), (caller, sender));
+        // The connection the caller asked from is remembered, not looked up: the
+        // answer has to go back the way the call came.
+        self.pending.lock().insert(
+            (owner, node, call.id),
+            (caller, caller_peer.clone(), sender),
+        );
         let descriptors: Vec<RawFd> = call.fds.iter().map(|fd| fd.as_raw_fd()).collect();
         self.to_peer(
             owner,
@@ -401,22 +531,60 @@ impl Transport {
         let answer = answer
             .map_err(|_| anyhow::anyhow!("no answer for node {} from client {}", node, owner))?;
         let fds: Vec<RawFd> = answer.fds.iter().map(|fd| fd.as_raw_fd()).collect();
-        self.to_peer(caller, answer.message, &fds)
+        // The writer's lock is taken after the map's is dropped, as everywhere
+        // else, so a slow connection cannot hold up everyone's routing.
+        caller_peer.writer.lock().send(&answer.message, &fds)
     }
 
     fn to_peer(&self, client: ClientId, message: Message, fds: &[RawFd]) -> anyhow::Result<()> {
-        let peer = self.peers.lock().get(&client).cloned();
-        let peer = peer.ok_or_else(|| anyhow::anyhow!("no connection for client {}", client))?;
-        // The lock on the writer is taken after the map's is dropped, so a slow
-        // connection cannot hold up everyone else's routing.
-        let sent = peer.writer.lock().send(&message, fds);
-        sent
+        let peers = self.peers.lock().get(&client).cloned().unwrap_or_default();
+        anyhow::ensure!(!peers.is_empty(), "no connection for client {}", client);
+        // Every connection the client has, because they share a handle table: a
+        // transaction forwarded to the process is served by whichever connection
+        // reads it. The lock on each writer is taken after the map's is dropped, so
+        // a slow connection cannot hold up everyone else's routing.
+        for peer in &peers {
+            peer.writer.lock().send(&message, fds)?;
+        }
+        Ok(())
     }
 }
 
 /// The pid of the process on the other end, from the kernel rather than from
 /// anything the client says about itself.
+/// Which process a connection belongs to.
+///
+/// In a test every connection comes from the test's own pid, so two connections
+/// that are meant to be two *processes* look like one -- which is now a real
+/// difference, since a process is one client however many connections it has.
+/// Tests set this; everything else asks the kernel.
+#[cfg(test)]
+static PEER_PIDS: Mutex<Option<HashMap<RawFd, u32>>> = Mutex::new(None);
+
+/// Say which process a connection is.
+///
+/// Tests only, and only because every connection in a test comes from the test's
+/// own pid: two connections meant to be two *processes* cannot say so otherwise,
+/// and since a process is one client however many connections it has, that
+/// difference is now one the tests need to express. Keyed by descriptor, so tests
+/// running in parallel do not walk on each other.
+#[cfg(test)]
+pub fn set_peer_pid_for_tests(fd: RawFd, pid: u32) {
+    PEER_PIDS
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(fd, pid);
+}
+
 fn peer_pid(fd: RawFd) -> anyhow::Result<u32> {
+    #[cfg(test)]
+    {
+        if let Some(pids) = PEER_PIDS.lock().as_ref() {
+            if let Some(pid) = pids.get(&fd) {
+                return Ok(*pid);
+            }
+        }
+    }
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     // SAFETY: the descriptor is open for as long as the caller holds the
     // stream, which outlives this call.
@@ -460,11 +628,21 @@ mod tests {
         let path = dir.path().join("binder.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let transport = Arc::new(Transport::new());
+        // A hang-up in these tests stands for a process that died, which is what
+        // they are about. Deciding liveness here rather than reading `/proc` keeps
+        // them from depending on which pids the machine happens to be using -- and
+        // a test that wants the *other* answer says so.
+        transport.broker.lock().set_liveness(|_| false);
 
         let acceptor = transport.clone();
         std::thread::spawn(move || {
-            for _ in 0..2 {
+            for n in 0..2u32 {
                 let (stream, _) = listener.accept().unwrap();
+                // Two connections, two processes: they share a handle table only
+                // when they come from one, and these tests are about what crosses
+                // between two. The pid is set on the socket the server side holds,
+                // because that is the one `peer_pid` is asked about.
+                set_peer_pid_for_tests(stream.as_raw_fd(), 1001 + n);
                 let transport = acceptor.clone();
                 std::thread::spawn(move || {
                     let _ = transport.serve(&stream);
@@ -534,7 +712,9 @@ mod tests {
             panic!("expected an answer")
         };
         assert_eq!(objects, vec![4]);
-        assert!(data.len() >= 4 + 28);
+        // The status, then a descriptor object: 24 bytes, since a descriptor
+        // carries no stability word.
+        assert!(data.len() >= 4 + 24);
     }
 
     fn connect(path: &std::path::Path) -> UnixStream {
@@ -596,8 +776,12 @@ mod tests {
         }
     }
 
-    fn own_node(counter: u32) -> u64 {
-        ((std::process::id() as u64) << 32) | counter as u64
+    /// A node belonging to one of the harness's two processes. The node id carries
+    /// its owner's pid, which is how the broker stops a client exporting another's
+    /// object -- so the pid here has to be the one the harness told the connection
+    /// it was, not the test's own.
+    fn own_node(pid: u32, counter: u32) -> u64 {
+        ((pid as u64) << 32) | counter as u64
     }
 
     #[test]
@@ -659,7 +843,7 @@ mod tests {
     #[test]
     fn a_transaction_crosses_between_two_connections() {
         let mut h = harness();
-        let node = own_node(42);
+        let node = own_node(1001, 42);
         h.owner
             .send(
                 &Message::Export {
@@ -740,7 +924,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let mut h = harness();
-        let node = own_node(77);
+        let node = own_node(1001, 77);
         h.owner
             .send(
                 &Message::Export {
@@ -803,7 +987,7 @@ mod tests {
     #[test]
     fn a_client_that_goes_away_is_reported() {
         let mut h = harness();
-        let node = own_node(99);
+        let node = own_node(1001, 99);
         h.owner
             .send(
                 &Message::Export {

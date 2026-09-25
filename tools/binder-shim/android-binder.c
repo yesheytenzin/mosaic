@@ -37,11 +37,19 @@ extern void mosaic_alloc_trace_mark(const char *what, const void *pointer)
 
 extern void *dlsym(void *, const char *);
 extern void *dlopen(const char *, int);
+/* Android's dynamic linker uses the usual RTLD_NEXT value for lookup after the
+ * preload object itself. */
+#define RTLD_NEXT ((void *) -1)
+/* The strong hold a transaction takes on its target, resolved from libutils. */
+void shim_resolve_refbase(void *incref_symbol, void *decref_symbol);
+/* A reference kept for good, for an object the registry now owns. */
+void shim_hold_object(void *object);
 extern long write(int, const void *, unsigned long);
 extern void *malloc(ulong);
 extern void free(void *);
 
 #define RTLD_NOW 2
+#define RTLD_GLOBAL 0x100
 
 #define SYM_WRITE_INT32 "_ZN7android6Parcel10writeInt32Ei"
 #define SYM_WRITE_BINDER "_ZN7android6Parcel17writeStrongBinderERKNS_2spINS_7IBinderEEE"
@@ -58,6 +66,9 @@ extern void free(void *);
 #define SYM_GET_POSITION "_ZNK7android6Parcel12dataPositionEv"
 #define SYM_READ_BINDER "_ZNK7android6Parcel16readStrongBinderEv"
 #define SYM_WRITE_OBJECT "_ZN7android6Parcel11writeObjectERK18flat_binder_objectb"
+/* RefBase's own counts, which a transaction's target is held by. */
+#define SYM_INC_STRONG "_ZNK7android7RefBase9incStrongEPKv"
+#define SYM_DEC_STRONG "_ZNK7android7RefBase9decStrongEPKv"
 #define SYM_SET_REFERENCE "_ZN7android6Parcel19ipcSetDataReferenceEPKhmPKymPFvPS0_S2_mS4_mE"
 #define SYM_BINDER_TRANSACT "_ZN7android7BBinder8transactEjRKNS_6ParcelEPS1_j"
 extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
@@ -95,6 +106,14 @@ extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void
 #define TRANSACTION_REGISTER_CLIENT_CALLBACK 11
 #define TRANSACTION_TRY_UNREGISTER_SERVICE 12
 #define TRANSACTION_GET_SERVICE_DEBUG_INFO 13
+/* `android.os.IServiceManager::isDeclared`, seventh in that interface's declaration
+ * order. It is not the same question as "is it registered": a declared HAL that is
+ * not running is still declared, and `ServiceManager.waitForDeclaredService` asks
+ * this before it asks for the service at all -- `isDeclared(name) ? waitForService(name)
+ * : null`. Answering the unknown code with an empty reply made it false, which is
+ * why the AIDL health HAL was never looked for even though it is in the manifest
+ * this side carries. */
+#define TRANSACTION_IS_DECLARED 7
 
 /* The object types libbinder actually writes, read out of Parcel::unflattenBinder:
  *
@@ -105,8 +124,15 @@ extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void
  * so every addService was read as "not a local binder" and remembered nothing --
  * which is why the framework's own services were never found. */
 #define BINDER_TYPE_BINDER 0x73622a85u
-#define BINDER_TYPE_WEAK_BINDER 0x73622a86u
-#define BINDER_TYPE_FD 0x73662a85u
+/* B_PACK_CHARS, from the driver's own header: the three characters then the type
+ * byte. `BINDER_TYPE_FD` was 0x73662a85, which is 's','f','*' -- the *handle*
+ * pattern with the middle letter changed -- and the framework rejected it as an
+ * invalid object type, so every descriptor handed back was dropped. That is what
+ * `BitTube::readFromParcel: can't dup file descriptor` was, and behind it
+ * `DisplayEventReceiver` failing to initialize, and behind that the display
+ * service failing to boot. */
+#define BINDER_TYPE_WEAK_BINDER 0x77622a85u
+#define BINDER_TYPE_FD 0x66642a85u
 #define BINDER_TYPE_HANDLE 0x73682a85u
 
 #define MAX_SERVICES 128
@@ -267,6 +293,11 @@ static void resolve(void) {
     parcel_write_bytes = (write_bytes_fn)dlsym(binder, SYM_WRITE_BYTES);
     parcel_write_binder = (write_binder_fn)dlsym(binder, SYM_WRITE_BINDER);
     parcel_write_object = (write_object_fn)dlsym(binder, SYM_WRITE_OBJECT);
+    /* libutils, not libbinder: RefBase lives there. */
+    void *utils = dlopen("libutils.so", 1);
+    if (utils) {
+        shim_resolve_refbase(dlsym(utils, SYM_INC_STRONG), dlsym(utils, SYM_DEC_STRONG));
+    }
     parcel_data = (parcel_data_fn)dlsym(binder, SYM_DATA);
     parcel_data_size = (parcel_size_fn)dlsym(binder, SYM_DATA_SIZE);
     parcel_ctor = (parcel_ctor_fn)dlsym(binder, SYM_PARCEL_CTOR);
@@ -352,7 +383,10 @@ static void write_object_into(void *reply, uint32 type, ulong value, ulong cooki
     object.cookie = cookie;
     if (parcel_write_object) {
         parcel_write_object(reply, &object, 0);
-        parcel_write_int32(reply, stability);
+        /* The stability word belongs to binder objects, not to descriptors: a
+         * descriptor object is 24 bytes and the reader advances by that. Writing
+         * one for an fd made everything after it four bytes long. */
+        if (type != BINDER_TYPE_FD) parcel_write_int32(reply, stability);
         return;
     }
     /* Without libbinder's writer, raw words: 24 bytes then the stability word.
@@ -540,6 +574,20 @@ static const unsigned char *name_after_token(const unsigned char *data, ulong si
 #define MOSAIC_WIRE_MAGIC "MSBD"
 #define MOSAIC_WIRE_VERSION 1
 
+/* From probe.so, which owns the ioctl path and the driver's command values. Both
+ * are preloaded into the same process, so a plain declaration is enough. */
+void shim_death_arrived(unsigned int handle);
+/* The strong hold a transaction takes on its target. */
+/* An incoming transaction, handed to the ioctl half to deliver as BR_TRANSACTION. */
+void shim_incoming(void *object, unsigned long long cookie, unsigned int code,
+                   unsigned int flags, const unsigned char *data, unsigned long size,
+                   unsigned int objects);
+/* The object a node names, and the cookie that goes with it. */
+void object_and_cookie_for_node(ulong node, void **object, unsigned long long *cookie);
+/* The cookie of the object a node names, which is the only thing that finds it on
+ * the framework's side. */
+unsigned long long cookie_for_node(ulong node);
+
 #define KIND_TRANSACTION 0
 #define KIND_REPLY 1
 #define KIND_ACQUIRE 2
@@ -553,6 +601,8 @@ static const unsigned char *name_after_token(const unsigned char *data, ulong si
 #define KIND_LOOKUP 10
 #define KIND_FOUND 11
 #define KIND_INCOMING_REPLY 12
+#define KIND_LINK 13
+#define KIND_UNLINK 14
 
 #define NO_HANDLE 0xffffffffu
 
@@ -569,6 +619,8 @@ static const unsigned char *name_after_token(const unsigned char *data, ulong si
 #define SYS_NANOSLEEP 35
 #define SYS_GETPID 39
 #define SYS_RECVMSG 47
+#define SYS_GETTID 186
+#define SYS_OPENAT 257
 
 /* The three structs `recvmsg` needs, and the control-message macros that go with
  * them. This file has no headers -- it declares what it uses and reaches the
@@ -796,12 +848,60 @@ static int broker_send(uint32 kind, uint32 a, uint32 b, uint32 c, ulong node,
     if (result == 0 && size > 0) result = write_all(fd, data, size);
     unlock_writes();
     if (result != 0) {
+        /* A write that fails means the connection is gone -- the broker closed it,
+         * or the descriptor is stale. Clearing it here is what makes the *next*
+         * lookup reconnect instead of writing into a dead socket and coming back
+         * absent, which is how a framework that looks up a name every second ends
+         * up waiting forever for a service that is published and reachable. */
+        int dead = broker_fd;
+        broker_fd = -1;
+        if (dead >= 0) syscall(SYS_CLOSE, dead);
         say("android-binder: sending to the broker failed (kind ");
         say_dec((long)kind);
         say(")\n");
-        say_once();
     }
     return result;
+}
+
+/* The other direction, for the ioctl half to call: a caller asked to hear about a
+ * handle dying, or stopped asking. The broker keeps the list, so both have to
+ * reach it -- without the first it never sends `Dead`, and without the second it
+ * keeps sending them to a caller that has stopped listening. Neither is a request
+ * with an answer, so nothing waits for a reply. */
+void shim_death_requested(unsigned int handle) {
+    broker_send(KIND_LINK, handle, 0, 0, 0, 0, 0);
+}
+
+void shim_death_cleared(unsigned int handle) {
+    broker_send(KIND_UNLINK, handle, 0, 0, 0, 0, 0);
+}
+
+/* A reference taken or given back on an object another process owns.
+ *
+ * The count is kept by the broker, because it is the only party that sees every
+ * holder: one process's take has to be visible to the one that decides an object
+ * is dead. Dropping these -- which is what happened, the commands were consumed
+ * and forgotten -- leaves the count on one side of the socket, and the object is
+ * destroyed while a holder still believes in it: `RefBase: decWeak called on ...
+ * too many times`. */
+void shim_reference_taken(unsigned int handle) {
+    broker_send(KIND_ACQUIRE, handle, 0, 0, 0, 0, 0);
+}
+
+void shim_reference_released(unsigned int handle) {
+    broker_send(KIND_RELEASE, handle, 0, 0, 0, 0, 0);
+}
+
+/* The weak pair. `RefBase` keeps two counts and the weak one is what death
+ * notification hangs off; it crosses processes as `BC_INCREFS` and `BC_DECREFS`
+ * and was dropped here, so the broker's table never heard about a weak holder and
+ * the object was torn down underneath it. */
+void shim_weak_reference_taken(unsigned int handle) {
+    broker_send(KIND_INCREFS, handle, 0, 0, 0, 0, 0);
+}
+
+void shim_weak_reference_released(unsigned int handle) {
+    broker_send(KIND_DECREFS, handle, 0, 0, 0, 0, 0);
 }
 
 /* Read one frame. `data` is the caller's buffer and `size` its capacity on the
@@ -988,6 +1088,11 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size,
 
     if (!found) return 0;
     const unsigned char *object = found;
+    /* The reader above takes a reference because a registration is a claim of
+     * ownership. This path, which is what the Java requests come through, took
+     * none -- so a service registered from a temporary was owned by nobody, and
+     * the object was destroyed while the registry still named it. */
+    (void)0;
 
     /* Which of the two pointer fields is the IBinder.
      *
@@ -1074,11 +1179,80 @@ static void *object_at(void *parcel, const unsigned char *data, ulong size,
         }
         return 0;
     }
+    /* Offset 16 first, which is where the `BBinder` is -- read off
+     * `Parcel::flattenBinder`'s disassembly: it calls `RefBase::getWeakRefs()` and
+     * stores the result at `%rsp+0x8`, then stores the BBinder at `%rsp+0x10`. So
+     * offset 8 is the weak reference table and offset 16 is the object.
+     *
+     * The kernel's `flat_binder_object` describes the fields differently -- `binder`
+     * at 8 as "local object", `cookie` at 16 as extra data -- and changing this loop
+     * to prefer 8 on that basis brings the crash straight back: `call *0x80(%rax)`
+     * inside `BBinder::transact`, a virtual call through a pointer whose first word
+     * is not a vtable. The struct's own words describe the kernel's view of the
+     * pair; what libbinder writes into a parcel and reads back out is this. */
+    {
+        long a = (long)fields[0], b = (long)fields[1];
+        say("android-binder: candidates 8=0x");
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            char one[2];
+            one[0] = "0123456789abcdef"[((unsigned long)a >> shift) & 0xf];
+            one[1] = 0;
+            say(one);
+        }
+        say(" 16=0x");
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            char one[2];
+            one[0] = "0123456789abcdef"[((unsigned long)b >> shift) & 0xf];
+            one[1] = 0;
+            say(one);
+        }
+        say("\n");
+    }
     for (int f = 1; f >= 0; f--) {
         unsigned long candidate = fields[f];
         if (candidate < 0x10000 || candidate >= 0x800000000000UL) continue;
         unsigned long first = *(const unsigned long *)candidate;
-        if (first >= 0x10000 && first < 0x800000000000UL) return (void *)candidate;
+        /* A weak reference table's first word is its refcounts -- `{strong, weak}`
+         * packed into one word, so two small integers and nothing else. That is
+         * what this side was handing over: `0x0000000100000001` is `{1, 1}`, and
+         * `BBinder::transact` read it as a vtable and called `+0x80` through it.
+         *
+         * Both halves being small is the test. A vtable pointer is a single large
+         * address in a mapped library, and the low half of one is not a small
+         * integer. */
+        unsigned int low = (unsigned int)(first & 0xffffffffu);
+        unsigned int high = (unsigned int)(first >> 32);
+        if (low != 0 && low < 0x10000 && high != 0 && high < 0x10000) continue;
+        if (first >= 0x10000 && first < 0x800000000000UL) {
+            /* Which field was chosen, what it holds in its first word, and what
+             * that word's first word is -- the last of those is whether it is
+             * really a vtable, which is the question the crash asks. */
+            say("android-binder: object_at picked field ");
+            say_dec((long)f);
+            say(" candidate=0x");
+            {
+                unsigned long v = candidate;
+                for (int shift = 60; shift >= 0; shift -= 4) {
+                    char one[2];
+                    one[0] = "0123456789abcdef"[(v >> shift) & 0xf];
+                    one[1] = 0;
+                    say(one);
+                }
+            }
+            say(" first=0x");
+            {
+                unsigned long v = first;
+                for (int shift = 60; shift >= 0; shift -= 4) {
+                    char one[2];
+                    one[0] = "0123456789abcdef"[(v >> shift) & 0xf];
+                    one[1] = 0;
+                    say(one);
+                }
+            }
+            say("\n");
+            shim_hold_object((void *)candidate);
+            return (void *)candidate;
+        }
     }
     return 0;
 }
@@ -1239,7 +1413,22 @@ static void remember(const char *name, void *object, unsigned long cookie) {
         listed = 1;
     }
     unlock_registry();
-    if (listed) broker_export(name, node);
+    if (listed) {
+        say(name);
+        say(" is object 0x");
+        {
+            static const char hex[] = "0123456789abcdef";
+            unsigned long v = (unsigned long)object;
+            char digit[2];
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                digit[0] = hex[(v >> shift) & 0xf];
+                digit[1] = 0;
+                say(digit);
+            }
+        }
+        say("\n");
+        broker_export(name, node);
+    }
 }
 
 /* The object, and the weak reference table that goes beside it in a hand-back.
@@ -1382,12 +1571,22 @@ static int collect_argument_objects(const unsigned char *data, ulong size, const
         __builtin_memcpy(&kind, data + at, 4);
         ulong node = 0;
         if (kind == BINDER_TYPE_BINDER || kind == BINDER_TYPE_WEAK_BINDER) {
-            /* A local object: `binder` is the pointer this process knows it by, and
-             * the same pointer the registry remembers it under. */
-            unsigned long object = 0;
-            unsigned long cookie = 0;
-            __builtin_memcpy(&object, data + at + 8, 8);
-            __builtin_memcpy(&cookie, data + at + 16, 8);
+            /* Which of the two words is the object being published.
+             *
+             * This read offset 8 -- the kernel calls that field `binder` and
+             * describes it as the local object -- and offset 16 as the cookie. What
+             * comes back from it, called through, is a `RefBase` weak reference
+             * table: `BBinder::transact` reads the word at the pointer, finds
+             * `{strong=1, weak=1}` where a vtable should be, and faults at `+0x80`.
+             * So for a *native* publisher the pair is the other way round, which is
+             * what `Parcel::flattenBinder`'s disassembly said all along for the
+             * Java path: the weak table at 8, the object at 16. */
+            unsigned long weak_or_object = 0;
+            unsigned long object_or_cookie = 0;
+            __builtin_memcpy(&weak_or_object, data + at + 8, 8);
+            __builtin_memcpy(&object_or_cookie, data + at + 16, 8);
+            unsigned long object = object_or_cookie;
+            unsigned long cookie = weak_or_object;
             node = remember_object((void *)object, cookie);
             if (node == 0) continue;
         }
@@ -1421,7 +1620,7 @@ static void write_broker_answer(void *reply, const unsigned char *answer, ulong 
     uint32 fd_used = 0;
     for (uint32 i = 0; i < count; i++) {
         ulong offset = answer_offset(answer, data_size, i);
-        if (offset < at || offset + 28 > data_size) break;
+        if (offset < at || offset + 24 > data_size) break;
         if (offset > at && parcel_write_bytes) parcel_write_bytes(reply, answer + at, offset - at);
         flat_object_t object;
         __builtin_memcpy(&object, answer + offset, sizeof(object));
@@ -1437,7 +1636,9 @@ static void write_broker_answer(void *reply, const unsigned char *answer, ulong 
         } else {
             write_object_into(reply, object.type, object.binder, object.cookie, stability);
         }
-        at = offset + 28;
+        /* A descriptor object is 24 bytes, a binder object 28; the type is in the
+         * word and says which. */
+        at = offset + (object.type == BINDER_TYPE_FD ? 24 : 28);
     }
     if (at < data_size && parcel_write_bytes) parcel_write_bytes(reply, answer + at, data_size - at);
 }
@@ -1562,6 +1763,7 @@ static ulong remember_object(void *object, unsigned long cookie) {
         services[service_count].cookie = cookie;
         services[service_count].node = ((ulong)syscall(SYS_GETPID) << 32) | (ulong)(service_count + 1);
         node = services[service_count].node;
+
         service_count++;
         listed = 1;
     }
@@ -1575,7 +1777,13 @@ static ulong remember_object(void *object, unsigned long cookie) {
 static uint32 broker_lookup(const char *name, ulong *node, uint32 *owner) {
     if (!name) return NO_HANDLE;
     start_reader();
-    if (broker_fd < 0) return NO_HANDLE;
+    /* Connect if this process has not yet. Bailing here instead, which this did,
+     * means a process that only ever *looks up* -- the framework is one -- never
+     * connects at all: the connection was made lazily inside `broker_send`, which
+     * the early return never reached. Every lookup in such a process then came
+     * back absent without a byte going out, which is indistinguishable from a
+     * service that is genuinely not published. */
+    if (broker_fd < 0 && broker_connect() < 0) return NO_HANDLE;
     lock_broker();
     uint32 id = next_request_id++;
     awaiting_kind = KIND_FOUND;
@@ -1610,10 +1818,14 @@ static int broker_transact(uint32 handle, uint32 code, uint32 flags, const unsig
                            unsigned char **reply, ulong *reply_size, uint32 *status,
                            uint32 *object_count_out);
 
-/* Serve one transaction another process sent to an object here. */
+/* Serve a transaction another process sent to one of this process's objects.
+ *
+ * Defined below with the Java-world helpers; declared here because the reader is
+ * what calls it. */
 static void broker_serve(uint32 id, ulong node, uint32 code, uint32 flags, uint32 object_count,
                          const unsigned char *data, ulong size);
 
+/* The reader: the thread that takes whatever the broker sends. */
 static void *broker_reader(void *arg) {
     (void)arg;
     if (!response_data) {
@@ -1630,18 +1842,59 @@ static void *broker_reader(void *arg) {
         uint32 fd_count = 0;
         if (broker_recv(&kind, &a, &b, &c, &node, response_data, &size, response_fds,
                         &fd_count) != 0) {
+            /* The conversation is over -- the broker closed it, or the frame was
+             * unreadable. Clearing the descriptor is the part that matters: a
+             * reader that gives up while `broker_fd` still looks valid turns every
+             * later lookup into a silent miss, because the send goes to a socket
+             * nobody is reading. The next caller reconnects, which is cheap and
+             * correct -- the broker owns the names, so a fresh connection is the
+             * same authority as the old one. */
+            int dead = broker_fd;
+            broker_fd = -1;
+            reader_started = 0;
+            if (dead >= 0) syscall(SYS_CLOSE, dead);
+            say("android-binder: the broker conversation ended\n");
             break;
         }
         if (kind == KIND_INCOMING) {
-            say("android-binder: the broker sent a transaction\n");
-            say_once();
             /* `a` is the caller's request id, which the answer echoes. The object
              * count rides in the upper half of `c`, which is otherwise the
-             * caller's flags. */
-            broker_serve(a, node, b, c & 0xffff, c >> 16, response_data, size);
+             * caller's flags.
+             *
+             * This is *served*, which is what a driver does with a transaction for
+             * an object here: the object is entered and its `onTransact` runs.
+             *
+             * What this replaces queued the transaction for the process's own binder
+             * thread to pick up as BR_TRANSACTION, and that thread never came: the
+             * process parks in this side's socket path rather than in a driver read,
+             * so after the queue was filled not one read followed it, and the
+             * transaction sat there for the life of the run. What that cost was
+             * `BatteryService`, which waits for the health HAL to call it back: the
+             * HAL asked, the broker carried the call here, and it was queued into a
+             * queue nobody drained -- sixty seconds of a blocked main thread and a
+             * Watchdog reset, every boot. The same queue is what every cross-process
+             * call to a framework-owned service would go through, so this is where
+             * that would have failed next. */
+            uint32 object_count = c >> 16;
+            ulong body = size;
+            /* The caller's object references ride after the body, twelve bytes each,
+             * and they are the *sender's* annotation: the object words in the data
+             * already say what each one is. They come off here, so the offsets the
+             * serving side reads are the last thing in what it is given. */
+            if (body >= (ulong)object_count * 12) body -= (ulong)object_count * 12;
+            broker_serve(a, node, b, c & 0xffff, object_count, response_data, body);
             continue;
         }
-        if (kind == KIND_DEAD) continue;
+        if (kind == KIND_DEAD) {
+            /* The broker reports a node's owner dying as `Dead { handle }`, and
+             * `a` carries the handle. This side's job is to hand it to the caller
+             * the way the driver would, as BR_DEAD_BINDER on a read -- done in
+             * probe.so, which owns the ioctl path. Ignoring it, which this did,
+             * leaves the caller using a handle that no longer routes: the broker
+             * refuses the transaction and what comes back is read as a status. */
+            shim_death_arrived((unsigned int)a);
+            continue;
+        }
         /* Only an answer someone is waiting for goes into the slot. A late one --
          * to a request that has already given up -- would otherwise be read as the
          * next caller's answer, with its fields meaning something else. */
@@ -1666,6 +1919,28 @@ static void *broker_reader(void *arg) {
         __sync_lock_test_and_set(&response_ready, 1);
     }
     return 0;
+}
+
+/* The object a node names, and the cookie that goes beside it.
+ *
+ * Both are needed and they are not the same value. `binder_transaction_data`
+ * carries the object in `target.ptr` -- the reader calls a virtual method on it --
+ * and the publishing process's own cookie in `cookie`, which is what its
+ * `onTransact` sees. Handing the cookie in `target.ptr` is a virtual call through
+ * a value that is not a vtable, which is exactly the `SEGV_MAPERR` inside
+ * `BBinder::transact` this used to produce. */
+void object_and_cookie_for_node(ulong node, void **object, unsigned long long *cookie) {
+    *object = 0;
+    *cookie = 0;
+    lock_registry();
+    for (int i = 0; i < service_count; i++) {
+        if (services[i].node == node) {
+            *object = services[i].object;
+            *cookie = services[i].cookie;
+            break;
+        }
+    }
+    unlock_registry();
 }
 
 /* The object a node names, if this process owns it. */
@@ -1706,48 +1981,175 @@ typedef struct {
     void *reserved[3];
     int (*DestroyJavaVM)(JavaVM *);
     int (*AttachCurrentThread)(JavaVM *, void **, void *);
+    int (*DetachCurrentThread)(void *);
+    int (*GetEnv)(JavaVM *, void **, int);
 } jni_invoke_interface_t;
 
 struct JavaVM_ {
     const jni_invoke_interface_t *functions;
 };
 
-typedef int (*get_created_vms_fn)(JavaVM **, int, int *);
 
+typedef int (*android_thread_func)(void *);
+typedef int (*android_create_thread_fn)(android_thread_func, void *, const char *, int,
+                                       unsigned long, unsigned long *);
+static android_create_thread_fn delegate_android_create_thread;
+static android_create_thread_fn real_android_create_raw_thread;
+static void *android_runtime_handle;
 static __thread int thread_attached = 0;
 static __thread int attach_attempted = 0;
+typedef void *(*get_jni_env_fn)(void);
+static __thread void *cached_jni_env;
+static get_jni_env_fn real_get_jni_env;
+
+void *_ZN7android14AndroidRuntime9getJNIEnvEv(void) {
+    if (cached_jni_env) return cached_jni_env;
+    if (!real_get_jni_env) {
+        real_get_jni_env = (get_jni_env_fn)dlsym(
+            RTLD_NEXT, "_ZN7android14AndroidRuntime9getJNIEnvEv");
+    }
+    void *env = real_get_jni_env ? real_get_jni_env() : 0;
+    if (env) cached_jni_env = env;
+    return env;
+}
+static int thread_attach_armed = 0;
+
+struct shim_thread_start {
+    android_thread_func start;
+    void *arg;
+};
 
 static void attach_to_jvm(void) {
-    if (thread_attached || attach_attempted) return;
+    if (!thread_attach_armed || thread_attached || attach_attempted) return;
     attach_attempted = 1;
-    void *art = dlopen("libart.so", RTLD_NOW);
-    if (!art) {
-        say("android-binder: no libart.so, so no VM to attach the serving thread to\n");
-        say_once();
-        return;
-    }
-    get_created_vms_fn get_vms = (get_created_vms_fn)dlsym(art, "JNI_GetCreatedJavaVMs");
-    if (!get_vms) {
-        say("android-binder: JNI_GetCreatedJavaVMs is not exported\n");
-        say_once();
-        return;
-    }
-    JavaVM *vm = 0;
-    int count = 0;
-    if (get_vms(&vm, 1, &count) != 0 || count < 1 || !vm || !vm->functions) {
-        say("android-binder: no Java VM has been created\n");
-        say_once();
-        return;
-    }
+    if (!android_runtime_handle) return;
+    JavaVM *(*get_vm)(void) = (JavaVM *(*)(void))dlsym(
+        android_runtime_handle, "_ZN7android14AndroidRuntime9getJavaVMEv");
+    if (!get_vm) return;
+    JavaVM *vm = get_vm();
+    if (!vm || !vm->functions) return;
     void *env = 0;
-    if (vm->functions->AttachCurrentThread(vm, &env, 0) == 0) {
+    int getenv_status = vm->functions->GetEnv(vm, &env, 0x00010004);
+    if (getenv_status == 0) cached_jni_env = env;
+    if (getenv_status == 0) {
         thread_attached = 1;
-        say("android-binder: serving thread attached to the Java VM\n");
-        say_once();
-    } else {
-        say("android-binder: attaching the serving thread to the Java VM failed\n");
+        return;
+    }
+    if (vm->functions->AttachCurrentThread(vm, &env, 0) == 0) {
+        cached_jni_env = env;
+        thread_attached = 1;
+        say("android-binder: native Java thread attached to the VM\n");
         say_once();
     }
+}
+
+static int shim_thread_entry(void *raw) {
+    struct shim_thread_start *start = raw;
+    android_thread_func entry = start->start;
+    void *arg = start->arg;
+    free(start);
+    attach_to_jvm();
+    return entry(arg);
+}
+
+static int shim_android_create_thread(android_thread_func entry, void *arg, const char *name,
+                                     int priority, unsigned long stack, unsigned long *id) {
+    if (!delegate_android_create_thread) return -1;
+    struct shim_thread_start *state = malloc(sizeof(*state));
+    if (!state) return delegate_android_create_thread(entry, arg, name, priority, stack, id);
+    state->start = entry;
+    state->arg = arg;
+    return delegate_android_create_thread(shim_thread_entry, state, name, priority, stack, id);
+}
+int androidCreateRawThreadEtc(android_thread_func entry, void *arg, const char *name,
+                              int priority, unsigned long stack, unsigned long *id) {
+    if (!real_android_create_raw_thread) {
+        real_android_create_raw_thread = (android_create_thread_fn)dlsym(
+            RTLD_NEXT, "androidCreateRawThreadEtc");
+        if (!real_android_create_raw_thread) return -1;
+    }
+    if (!thread_attach_armed) {
+        return real_android_create_raw_thread(entry, arg, name, priority, stack, id);
+    }
+    struct shim_thread_start *state = malloc(sizeof(*state));
+    if (!state) return real_android_create_raw_thread(entry, arg, name, priority, stack, id);
+    state->start = entry;
+    state->arg = arg;
+    return real_android_create_raw_thread(shim_thread_entry, state, name, priority, stack, id);
+}
+
+static unsigned long long parse_hex_value(const char *text, const char **end) {
+    unsigned long long result = 0;
+    while (*text) {
+        unsigned long long digit;
+        if (*text >= '0' && *text <= '9') digit = (unsigned long long)(*text - '0');
+        else if (*text >= 'a' && *text <= 'f') digit = (unsigned long long)(*text - 'a' + 10);
+        else if (*text >= 'A' && *text <= 'F') digit = (unsigned long long)(*text - 'A' + 10);
+        else break;
+        result = (result << 4) | digit;
+        text++;
+    }
+    *end = text;
+    return result;
+}
+
+static void patch_utils_line(const char *line) {
+    if (!strstr(line, "libutils.so")) return;
+    const char *cursor = line;
+    const char *parsed_end;
+    unsigned long long start = parse_hex_value(cursor, &parsed_end);
+    cursor = parsed_end;
+    while (*cursor && *cursor != ' ') cursor++;
+    while (*cursor == ' ') cursor++;
+    while (*cursor && *cursor != ' ') cursor++;
+    while (*cursor == ' ') cursor++;
+    unsigned long long file_offset = parse_hex_value(cursor, &parsed_end);
+    if (start > 0x100000000ULL && file_offset == 0) {
+        void **factory = (void **)(unsigned long)(start + 0x1e350);
+        *factory = shim_android_create_thread;
+    }
+}
+
+static void patch_mapped_libutils(void) {
+    char line[4096];
+    unsigned long used = 0;
+    long fd = syscall(SYS_OPENAT, -100, "/proc/self/maps", 0, 0);
+    if (fd < 0) return;
+    for (;;) {
+        char byte;
+        long got = syscall(SYS_READ, fd, &byte, 1);
+        if (got <= 0) break;
+        if (byte == '\n') {
+            line[used] = 0;
+            patch_utils_line(line);
+            used = 0;
+        } else if (used + 1 < sizeof line) {
+            line[used++] = byte;
+        }
+    }
+    if (used) {
+        line[used] = 0;
+        patch_utils_line(line);
+    }
+    syscall(SYS_CLOSE, fd);
+}
+
+void shim_arm_thread_attach(void) {
+    thread_attach_armed = 1;
+    android_runtime_handle = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+    if (android_runtime_handle) {
+        delegate_android_create_thread = (android_create_thread_fn)dlsym(
+            android_runtime_handle, "_ZN7android14AndroidRuntime19javaCreateThreadEtcEPFiPvES1_PKcimPS1_");
+    }
+    void *inputflinger = dlopen("libinputflinger_base.so", RTLD_NOW);
+    if (!inputflinger) return;
+    void *thread_run = dlsym(inputflinger, "_ZN7android6Thread3runEPKcim");
+    dl_info_t info;
+    __builtin_memset(&info, 0, sizeof info);
+    if (!thread_run || !dladdr(thread_run, &info) || !info.dli_fbase) return;
+    void **factory = (void **)((unsigned long)info.dli_fbase + 0x1e350);
+    *factory = shim_android_create_thread;
+    patch_mapped_libutils();
 }
 
 /* Serve one transaction another process sent to an object here.
@@ -1792,7 +2194,7 @@ static void broker_serve(uint32 id, ulong node, uint32 code, uint32 flags, uint3
             ulong at = 0;
             for (uint32 i = 0; i < object_count; i++) {
                 ulong offset = answer_offset(data, data_size, i);
-                if (offset < at || offset + 28 > data_size) break;
+                if (offset < at || offset + 24 > data_size) break;
                 if (offset > at) parcel_write_bytes(request, data + at, offset - at);
                 flat_object_t argument;
                 __builtin_memcpy(&argument, data + offset, sizeof(argument));
@@ -1809,9 +2211,19 @@ static void broker_serve(uint32 id, ulong node, uint32 code, uint32 flags, uint3
                 } else {
                     write_object_into(request, argument.type, argument.binder, argument.cookie, stability);
                 }
-                at = offset + 28;
+                /* A descriptor object is 24 bytes, a binder object 28, and the type
+                 * is in the word that says which. */
+                at = offset + (argument.type == BINDER_TYPE_FD ? 24 : 28);
             }
             if (at < data_size) parcel_write_bytes(request, data + at, data_size - at);
+            /* Writing into the parcel leaves its read position at the end, and the
+             * object reads from where it is. A parcel that arrives from a driver is
+             * reset to zero by `ipcSetDataReference` before anyone reads it; one this
+             * side fills by writing has to be rewound the same way. Without it the
+             * receiver reads past its own data and every argument comes back empty --
+             * `enforceInterface() expected 'android.hardware.health.IHealthInfoCallback'
+             * but read ''`, and the call is refused as an incorrect interface. */
+            if (parcel_set_position) parcel_set_position(request, 0);
             parcel_ctor(reply);
             status = binder_transact(object, code, request, reply, flags);
 
@@ -1908,6 +2320,17 @@ static int broker_transact(uint32 handle, uint32 code, uint32 flags, const unsig
     unlock_broker();
     if (waited != 0) return -1;
     *status = (uint32)a;
+    /* A status that is not zero is a call the callee refused, and which call it
+     * was is the whole question when the framework throws on one. */
+    if (a != 0) {
+        say("android-binder: code=");
+        say_dec((long)code);
+        say(" handle=");
+        say_dec((long)handle);
+        say(" answered status=");
+        say_dec((long)a);
+        say("\n");
+    }
     *reply = answer;
     *reply_size = answer_size;
     *object_count_out = c;
@@ -2077,6 +2500,18 @@ static int service_manager(uint32 code, const unsigned char *data, ulong size, v
         return 1;
     }
 
+    /* Declared, whether or not it is running. The HALs this runtime provides are
+     * the ones in the manifest it carries, and this answers for them. */
+    if (code == TRANSACTION_IS_DECLARED) {
+        int declared = 0;
+        if (strstr(name, "android.hardware.health") != 0) declared = 1;
+        parcel_write_int32(reply, 0); /* exception */
+        parcel_write_int32(reply, declared);
+        say("android-binder: isDeclared ");
+        say(name);
+        say(declared ? " -> yes\n" : " -> no\n");
+        return 1;
+    }
     if (code == TRANSACTION_GET_SERVICE || code == TRANSACTION_CHECK_SERVICE) {
         void *object = have_name ? lookup(name) : 0;
         uint32 remote = NO_HANDLE;
@@ -2340,7 +2775,62 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
             if (broker_transact((uint32)handle, code, flags, parcel_data(data),
                                 parcel_data_size(data), refs, ref_count, &answer, &answer_size,
                                 &status, &object_count) == 0) {
-                if (answer && answer_size) write_broker_answer(reply, answer, answer_size, object_count);
+                /* No status is added here, and that is deliberate: the answer a
+                 * broker-hosted service returns is a *complete Parcel*, status word
+                 * and all -- it is built with `Parcel::ok()` and the objects it
+                 * hands back are registered in it as it is written. Adding a second
+                 * status in front, which this did while looking for one that was
+                 * absent, moved every object four bytes past where the reader looks:
+                 * the object written at 4 was asked for at 0. */
+                if (answer && answer_size) {
+                    /* The status goes first, and the broker sends it as a field of its own.
+                     *
+                     * The comment this replaces said no status was needed here because the
+                     * answer is a complete Parcel. That is true of the *service's* answer --
+                     * a Rust service's reply begins with `ok()` -- but the broker sends the
+                     * status *beside* that answer rather than inside it, and what the caller
+                     * reads has to begin with it: `Parcel.readException` reads the first word
+                     * as a status, and health's `registerCallback` was reading `0x01000000`
+                     * -- the first boolean of a `HealthInfo` -- and throwing "unknown
+                     * exception code: 1" for it. */
+                    /* The status goes first, because that is the shape a driver's reply has
+                     * and what `Parcel.readException` reads. The broker sends it as a field
+                     * of its own, beside the service's answer, and the services return
+                     * *values* rather than a whole parcel -- so joining the two is this
+                     * side's job, in one place, for every forwarded call. */
+                    /* One interface, and only one, whose replies carry no status
+                     * word: `android.ui.ISurfaceComposer`, the *legacy* C++ interface.
+                     * Its `createDisplayEventConnection` answers with a single binder,
+                     * so a word in front of it puts the object at offset 4 while the
+                     * reader is at 0, and libbinder says so exactly -- "Attempt to
+                     * read object from Parcel at offset 0 that is not in the object
+                     * list", then `status=-19` and no display event receiver.
+                     *
+                     * The AIDL interface is not like this. AIDL writes the status into
+                     * the reply itself (`Status::writeToParcel`, generate_cpp.cpp) and
+                     * the proxy reads it there, so `android.gui.ISurfaceComposer` needs
+                     * the word -- without it `getPhysicalDisplayIds` reads this side's
+                     * count as an exception code and answers "no displays". */
+                    int native_reply = 0;
+                    if (parcel_data && parcel_data(data)) {
+                        const unsigned char *d = parcel_data(data);
+                        ulong ds = parcel_data_size(data);
+                        if (after_token(d, ds, "android.ui.ISurfaceComposer") ||
+                            after_token(d, ds, "android.ui.ISurfaceComposerClient")) {
+                            native_reply = 1;
+                        }
+                    }
+                    if (!native_reply && parcel_write_int32) {
+                        parcel_write_int32(reply, (int)status);
+                    }
+                    write_broker_answer(reply, answer, answer_size, object_count);
+                }
+
+                /* For this call only, so the reading is not confused by whichever
+                 * reply happens to be nearest. */
+
+                say("android-binder: reply parcel ");
+
                 say("android-binder: forwarded code ");
                 say_dec((long)code);
                 say(" to the broker\n");
@@ -2519,9 +3009,47 @@ int mosaic_binder_reply(uint32 handle, uint32 code, const unsigned char *request
                             refs, ref_count, &answer, &answer_size, &status, &object_count) == 0) {
             ulong size = answer_data_size(answer_size, object_count);
             write_answer_fds(answer, size, object_count);
-            return copy_out(answer, size, answer_objects(answer, size, object_count),
-                            reply_object_count(object_count), out_data, out_size, out_objects,
-                            out_objects_count);
+            /* The reply's data begins with the status. That is the driver's
+             * convention and it is what `Parcel.readException` reads first, and the
+             * broker sends the status as a field of its own -- so joining the two
+             * is this side's job.
+             *
+             * Without it the caller reads the first four bytes of the *answer* as a
+             * status. For a failed transaction that answer is the error text, so the
+             * exception that surfaces names a code nobody wrote: `no handle 43 in
+             * client 1` is read as 0x68206f6e, "no h", and reported as an unknown
+             * exception code in the middle of an unrelated call. */
+            /* The legacy C++ composer interface writes no status word; the AIDL one
+             * does (`Status::writeToParcel`). Prefixing the legacy replies is what
+             * broke `createDisplayEventConnection`; prefixing the AIDL ones is what
+             * the AIDL proxy reads. */
+            int native_reply = 0;
+            if (request && after_token(request, request_size, "android.ui.ISurfaceComposer")) {
+                native_reply = 1;
+            }
+            if (native_reply) {
+                const unsigned long *objects = answer_objects(answer, size, object_count);
+                return copy_out(answer, size, objects, reply_object_count(object_count), out_data,
+                                out_size, out_objects, out_objects_count);
+            }
+            unsigned char *joined = malloc(size + 4);
+            if (!joined) return 0;
+            joined[0] = (unsigned char)(status >> 24);
+            joined[1] = (unsigned char)(status >> 16);
+            joined[2] = (unsigned char)(status >> 8);
+            joined[3] = (unsigned char)status;
+            if (size) __builtin_memcpy(joined + 4, answer, size);
+            const unsigned long *offsets = answer_objects(answer, size, object_count);
+            /* Every object offset is an offset into the data, so they all move by
+             * the four bytes the status took. */
+            for (uint32 i = 0; i < object_count; i++) {
+                unsigned long *mutable_offsets = (unsigned long *)offsets;
+                mutable_offsets[i] += 4;
+            }
+            int copied = copy_out(joined, size + 4, offsets, reply_object_count(object_count),
+                                  out_data, out_size, out_objects, out_objects_count);
+            free(joined);
+            return copied;
         }
         /* Nobody answered, so the caller gets a failed transaction rather than an
          * empty one: EX_TRANSACTION_FAILED is what the framework reports as a

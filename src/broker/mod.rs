@@ -84,9 +84,18 @@ pub async fn serve(args: &MosaicArgs) -> anyhow::Result<()> {
     // boot that waits.
     // What the device services need of this process's configuration: the runtime
     // bundle is where the framework's `/data` and `/system` live.
-    let root = crate::runtime::resolve(&args.work)
-        .map(|(dir, _)| dir)
-        .unwrap_or_default();
+    //
+    // `MOSAIC_ANDROID_ROOT` wins when it is set, because that is the tree the
+    // framework is *actually* running from: a harness that launches the framework
+    // against a bundle the broker does not know about would otherwise have services
+    // answering about a different one -- the apex service listing the apexes of a
+    // directory that is not the one the package manager scans, and so on.
+    let root = match std::env::var("MOSAIC_ANDROID_ROOT") {
+        Ok(dir) if !dir.is_empty() => dir,
+        _ => crate::runtime::resolve(&args.work)
+            .map(|(dir, _)| dir)
+            .unwrap_or_default(),
+    };
     crate::device::host_all(&binder, &root);
     monitor_idle(open.clone());
     loop {

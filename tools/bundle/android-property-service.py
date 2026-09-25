@@ -31,6 +31,7 @@ import importlib.util
 import os
 import socket
 import struct
+import subprocess
 import sys
 
 # The area builder knows how to append to a prop_area, so a property created at
@@ -97,7 +98,14 @@ def add_property(index: dict, name: str, value: str) -> str:
         written = area.finish()
     except Exception as error:  # noqa: BLE001 - reported, not raised
         return f"could not add: {error}"
-    with open(path, "wb") as handle:
+    # In place, never truncated. The area is mapped by every Bionic process in the
+    # system, and `"wb"` truncates the file before writing: a reader that touches the
+    # mapping while it is zero length gets `SIGBUS`, which is what
+    # `prop_area::find_property` faults with on whichever thread happened to be
+    # reading. The image is the area's full size, so overwriting it changes nothing
+    # about the file's length.
+    with open(path, "r+b") as handle:
+        handle.seek(0)
         handle.write(written)
     os.chmod(path, 0o644)
     index[name] = (filename, area.index[name])
@@ -110,6 +118,54 @@ def add_property(index: dict, name: str, value: str) -> str:
     except OSError as error:
         return f"added but could not record it: {error}"
     return "added"
+
+
+# A daemon the framework asks for. On a device `init` watches `ctl.start` and
+# `ctl.stop` and runs the named service; here the property service is what receives
+# the write, so it is what has to act on it. The framework starts the overlay
+# compiler this way and then waits five seconds for the `idmap` service it
+# registers, so a write that is stored and not acted on is a boot that fails with
+# "Failed to connect to 'idmap' in 5000 milliseconds".
+_children = {}
+
+
+def handle_control(name: str, value: str) -> str:
+    if name not in ("ctl.start", "ctl.stop"):
+        return ""
+    root = os.environ.get("MOSAIC_ANDROID_ROOT")
+    if not root:
+        return "no bundle to start it from"
+    if name == "ctl.stop":
+        child = _children.pop(value, None)
+        if child is not None:
+            child.terminate()
+            return "stopped"
+        return "not running"
+    if value in _children and _children[value].poll() is None:
+        return "already running"
+    program = os.path.join(root, "bin", value)
+    if not os.path.exists(program):
+        return f"no {value} in the bundle"
+    # Through the bundle's `run.sh`, not directly: that is what puts the Android
+    # linker and the preload in front of a Bionic program, and a program started
+    # without them does not run at all. The environment is otherwise the one this
+    # service was started in, which is the framework's.
+    # Through the bundle's own runner, which reads the binary's ELF interpreter and
+    # uses the Android linker for a Bionic program and a direct exec for a host one.
+    # `run.sh` alone is not enough: it execs directly, and a Bionic binary exec'd
+    # that way fails with "required file not found" because its interpreter is
+    # `/system/bin/linker64`.
+    runner = os.path.join(root, "bundle.sh")
+    command = [runner, "run", root, value] if os.path.exists(runner) else [program]
+    environment = dict(os.environ)
+    # The shim has to be in front of it, or it opens /dev/binder -- which a host
+    # does not have -- and aborts. The framework's own preload list is in the
+    # environment this service was started in.
+    preload = environment.get("MOSAIC_PRELOAD")
+    if preload:
+        environment["LD_PRELOAD"] = preload
+    _children[value] = subprocess.Popen(command, env=environment)
+    return "started"
 
 
 def apply_write(index: dict, name: str, value: str) -> str:
@@ -173,7 +229,7 @@ def main() -> int:
                 print(f"property-service: command {command} ignored", file=sys.stderr, flush=True)
                 continue
 
-            outcome = apply_write(index, name, value)
+            outcome = handle_control(name, value) or apply_write(index, name, value)
             print(f"property-service: set {name}={value!r} -> {outcome}", file=sys.stderr, flush=True)
         finally:
             # Closing is the acknowledgement this protocol uses.
