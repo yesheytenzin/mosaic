@@ -34,6 +34,9 @@ check:
 	cargo clippy -- -D warnings
 	cargo test
 
+verify-a:
+	tools/verify-a.sh "$(BUNDLE)"
+
 # The broker is a systemd user service with socket activation, so there is no
 # daemon, no D-Bus service and no kernel module. Two things do land system side,
 # and both are limits rather than machinery: the priority limit the framework

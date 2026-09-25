@@ -8,7 +8,7 @@ gate that says it is done. Kept here because it is the list being worked.
 Done. The shim redirected `open` but not `stat`/`access`, and the font parser
 filters by `File.exists`.
 
-## A2. The service registry
+## A2. The service registry ✅
 
 The authority is `src/binder/broker.rs`, exercised by tests, and served over the
 socket by `src/binder/transport.rs`.
@@ -308,17 +308,17 @@ section D.
 ## A status
 
 All items in the A critical path are implemented and their gates pass. The
-real-runtime checks are:
+single repeatable gate is:
 
-- `tools/verify-two-process-call.sh <runtime-bundle>` — A2/A4/A5 and the
-  display-half probe: reply objects, argument objects, descriptors, real
-  cross-process forwarding, and the display service's host-truth answers.
-- `tools/verify-priority-limit.sh <runtime-bundle>` — A6: installed
-  `LimitNICE=40`, the running user manager, and a framework run without
-  `pretend-nice.so`.
-- `tools/boot-system-server.sh <runtime-bundle>` — A1, A2, A6, A7, and A8:
-  the framework passes font loading, reaches the hosted services, redirects the
-  bundle paths, and reads/writes the generated property area.
+```
+tools/verify-a.sh <runtime-bundle>
+```
+
+It runs the Rust checks, warning-free native builds, the live Binder/display
+gate, the installed `LimitNICE` gate, and the real `SystemServer` smoke. The
+smoke accepts a later B failure only after proving the A milestones: font
+loading, service registration, display construction, path redirection, and
+property reads/writes.
 
 The current system-server crash after those A gates is a later B item, not an
 unfinished A gate. The compositing half of the windowing phase is section D.
