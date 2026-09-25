@@ -36,17 +36,15 @@ GET_PRIMARY_PHYSICAL_DISPLAY_ID = 4
 GET_PHYSICAL_DISPLAY_TOKEN = 5
 GET_DISPLAY_STATE = 8
 
-# `android::ISurfaceComposer`, in the order of `ISurfaceComposer.h`'s tag enum.
 LEGACY_DESCRIPTOR = "android.ui.ISurfaceComposer"
 LEGACY_GET_STATIC_DISPLAY_INFO = 3
-LEGACY_GET_DYNAMIC_DISPLAY_INFO = 52
+LEGACY_GET_DYNAMIC_DISPLAY_INFO = 55
 LEGACY_CREATE_DISPLAY_EVENT_CONNECTION = 4
-
 # `android.gui.IDisplayEventConnection`, in declaration order, and the object type
 # a descriptor is written as.
 CONNECTION_DESCRIPTOR = "android.gui.IDisplayEventConnection"
 STEAL_RECEIVE_CHANNEL = 1
-BINDER_TYPE_FD = 0x73662A85
+BINDER_TYPE_FD = 0x66642A85
 
 
 def send(sock, kind, a=0, b=0, c=0, node=0, data=b""):
@@ -140,14 +138,11 @@ def main(path):
         node=1,
         data=request(AIDL_DESCRIPTOR),
     )
-    kind, status, _, count, _, body, _ = recv(sock)
+    kind, status, _, _, _, body, _ = recv(sock)
     if kind != KIND_REPLY or status != 0:
         raise SystemExit(f"getPhysicalDisplayIds failed: kind={kind} status={status}")
-    (exception,) = struct.unpack_from("<i", body, 0)
-    (total,) = struct.unpack_from("<i", body, 4)
-    if exception != 0:
-        raise SystemExit(f"the exception word is {exception}, not none")
-    ids = list(struct.unpack_from("<" + "q" * total, body, 8)) if total else []
+    (total,) = struct.unpack_from("<i", body, 0)
+    ids = list(struct.unpack_from("<" + "q" * total, body, 4)) if total else []
     print(f"displays: {[hex(i) for i in ids]}")
 
     host = host_modes()
@@ -165,11 +160,10 @@ def main(path):
         node=2,
         data=request(AIDL_DESCRIPTOR),
     )
-    kind, status, _, count, _, body, _ = recv(sock)
-    (exception,) = struct.unpack_from("<i", body, 0)
-    (primary,) = struct.unpack_from("<q", body, 4)
-    if exception != 0:
-        raise SystemExit(f"the primary display answered exception {exception}")
+    kind, status, _, _, _, body, _ = recv(sock)
+    if kind != KIND_REPLY or status != 0:
+        raise SystemExit(f"getPrimaryPhysicalDisplayId failed: kind={kind} status={status}")
+    (primary,) = struct.unpack_from("<q", body, 0)
     if ids and primary != ids[0]:
         raise SystemExit(f"the primary display {primary:#x} is not the first of {ids}")
     print(f"primary: {primary:#x}")
@@ -207,10 +201,9 @@ def main(path):
         data=request(AIDL_DESCRIPTOR, args + b"\x00" * 4),
     )
     kind, status, _, _, _, body, _ = recv(sock)
-    (exception,) = struct.unpack_from("<i", body, 0)
-    (state,) = struct.unpack_from("<i", body, 4)
-    if exception != 0:
-        raise SystemExit(f"getDisplayState answered exception {exception}")
+    if kind != KIND_REPLY or status != 0:
+        raise SystemExit(f"getDisplayState failed: kind={kind} status={status}")
+    (state,) = struct.unpack_from("<i", body, 0)
     print(f"state: {state} (2 is on)")
 
     # The two calls `LocalDisplayAdapter` builds a display device out of, with the
@@ -229,7 +222,9 @@ def main(path):
     (result,) = struct.unpack_from("<i", body, 0)
     if result != 0:
         raise SystemExit(f"getStaticDisplayInfo answered {result}")
-    connection_type, density, secure, product, rotation = struct.unpack_from("<ifiii", body, 4)
+    # Legacy Flattenable replies put the flattened size after the result.
+    at = 8
+    connection_type, density, secure, product, rotation = struct.unpack_from("<ifiii", body, at)
     print(
         f"static: connection={connection_type} density={density} secure={secure} "
         f"product={product} rotation={rotation}"
@@ -249,9 +244,10 @@ def main(path):
     (result,) = struct.unpack_from("<i", body, 0)
     if result != 0:
         raise SystemExit(f"getDynamicDisplayInfo answered {result}")
-    at = 4
-    (modes,) = struct.unpack_from("<i", body, at)
-    at += 4
+    # Legacy Flattenable replies put the flattened size after the result.
+    at = 8
+    (modes,) = struct.unpack_from("<Q", body, at)
+    at += 8
     mode_id, width, height = struct.unpack_from("<iii", body, at)
     at += 12
     x_dpi, y_dpi, refresh = struct.unpack_from("<fff", body, at)
@@ -299,9 +295,10 @@ def main(path):
         data=request(CONNECTION_DESCRIPTOR),
     )
     kind, status, _, count, _, body, fds = recv(sock)
+    # The descriptor words are checked below against the protocol constant.
     if count != 2:
         raise SystemExit(f"the BitTube carried {count} objects, not two")
-    (presence,) = struct.unpack_from("<i", body, 4)
+    (presence,) = struct.unpack_from("<i", body, 0)
     if presence != 1:
         raise SystemExit(f"the parcelable's presence word is {presence}, not 1")
     if not fds:

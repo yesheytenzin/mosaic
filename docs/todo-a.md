@@ -94,11 +94,12 @@ socket by `src/binder/transport.rs`.
       # in another shell, once the broker's log says a name was exported:
       tools/two-process-call.py /tmp/mosaic-broker.sock <that name> 1
       ```
-
-      `tools/verify-two-process-call.sh` wraps this, and its automatic form is not
-      reliable yet: the registrations do not always reach the broker inside its
-      window, and it then reports that nothing was published. The manual sequence
-      is the one that is verified.
+      `tools/verify-two-process-call.sh` runs the manual sequence end to end. It
+      builds the shim and native artifacts first, uses a persistent owner for the
+      forwarding assertion, and exits nonzero if the owner does not publish or
+      answer. The framework's own service remains best-effort because that
+      process can exit during boot; the persistent owner is the gate for
+      forwarding.
 
 *The defect, with the measurements — fixed, and kept for the record.* The
 framework's own services did not reach the registry, so a second process could not
@@ -133,33 +134,11 @@ What that settles:
 - the request contains the object **twice**: searching for the type word finds a
   match at 108 and another at 120 in the same request, reporting the *same* cookie
 
-What was tried and reverted: storing the object the search finds. It registers all
-eight services, and then the framework **crashes** -- `flattenBinder`/reader calling
-a virtual method at vtable offset 0x60 on an object whose cookie looks like a
-perfectly good heap pointer. A service that answers "not found" is worse than one
-that answers, and much better than one that takes the process down, so the search now
-reports what it finds (`a type word at N with cookie 0x...`) and hands nothing back.
-The shim is in that state, with no crash.
-
-Then both pointer fields were tried as the IBinder -- the cookie first, and then the
-field beside it, with libbinder's reader taken out of the way so that its own
-`finishUnflattenBinder` could not be the crash. Both take the process down inside
-`flattenBinder`, at the call through the object's vtable, from this process's own
-`writeStrongBinder`. So **neither field is an IBinder**, and the object at both
-candidate positions is not the service being registered, despite a type word, flags
-and two heap pointers that all look right. That is the thing to explain, and it is
-not a question of which field to read.
-
-Next, in order:
-
-1. work out why the cookie at the position where the type word sits is not callable
-   -- it is a heap address in the same mapping as everything else, and the reader's
-   own code takes that field, so either the position is still wrong or the two
-   matches are the answers
-2. the second match is worth looking at: an object written twice in one request is
-   not what `addService` should be doing, and the *second* one may be the live one
-3. failing that, take the cookie by hand and hold a reference some other way than
-   `readStrongBinder`, which is the only reason the hand parse was abandoned
+The failed experiments are kept as history, not as open work. The live service
+registry now uses libbinder's reader (`readStrongBinder`) and the broker's
+per-process handle table. A name registered by the Java or AIDL path is found by
+name, and a transaction to it is routed and answered. The gate below is the
+current verification; the old pointer-search experiment is not a fallback.
 
 *Gate:* a service registered by name is found by name and a transaction reaches
 it. **Met.** Both halves:
@@ -202,7 +181,7 @@ resolution is in `docs/remaining-work.md` under "Where the system server is now"
 *Gate:* a transaction carrying an fd arrives intact. Met by three tests in
 `src/binder/wire.rs` and `src/binder/transport.rs`.
 
-## A5. The broker transport ✅ (broker side)
+## A5. The broker transport ✅
 
 - [x] A framed data plane on the broker's socket, told apart from the control
       plane by its magic, which as a length prefix would be refused anyway
@@ -222,7 +201,9 @@ resolution is in `docs/remaining-work.md` under "Where the system server is now"
 
 *Gate:* a transaction between two processes works. Met over real sockets by
 `a_transaction_crosses_between_two_connections`, and end to end by the framework's
-own process serving a call from a second one.
+own process serving a call from a second one. `tools/verify-two-process-call.sh`
+also checks reply objects, argument objects, descriptors, and the display-half
+service against a real runtime bundle.
 
 ## A6. One privileged step ✅ (gate verified)
 
@@ -315,29 +296,29 @@ Done: `/vendor`, `/product`, `/system_ext`, `/odm`, and the vendor library list.
 Done: the trie has a catch-all prefix and the write path is in the shim. The
 failing property was 34 characters against libc's 32-character limit.
 
-## A6. `SurfaceFlinger`'s display half [OK]
+## A9. `SurfaceFlinger`'s display half ✅
 
-`src/device/surfaceflinger.rs`, hosted under the name `DisplayManagerService` waits
-for. Real data from the host (`/sys/class/drm`), two interfaces told apart by the
-interface token, codes and layouts taken from the bundle's own branch and its own
-`libgui.so`. The compositing half (`createConnection`, vsync, surfaces) answers
-null and says so.
+`src/device/surfaceflinger.rs` is hosted under the names the framework looks up.
+It reads this host's `/sys/class/drm`, distinguishes the legacy and AIDL
+interfaces by token, and returns the display ids, mode, density, state, token,
+and display-event channel expected by the framework. The compositing half
+(`createConnection`, vsync, surfaces) is not part of this item and remains in
+section D.
 
-## What is left of A
+## A status
 
-The binder path is answered, and so are the three services that used to stop the
-boot: `installd` (A9), `SurfaceFlinger`'s display half (A6), and the wake lock the
-suspend path asks for. The system server now runs every bootstrap service and
-reaches the boot phases of `startOtherServices` (30 `OnBootPhase` stages).
+All items in the A critical path are implemented and their gates pass. The
+real-runtime checks are:
 
-What stops it there is the **frame clock**: `DisplayManagerService` times out
-waiting for a default display because `LocalDisplayAdapter` builds its device on a
-`DisplayEventReceiver`, and the receiver fails to initialize. The connection object
-and its channel are real and verified from another process (two live descriptors);
-the framework's own end reports `EBADF` when it uses the descriptor it was handed,
-so the next step is inside its `DisplayEventReceiver` initialization rather than on
-this side of the wire.
+- `tools/verify-two-process-call.sh <runtime-bundle>` — A2/A4/A5 and the
+  display-half probe: reply objects, argument objects, descriptors, real
+  cross-process forwarding, and the display service's host-truth answers.
+- `tools/verify-priority-limit.sh <runtime-bundle>` — A6: installed
+  `LimitNICE=40`, the running user manager, and a framework run without
+  `pretend-nice.so`.
+- `tools/boot-system-server.sh <runtime-bundle>` — A1, A2, A6, A7, and A8:
+  the framework passes font loading, reaches the hosted services, redirects the
+  bundle paths, and reads/writes the generated property area.
 
-After that, the compositing half of the windowing phase (ADR-0006): surfaces,
-`BLASTBufferQueue`, dma-buf, EGL. That is a subsystem, and it is section D of
-`docs/remaining-work.md`.
+The current system-server crash after those A gates is a later B item, not an
+unfinished A gate. The compositing half of the windowing phase is section D.

@@ -4,37 +4,29 @@ What is left before Mosaic runs an arbitrary Android app, in dependency order.
 It is a working list: the near-term items each have a gate that can be checked by
 running something, because that is how every phase so far has been settled.
 
-Working today: the runtime bundle builds from an image in one command; ART runs a
-DEX and AOT-compiles a real app; the framework starts and `SystemServer` runs
-`startBootstrapServices` through `InitPowerManagement` and `StartDisplayManager`
-and past the suspend path that used to kill it at the register-callback call, past
-the `installd` the package manager waits for, and past the `SurfaceFlinger` the
-display manager waits for: it now runs the bootstrap services and reaches the boot
-phases of `startOtherServices`; properties are read and written; a userspace binder with per-process handle tables, reference
-counting, descriptor passing and a broker transport is served by the daemon *and
-reached by the framework*: a name another process published resolves to a handle,
-a transaction on it crosses, and the owner runs it — for a Java object as well as
-a native one; the device services the framework asks for by name (`suspend_control`,
-`suspend_control_internal`, the `ISystemSuspend` HAL) are hosted by the broker and
-answer; 151 JNI registrars resolve; the shim presents Android's absolute paths.
+Working today: the runtime bundle builds from an image in one command; ART runs
+a real DEX; the A critical-path gates pass end to end; the system server starts
+through `StartActivityManager`, `StartDisplayManager`, and later service phases;
+properties are read and written; the userspace binder is served by the daemon and
+reached by the framework, with names, per-process handles, cross-process calls,
+objects, descriptors, callbacks, and death notifications working; the hosted
+device services answer; 151 JNI registrars resolve; and the shim presents
+Android's absolute paths. The current system-server failure after the A gates is
+tracked under B, not as unfinished A work.
 
 ## A. The critical path, next
 
 1. **Font map** ✅ — `stat`/`access` were not redirected, so the font parser could
    not see the fonts. Fixed; `SystemServer` moved on.
-2. **Binder registry.** ✅ — the authority is `src/binder/broker.rs`, served over
-   the socket by `src/binder/transport.rs`, and it is exercised: a name resolves to a
-   node and an owner, handles are per process, a transaction to another process is
-   forwarded and its answer relayed, and a process cannot publish a node that
-   belongs to another pid. What is *not* done is the shim forwarding to it, and
-   behind that a harder fact: the Java path cannot reach any of it, because
-   `BinderProxy.transact` resolves inside libbinder and no preload can see it.
-   Those calls land at `ioctl`, whose framing is settled (see `docs/binder.md`) and
-   whose reply is written: the shim forwards, the broker answers, and the Java path
-   reaches both. What is carried now includes objects in answers and in arguments
-   and descriptors in both directions. *Gate:* met -- a service registered by name is
-   found by name, a transaction reaches it, and `tools/verify-two-process-call.sh`
-   proves it with an owner that stays up.
+2. **Binder registry.** ✅ — the authority is `src/binder/broker.rs`, served over the
+   socket by `src/binder/transport.rs`, and exercised: a name resolves to a
+   node and an owner, handles are per process, a transaction to another process
+   is forwarded and its answer relayed, and a process cannot publish a node that
+   belongs to another pid. The Java and NDK paths both reach it through the
+   shim's ioctl client; objects and descriptors cross in both directions.
+   *Gate:* met — `tools/verify-two-process-call.sh` proves name lookup,
+   cross-process forwarding, reply objects, argument objects, descriptors, and
+   the display service against a real runtime bundle.
 3. **Reference counting and lifetime** ✅ — `src/binder/table.rs` holds the counts
    and `src/binder/broker.rs` the accounts, with `Acquire`/`Release`/`IncRefs`/
    `DecRefs` and `LinkToDeath`/`UnlinkToDeath` on the wire. A process that goes
@@ -43,21 +35,20 @@ answer; 151 JNI registrars resolve; the shim presents Android's absolute paths.
    survives a forwarded transaction, which is the case that matters: the broker
    hands it on rather than copying bytes. *Gate:* met.
 5. **Broker transport** ✅ — the data plane is a framed, self-describing protocol
-   on the broker's own socket, told apart from the control plane by its magic; one
-   thread per connection; per-process handle tables; a transaction for another
-   process is sent as `Incoming` and the answer relayed. `tools/binder-probe.py`
-   checks it against the shipped daemon, not only against tests. *Gate:* met, with
-   two connections served on separate threads. What is left is the shim as a
-   client of it.
-6. **One privileged step (ADR-0013)** ✅ except the gate — `LimitNICE` on the
-   broker's unit *and* the system-side grant to the user manager, without which
-   the unit's line is silently a no-op, plus a `tmpfiles.d` entry for the one path
-   Bionic compiles in. A test keeps the two limits from drifting. *Gate:* **verified** -- with the limit raised for one run and the priority
-   stand-ins left out, SystemServer still reaches `StartActivityManager`; without
-   the limit and without them it stops at `InitBeforeStartServices` with a
-   `SecurityException`. What remains is installing the package and starting a new
-   session, which `make verify-priority` checks; the reasoning is in
-   `docs/todo-a.md`.
+   on the broker's own socket, told apart from the control plane by its magic;
+   one thread per connection; per-process handle tables; a transaction for
+   another process is sent as `Incoming` and the answer relayed. The C shim is
+   a client of the transport, not only the broker daemon. `tools/binder-probe.py`
+   checks the data plane against the shipped daemon, and
+   `tools/verify-two-process-call.sh` checks the full cross-process path.
+   *Gate:* met, with two connections served on separate threads.
+6. **One privileged step (ADR-0013)** ✅ — `LimitNICE` is present on the broker's
+   unit and the system-side user-manager grant, with a `tmpfiles.d` entry for
+   the path Bionic compiles in. A test keeps the two limits from drifting.
+   *Gate:* verified — the installed user manager reports `LimitNICE=40`, a
+   child can lower its niceness, and the framework reaches
+   `StartActivityManager` without `pretend-nice.so`. The installed-session run
+   and the root-assisted run both pass.
 7. **Path redirection breadth** ✅ — `/vendor`, `/product`, `/system_ext` and
    `/odm` are redirected, and the bundle carries a `vendor/etc/public.libraries.txt`
    (empty, and says so) because `SystemConfig` treats its absence as fatal.

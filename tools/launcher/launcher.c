@@ -325,7 +325,6 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
 
     static registrar_fn called[512];
     int called_count = 0;
-    int registered = 0;
     for (unsigned long i = 0; i < sizeof(kRegistrars) / sizeof(kRegistrars[0]); i++) {
         for (int l = 0; l < library_count; l++) {
             registrar_fn fn = (registrar_fn)dlsym(libraries[l], kRegistrars[i]);
@@ -344,10 +343,11 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
                 say_dec(result);
                 say("\n");
             }
-            registered++;
         }
     }
     say("launcher: registered ");
+    say_dec(called_count);
+    say("\n");
     void (*arm)(void) = (void (*)(void))dlsym((void *)-1L, "shim_arm_thread_attach");
     if (arm) arm();
 

@@ -27,7 +27,7 @@ for source in "$here"/*.c; do
   # which needs a helper Bionic does not export. The real thing is available and
   # is what a preload should use.
   clang --target="$target" -shared -fPIC -nostdlib -O2 -fno-emulated-tls \
-    -Wall -Wextra -Wno-unused-parameter \
+    -Wall -Wextra -Wno-unused-parameter -Wno-builtin-requires-header \
     -o "$out/$name.so" "$source"
   echo "built $out/$name.so"
 done

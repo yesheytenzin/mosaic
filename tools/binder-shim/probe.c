@@ -15,6 +15,9 @@
  */
 
 typedef unsigned long size_t;
+/* Keep clang from treating this headerless shim's interposed libc declaration as
+ * an incompatible redeclaration of the compiler built-in. */
+void *fopen(const char *, const char *) __attribute__((nothrow));
 typedef long ssize_t;
 typedef long off_t;
 
@@ -384,17 +387,9 @@ static void death_forget(unsigned int handle) {
  * thread with nothing to read and no way to be called back. */
 #define MAX_INCOMING 8
 
-/* The strong hold a transaction takes on its target, which the driver takes and
- * this side did not.
- *
- * On a device the kernel keeps the target alive for the duration of the call and
- * drops it after, and that is the reference that makes the difference between an
- * object being destroyed inside its own transaction and being destroyed when the
- * last holder lets go. Without it, `IPCThreadState`'s own balanced `sp<BBinder>`
- * around the call is the *last* reference, the object dies at the end of the
- * call, and the weak release that follows is against a count already gone:
- * `RefBase: decWeak called on ... too many times`. */
-static void *strong_hold;
+/* The reference callbacks are resolved for the registry's permanent holds. The
+ * driver-style per-transaction hold was removed after it was measured to call
+ * `RefBase::incStrong` on objects that are not `RefBase` instances. */
 typedef void (*strong_fn)(void *);
 static strong_fn refbase_inc_strong;
 static strong_fn refbase_dec_strong;
