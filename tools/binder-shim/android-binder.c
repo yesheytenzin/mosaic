@@ -2731,7 +2731,7 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
     void *own_reply = malloc(PARCEL_BYTES);
     if (!own_reply) return 0;
     parcel_ctor(own_reply);
-    if (service_manager(code, parcel_data(data), parcel_data_size(data), (void *)data, own_reply)) {
+    if (handle == 0 && service_manager(code, parcel_data(data), parcel_data_size(data), (void *)data, own_reply)) {
         if (parcel_set_reference) {
             parcel_set_reference(
                 reply, parcel_ipc_data(own_reply), parcel_ipc_data_size(own_reply),
@@ -2812,6 +2812,7 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
                      * the word -- without it `getPhysicalDisplayIds` reads this side's
                      * count as an exception code and answers "no displays". */
                     int native_reply = 0;
+                    int interface_reply = code == TRANSACTION_INTERFACE;
                     if (parcel_data && parcel_data(data)) {
                         const unsigned char *d = parcel_data(data);
                         ulong ds = parcel_data_size(data);
@@ -2820,7 +2821,7 @@ static int handle_transaction(int handle, uint32 code, const void *data, void *r
                             native_reply = 1;
                         }
                     }
-                    if (!native_reply && parcel_write_int32) {
+                    if (!native_reply && !interface_reply && parcel_write_int32) {
                         parcel_write_int32(reply, (int)status);
                     }
                     write_broker_answer(reply, answer, answer_size, object_count);
