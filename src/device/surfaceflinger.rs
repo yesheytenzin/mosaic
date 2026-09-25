@@ -679,11 +679,13 @@ impl SurfaceFlinger {
             legacy::GET_DESIRED_DISPLAY_MODE_SPECS => match self.named_display(args) {
                 Some(display) => {
                     let mut reply = Parcel::new();
-                    reply.i32(0); // defaultMode
-                    reply.boolean(false); // allowGroupSwitching
+                    // `SurfaceControl.DesiredDisplayModeSpecs` has no status
+                    // word: defaultMode, four float ranges, then the boolean.
+                    reply.i32(0); // defaultMode: the one supported mode
                     for _ in 0..4 {
                         reply.raw(&display.refresh_hz.to_le_bytes());
                     }
+                    reply.boolean(false); // allowGroupSwitching
                     reply.into_bytes().into()
                 }
                 None => {
@@ -1049,5 +1051,24 @@ mod tests {
         assert!(!aidl.data.is_empty(), "createDisplay is refused, by name");
         let mut reader = Reader::new(&aidl.data);
         assert_eq!(reader.i32(), EX_UNSUPPORTED_OPERATION);
+    }
+
+    #[test]
+    fn desired_display_mode_specs_keep_the_native_field_order() {
+        let mut service = service();
+        let reply = service
+            .transact(
+                legacy::GET_DESIRED_DISPLAY_MODE_SPECS,
+                &request(LEGACY, &[]),
+            )
+            .unwrap()
+            .data;
+        let mut reader = Reader::new(&reply);
+        assert_eq!(reader.i32(), 0);
+        assert_eq!(reader.f32(), 60.0);
+        assert_eq!(reader.f32(), 60.0);
+        assert_eq!(reader.f32(), 60.0);
+        assert_eq!(reader.f32(), 60.0);
+        assert_eq!(reader.i32(), 0, "allowGroupSwitching is the final field");
     }
 }
