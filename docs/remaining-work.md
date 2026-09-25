@@ -14,6 +14,11 @@ device services answer; 151 JNI registrars resolve; and the shim presents
 Android's absolute paths. The current system-server failure after the A gates is
 tracked under B, not as unfinished A work.
 
+The repeatable all-A gate is `tools/verify-a.sh <runtime-bundle>` (or
+`make verify-a BUNDLE=<runtime-bundle>`). It runs the unit, native, live
+Broker, priority, and real system-server checks and distinguishes a later B
+crash from an A failure.
+
 ## A. The critical path, next
 
 1. **Font map** ✅ — `stat`/`access` were not redirected, so the font parser could

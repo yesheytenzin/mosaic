@@ -492,7 +492,7 @@ impl SurfaceFlinger {
         out.extend_from_slice(&0f32.to_le_bytes());
         out.push(0); // autoLowLatencyModeSupported
         out.push(0); // gameContentTypeSupported
-        out.extend_from_slice(&(-1i32).to_le_bytes()); // preferredBootDisplayMode: none
+        out.extend_from_slice(&0i32.to_le_bytes()); // preferredBootDisplayMode: the one mode
         out
     }
 
@@ -1003,7 +1003,7 @@ mod tests {
         assert_eq!(reader.f32(), 0.0); // minLuminance
         assert_eq!(reader.i8(), 0); // auto low latency, one byte
         assert_eq!(reader.i8(), 0); // game content type, one byte
-        assert_eq!(reader.i32(), -1); // no preferred boot mode
+        assert_eq!(reader.i32(), 0); // preferred boot mode: the one supported mode
     }
 
     #[test]
