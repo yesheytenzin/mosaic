@@ -507,9 +507,13 @@ do_jars() { # <image> <bundle>
   # Configuration the framework reads by path: the font configuration is the
   # first thing SystemFonts asks for, and it fails with a NullPointerException in
   # FileInputStream when the file is absent, because the descriptor is null.
-  mkdir -p "$out/etc" "$out/fonts"
+  mkdir -p "$out/etc" "$out/etc/sysconfig" "$out/etc/permissions" "$out/fonts"
   local conf
-  mkdir -p "$out/etc/compatconfig" "$out/system_ext/etc/compatconfig"
+  mkdir -p "$out/etc/compatconfig" \
+    "$out/product/etc/sysconfig" "$out/product/etc/permissions" \
+    "$out/system_ext/etc/compatconfig" \
+    "$out/system_ext/etc/sysconfig" "$out/system_ext/etc/permissions" \
+    "$out/odm/etc/sysconfig" "$out/odm/etc/permissions"
   # Compatibility configuration is part of the device contract. The bundle
   # already redirects /system_ext and /apex, but without these XML files the
   # framework's SystemConfig has no arrays to initialize and aborts before
