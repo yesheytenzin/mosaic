@@ -168,10 +168,76 @@ def handle_control(name: str, value: str) -> str:
     return "started"
 
 
+# `persist.*` survives a restart. Android keeps them in
+# `/data/property/persistent_properties`, and init loads the ones it declared at
+# boot; this is the same idea with a plain-text body, one `name=value` per line,
+# because the file is ours and nothing else reads it. Written to a temporary file
+# and renamed, so a service killed mid-write leaves the old file rather than half
+# of a new one.
+PERSIST_PREFIX = "persist."
+
+
+def persist_path() -> str:
+    root = os.environ.get("MOSAIC_ANDROID_ROOT")
+    if not root:
+        return ""
+    return os.path.join(root, "data", "property", "persistent_properties")
+
+
+def persist_save(name: str, value: str) -> None:
+    path = persist_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        known = persist_load()
+        known[name] = value
+        temporary = path + ".new"
+        with open(temporary, "w") as handle:
+            for key, stored in sorted(known.items()):
+                handle.write(f"{key}={stored}\n")
+        os.replace(temporary, path)
+    except OSError as error:
+        print(f"property-service: could not persist {name}: {error}", file=sys.stderr, flush=True)
+
+
+def persist_load() -> dict:
+    path = persist_path()
+    if not path or not os.path.exists(path):
+        return {}
+    found = {}
+    try:
+        with open(path) as handle:
+            for line in handle:
+                line = line.strip()
+                if line and "=" in line and line.startswith(PERSIST_PREFIX):
+                    key, _, stored = line.partition("=")
+                    found[key] = stored
+    except OSError:
+        return {}
+    return found
+
+
+def persist_restore(index: dict) -> None:
+    """Put every persisted property back into the area at startup.
+
+    Only names the area already declares: `add_property` appends, and appending
+    for a name nothing declared at boot is how an area grows without its
+    `property_info` knowing, which is the thing that cannot be rewritten while
+    processes have it mapped.
+    """
+    for name, value in sorted(persist_load().items()):
+        if name in index:
+            apply_write(index, name, value)
+
+
 def apply_write(index: dict, name: str, value: str) -> str:
     entry = index.get(name)
     if entry is None:
-        return add_property(index, name, value)
+        result = add_property(index, name, value)
+        if result in ("added",) and name.startswith(PERSIST_PREFIX):
+            persist_save(name, value)
+        return result
     filename, offset = entry
     raw = value.encode()
     if len(raw) >= PROP_VALUE_SIZE:
@@ -179,16 +245,66 @@ def apply_write(index: dict, name: str, value: str) -> str:
 
     path = os.path.join(AREA_DIR, filename)
     with open(path, "r+b") as area:
-        # serial's top byte is the length; the rest of the value area is zeroed
-        # so a shorter value cannot leave a longer one's tail behind.
-        area.seek(offset)
-        area.write(struct.pack("<I", (len(raw) & 0xFF) << 24))
+        # The index holds offsets *into the area's data*, which is what the
+        # generator's writer works in; a file offset is that plus the area header.
+        # The header is 128 bytes and the two differ by exactly that, which is the
+        # whole bug this replaced: writing at the recorded offset wrote 128 bytes
+        # before the entry, into whatever is there -- a `prop_bt` node, whose name
+        # a reader compares when it walks the area -- and the property then reads as
+        # absent for every process (`find -> NOT FOUND`, empty value) while the
+        # service truthfully reports "applied" and a byte-level look at the entry
+        # still shows the old bytes.
+        at = make_property_area.AREA_HEADER + offset
+        raw = value.encode()
+        if len(raw) >= PROP_VALUE_SIZE:
+            return "value too long, dropped"
+        # Before anything is written: the entry at this offset must be *this*
+        # property's. The name is stored after the value area, which is the layout
+        # the generator writes (serial, value[92], name), and a write to an offset
+        # that is not the entry does not fail -- it lands in the middle of whatever
+        # is there. Refusing is the safe answer: a value that could not be set is a
+        # property that reads as it did, and a corrupted area is one that takes
+        # names with it.
+        area.seek(at + make_property_area.PROP_INFO_SIZE)
+        at_entry = area.read(len(name) + 1)
+        if at_entry != name.encode() + b"\x00":
+            return (
+                f"refused: the entry at {at} in {filename} is {at_entry!r}, "
+                f"not {name}"
+            )
+        # The serial is what a reader uses to know a value changed, and libc's own
+        # writer (`prop_info::update`) moves it in three steps: mark it dirty, write
+        # the value, then publish `(length << 24) | (serial + 1)`. Writing the
+        # length byte alone -- which is what this did -- leaves the counter still,
+        # so a *reader* that is polling for the change (libbase's `WaitForProperty`,
+        # which is how a Bionic client waits for `hwservicemanager.ready`) can read
+        # the old value forever, and the length in the top byte is all a fresh
+        # reader would believe.
+        #
+        # The value area is zeroed past the value so a shorter one cannot leave a
+        # longer one's tail behind.
+        area.seek(at)
+        current = struct.unpack("<I", area.read(4))[0]
+        dirty = current | 1
+        area.seek(at)
+        area.write(struct.pack("<I", dirty))
+        area.seek(at + 4)
         area.write(raw + b"\x00" * (PROP_VALUE_SIZE - len(raw)))
+        # The published serial counts from the *dirty* one, not from `current`:
+        # `(dirty + 1)` is what clears the low bit, and a serial left with it set
+        # is a value every reader refuses, which is what this did first --
+        # `serial=0x04000001`, `dirty=1` in the area, and a waiter that polls the
+        # name forever.
+        area.seek(at)
+        area.write(
+            struct.pack("<I", ((len(raw) & 0xFF) << 24) | ((dirty + 1) & 0xFFFFFF))
+        )
     return "applied"
 
 
 def main() -> int:
     index = load_index()
+    persist_restore(index)
     parent = os.path.dirname(SOCKET_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)

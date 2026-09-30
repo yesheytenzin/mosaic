@@ -166,7 +166,12 @@ EOF
 }
 
 write_linker_config() { # <bundle>
-  local out="$1"
+  local out="$1" apex library_paths
+  # Every library directory this bundle has: its own, bionic's, and each apex's.
+  library_paths="$out/lib64:$out/lib64/bionic"
+  for apex in "$out"/apex/*/lib64; do
+    [ -d "$apex" ] && library_paths="$library_paths:$apex"
+  done
   cat > "$out/ld.config.txt" <<EOF
 # Linker configuration for a Mosaic runtime bundle.
 #
@@ -183,13 +188,22 @@ write_linker_config() { # <bundle>
 # visible = true is what exports the namespace to
 # android_get_exported_namespace, which is how ART and libnativebridge ask for
 # it by name.
+#
+# The apex library directories are in the search path because that is where an
+# apex jar's native libraries live and how the framework loads them: a service
+# from service-connectivity.jar calls System.loadLibrary for "service-connectivity",
+# and the linker is asked for a bare name, which it can only resolve on a search
+# path. Without them the boot stops in that constructor:
+#
+#   java.lang.UnsatisfiedLinkError: dlopen failed: library
+#   "libservice-connectivity.so" not found
 dir.system = $out
 
 [system]
 namespace.default.isolated = false
 namespace.default.visible = true
-namespace.default.search.paths = $out/lib64:$out/lib64/bionic
-namespace.default.permitted.paths = $out/lib64:$out/lib64/bionic
+namespace.default.search.paths = $library_paths
+namespace.default.permitted.paths = $library_paths
 EOF
 }
 
@@ -389,7 +403,18 @@ stage_classpath() { # <image> <bootclasspath|systemserverclasspath> <output file
       dump_path "$img" "$where" "$out/framework/$base" >/dev/null || continue
       echo "  + $base"
     fi
-    printf '%s/framework/%s:' "$out" "$base" >> "$list"
+    # The *device* path, not the bundle's: this is the string the framework's
+    # class loaders are keyed on, and `SYSTEMSERVERCLASSPATH` in the environment
+    # has to name the same jars the same way or the same class is loaded twice --
+    # once through each loader -- and `SystemService` from an apex service is then
+    # a different class from the framework's:
+    #
+    #   Failed to create com.android.server.NetworkStatsServiceInitializer:
+    #   service must extend com.android.server.SystemService
+    #
+    # The shim presents these paths (ADR-0009), so a jar named `/system/framework/
+    # foo.jar` is the one staged at `<bundle>/framework/foo.jar`.
+    printf '%s:' "$jar" >> "$list"
   done
   sed -i 's/:$//' "$list"
   echo "  $want: $(tr ':' '\n' < "$list" | wc -l) jars"
@@ -400,14 +425,71 @@ stage_classpath() { # <image> <bootclasspath|systemserverclasspath> <output file
 # the boot without one ("There must be exactly one installer; found []"). The
 # bundle's root is what the framework sees as /system, so they land at the top
 # level, which is where its paths point.
-# What this runtime provides, in the form the framework looks for it. Written by
-# the bundle rather than taken from the image: it declares the HALs *this side*
-# hosts, and a HAL listed here that is missing is worse than one absent, because
-# `ServiceManager.waitForDeclaredService` would then wait for it.
-do_vintf() { # <bundle>
-  local out="$1"
-  mkdir -p "$out/etc/vintf"
-  cat > "$out/etc/vintf/manifest.xml" <<'XML'
+# VINTF: what this runtime declares, and what the image declares.
+#
+# These are two different files and mixing them is fatal, which is what this used
+# to do. `/system/etc/vintf/manifest.xml` is the *framework* manifest and
+# `/vendor/etc/vintf/manifest.xml` is the *device* one, and VINTF refuses to add
+# a framework manifest to a device one:
+#
+#   hwservicemanager: getFrameworkHalManifest: -2147483648 VINTF parse error:
+#     Cannot add manifest fragment /system/etc/vintf/manifest/android.frameworks.stats@1.0-service.xml:
+#     Cannot add a framework manifest to a device manifest
+#
+# so the image's framework manifest and its fragments are staged from the image
+# into `etc/vintf/`, and the health HAL -- the one this side hosts -- is declared
+# in the *device* manifest under `vendor/etc/vintf/`, where the shim's path rules
+# send `/vendor`.
+#
+# The framework manifest is what carries `android.hidl.manager@1.2::IServiceManager`,
+# and without it the HIDL service manager cannot find its own entry:
+#
+#   hwservicemanager: getTransport: Cannot find entry android.hidl.manager@1.2::IServiceManager/default
+#     in either framework or device VINTF manifest
+#
+# which leaves every HIDL lookup unanswered and the system server's
+# `startHidlServices` aborting on `ISensorManager::registerAsService()`.
+do_vintf() { # <image> <bundle>
+  local img="$1" out="$2" f
+
+  mkdir -p "$out/etc/vintf/manifest" "$out/vendor/etc/vintf/manifest"
+
+  # The image's own framework manifest and its fragments, and the compatibility
+  # matrices beside them. A HAL declared here that is missing is worse than one
+  # absent, because `ServiceManager.waitForDeclaredService` would then wait for
+  # it -- and this manifest declares framework services, which the image's own
+  # libraries provide.
+  rm -f "$out/etc/vintf/manifest.xml" "$out/etc/vintf/manifest"/*.xml
+  dump_path "$img" "/system/etc/vintf/manifest.xml" "$out/etc/vintf/manifest.xml" || true
+  for f in $(debugfs -R "ls -l /system/etc/vintf/manifest" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /\.xml$/ { print $NF }'); do
+    dump_path "$img" "/system/etc/vintf/manifest/$f" "$out/etc/vintf/manifest/$f" || true
+  done
+  for f in $(debugfs -R "ls -l /system/etc/vintf" "$img" 2>/dev/null \
+      | awk '$1 ~ /^[0-9]+$/ && $NF ~ /^compatibility_matrix.*\.xml$/ { print $NF }'); do
+    dump_path "$img" "/system/etc/vintf/$f" "$out/etc/vintf/$f" || true
+  done
+
+  # The device manifest, which is what this runtime provides. It is written rather
+  # than taken from the image: the image declares HALs whose daemons are Android
+  # binaries this runtime does not run.
+  #
+  # The HIDL entries are not decoration. `registerAsService` refuses a service that
+  # is not declared, *before* any transaction, and the refusal is what stops
+  # `SystemServer.startHidlServices`:
+  #
+  #   HidlServiceManagement: Service android.frameworks.sensorservice@1.0::ISensorManager/default
+  #                          must be in VINTF manifest in order to register/get.
+  #   Cannot register android.frameworks.sensorservice@1.0::ISensorManager: -2147483648
+  #
+  # and `-2147483648` is `0x80000000`, which is what that function returns when the
+  # check fails (measured in `registerAsServiceInternal`'s own code). The entries are
+  # the framework services a system server *registers* here -- its sensor service,
+  # its scheduling policy service and its stats service -- plus the two the HIDL
+  # manager itself provides, which an earlier hwservicemanager run reported as
+  # missing. `android.hardware.health` stays in its AIDL form: that one this runtime
+  # really does answer.
+  cat > "$out/vendor/etc/vintf/manifest.xml" <<'XML'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest version="1.0" type="device">
     <hal format="aidl">
@@ -415,15 +497,56 @@ do_vintf() { # <bundle>
         <version>1</version>
         <fqname>IHealth/default</fqname>
     </hal>
+    <hal format="hidl">
+        <name>android.frameworks.sensorservice</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>ISensorManager</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <hal format="hidl">
+        <name>android.frameworks.schedulerservice</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>ISchedulingPolicyService</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <hal format="hidl">
+        <name>android.frameworks.stats</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>IStats</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <hal format="hidl">
+        <name>android.hidl.manager</name>
+        <transport>hwbinder</transport>
+        <version>1.2</version>
+        <interface>
+            <name>IServiceManager</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <hal format="hidl">
+        <name>android.hidl.token</name>
+        <transport>hwbinder</transport>
+        <version>1.0</version>
+        <interface>
+            <name>ITokenManager</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
 </manifest>
 XML
-  # Both places the framework reads: the file and the directory of fragments, which
-  # is where this image keeps its own HAL declarations.
-  mkdir -p "$out/etc/vintf/manifest" "$out/vendor/etc/vintf/manifest"
-  cp "$out/etc/vintf/manifest.xml" "$out/etc/vintf/manifest/android.hardware.health-service.xml"
-  cp "$out/etc/vintf/manifest.xml" "$out/vendor/etc/vintf/manifest.xml"
-  cp "$out/etc/vintf/manifest.xml" "$out/vendor/etc/vintf/manifest/android.hardware.health-service.xml"
-  echo "  + etc/vintf/manifest.xml (the health HAL)"
+  cp "$out/vendor/etc/vintf/manifest.xml" \
+     "$out/vendor/etc/vintf/manifest/android.hardware.health-service.xml"
+  echo "  + vendor/etc/vintf/manifest.xml (the health HAL), etc/vintf/manifest.xml (the image's)"
 }
 
 do_apps() { # <image> <bundle>
@@ -485,6 +608,7 @@ do_apps() { # <image> <bundle>
   else
     echo "  --  apex/: not in the image, so nothing to scan" >&2
   fi
+
 }
 
 do_jars() { # <image> <bundle>
@@ -503,6 +627,27 @@ do_jars() { # <image> <bundle>
       | awk '$1 ~ /^[0-9]+$/ && $NF ~ /-res\.apk$/ { print $NF }'); do
     dump_path "$img" "/system/framework/$res" "$out/framework/$res"
   done
+
+  # The classpath configs themselves, where the framework looks for the list of
+  # jars it may build a class loader from.
+  for f in bootclasspath.pb systemserverclasspath.pb; do
+    local inode
+    inode=$(debugfs -R "ls -l /system/etc/classpaths" "$img" 2>/dev/null \
+      | awk -v n="$f" '$NF == n { print $1 }')
+    [ -n "$inode" ] || continue
+    mkdir -p "$out/etc/classpaths"
+    debugfs -R "dump <$inode> $out/etc/classpaths/$f" "$img" 2>/dev/null >/dev/null
+  done
+
+  # The classpath environment the framework reads, from the same configs: on a
+  # device init runs `derive_classpath` and loads its exports, and this runtime
+  # does not run init. See classpath-exports.py for what the two variables are
+  # and why the standalone one decides whether an apex jar may be loaded at all.
+  local exports
+  exports="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/classpath-exports.py"
+  if [ -f "$exports" ] && command -v python3 >/dev/null; then
+    python3 "$exports" "$out/index" "$out/data/system/environ/classpath"
+  fi
 
   # Configuration the framework reads by path: the font configuration is the
   # first thing SystemFonts asks for, and it fails with a NullPointerException in
@@ -532,6 +677,62 @@ do_jars() { # <image> <bundle>
       | awk '$1 ~ /^[0-9]+$/ && $NF ~ /^fonts.*\.xml$/ { print $NF }'); do
     dump_path "$img" "/system/etc/$conf" "$out/etc/$conf"
   done
+
+  # The host-HAL allowlist, which libhidlbase reads before it will look up any
+  # HIDL service: `isHostHalAllowed` loads /system/etc/hosthals.xml with tinyxml
+  # and dereferences the result without checking it, so a *missing* file is a
+  # SIGSEGV inside `XMLNode::FirstChildElement`, not a HAL that is looked for in
+  # the wrong place. It crashed `PowerStatsService`, on the main thread, in
+  # `startCoreServices`.
+  #
+  # The root element must be `hosthals`: the reader takes the root's first `hal`
+  # child, and with a different root the same unchecked dereference is what it
+  # does.
+  #
+  # The same file gates *registration*, which is what the entries below are for:
+  # `registerAsServiceInternal` calls that reader, and a service it does not find
+  # is refused with
+  #
+  #   HidlServiceManagement: Service android.frameworks.sensorservice@1.0::ISensorManager/default
+  #                          must be in VINTF manifest in order to register/get.
+  #   Cannot register android.frameworks.sensorservice@1.0::ISensorManager: -2147483648
+  #
+  # before any transaction is sent -- `-2147483648` is `0x80000000`, the constant
+  # that function returns when the lookup fails. So the three framework services a
+  # system server registers here have to be named. The rest of the image's list is
+  # not carried over: those are ARC's *host* HALs, and this runtime has no second
+  # Android environment, so nothing else may be registered or looked up on the host
+  # side.
+  # The entries are the services' *descriptors*, not the package names the
+  # image's own list uses: the reader is handed `details::getDescriptor(service)`
+  # -- `android.frameworks.sensorservice@1.0::ISensorManager` -- and compares the
+  # `<name>` text against it with `strcmp`, so a bare package name matches
+  # nothing. (That measurement is what the first attempt at this file got wrong.)
+  # ARC's host-HAL list, which libhidlbase reads before it will let a service be
+  # registered or looked up: the entry is the *instance-qualified* name and the
+  # `<priority>` child is part of the schema, both measured. The entries are the
+  # framework HIDL services *this* runtime serves -- its sensor service, its
+  # scheduling policy service and its stats service -- because in Mosaic the
+  # runtime is the host: there is no second Android environment for a "device"
+  # HAL to belong to, and every *device* HAL a real Android would serve is
+  # answered (or refused) by this side's own userspace services.
+  cat > "$out/etc/hosthals.xml" <<'XML'
+<hosthals version="1.0">
+    <hal>
+        <name>android.frameworks.sensorservice@1.0::ISensorManager/default</name>
+        <priority>true</priority>
+    </hal>
+    <hal>
+        <name>android.frameworks.schedulerservice@1.0::ISchedulingPolicyService/default</name>
+        <priority>true</priority>
+    </hal>
+    <hal>
+        <name>android.frameworks.stats@1.0::IStats/default</name>
+        <priority>true</priority>
+    </hal>
+</hosthals>
+XML
+  echo "  + etc/hosthals.xml (the framework HALs this runtime serves)"
 
   # And the fonts those files name, which Typeface.create opens by path.
   local font
@@ -649,6 +850,18 @@ SEED
 
   do_closure "$img" "$out" || return 1
 
+  # The apex libraries are staged as the image has them: symlinks into the system
+  # copy, by a device's absolute paths. Point them inside the bundle instead --
+  # they are dangling otherwise, and a dangling link is not just an unreadable
+  # file: the linker resolves a dependency to a real path and checks it against the
+  # namespace's permitted directories, so it surfaces as a library that is present
+  # and refused. See fix-library-links.py.
+  local links
+  links="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fix-library-links.py"
+  if [ -f "$links" ] && command -v python3 >/dev/null; then
+    python3 "$links" "$out"
+  fi
+
   echo "staging the boot classpath and data files..."
   do_jars "$img" "$out"
 
@@ -656,7 +869,7 @@ SEED
   do_apps "$img" "$out"
 
   echo "declaring the HALs this side hosts..."
-  do_vintf "$out"
+  do_vintf "$img" "$out"
 
   echo "building the property area..."
   do_properties "$img" "$out"
@@ -693,6 +906,49 @@ do_env() {
 # Generated by tools/bundle/bundle.sh. Source this before running a Bionic
 # binary out of this bundle.
 export LD_CONFIG_FILE="$out/ld.config.txt"
+# NOT the device path, although '/system' is the tempting value and this is where
+# it would go. 'android.os.Environment.getRootDirectory()' is
+# 'System.getenv("ANDROID_ROOT")' with a '/system' fallback, and the package manager
+# builds every partition path -- and so every package's 'sourceDir' -- from it. A
+# host path here is why the connectivity module cannot find its resource package:
+#
+#   pkgs.removeIf(pkg -> !pkg.activityInfo.applicationInfo.sourceDir
+#           .startsWith("/apex/com.android.tethering/"));
+#   throw new IllegalStateException("No connectivity resource package found");
+#
+# This line *is* what the apex paths turn on, and not through the apex root:
+# 'ApexManagerFlattenedApex.getActiveApexInfos' builds each 'ActiveApexInfo' with
+# 'Environment.getRootDirectory()' as 'preinstalledApexPath', and that -- not
+# 'Environment.DIR_APEX_ROOT', which is '/apex' here and set by nothing -- is what
+# the package manager's partition list uses. So every apex is scanned as
+# <root>/apex/<module>, each package in one gets that for its sourceDir, and the
+# connectivity module's startsWith("/apex/com.android.tethering/") can never match:
+#
+#   java.lang.IllegalStateException: No connectivity resource package found
+#
+# Read out of the bytecode with the bundle's own dexdump; the launcher prints the
+# process's APEX_ROOT and ANDROID_ROOT if this is ever in doubt again. APEX_ROOT is
+# unset, so DIR_APEX_ROOT is /apex -- the *root* is the one that matters.
+#
+# Setting this to / would put the apexes at the path the module wants, and it was
+# measured: 'No connectivity resource package found' disappears from that run. It was
+# not adopted then because that same run stopped at three stages instead of 157 -- and
+# the reason it stopped was CompatConfig.create failing with a
+# NullPointerException ("Attempt to get length of null array"), which is the apex
+# etc/compatconfig directories the shim now resolves. That blocker is gone, so the
+# device forms are adopted here and the run is the measurement that says whether they
+# are right. The *mapping* is unaffected: the shim finds the real tree through
+# the shim's root variable, which the harness sets to the bundle, and these variables only
+# decide which *strings* the framework builds and compares. The honest fix is to give the
+# framework /apex as a real path -- a mount in the harness's user namespace, or the
+# mount-namespace layout docs/remaining-work.md describes as the product's alternative
+# to path redirection -- rather than moving the root and hoping.
+#
+# Setting this to '/system' is *not* the fix for that filter, and it is not free:
+# with the device root, 'CompatConfig.create' failed in one run in
+# 'startBootstrapServices' ('NullPointerException: Attempt to get length of null
+# array' out of its XML parser, boot stopped at three stages) and passed in another,
+# so it is a race rather than a certainty. Leave this alone until that is settled.
 export ANDROID_ROOT="$out"
 export ANDROID_DATA="$out/data"
 export ANDROID_ART_ROOT="$out"
@@ -739,6 +995,107 @@ EOF
 # /dev/__properties__, which needs root to provision (ADR-0013), so the bundle
 # carries the generated files for the privileged step to install rather than
 # writing them itself.
+# `ApexManagerFlattenedApex` reads `/apex/apex-info-list.xml` to enumerate the apexes --
+# the fallback a *flattened* apex build uses instead of asking apexd, and the file a
+# previous session wrote by hand and then lost. It is generated from the apexes the
+# bundle actually carries, so it cannot disagree with them.
+do_apex_info() { # <bundle>
+  local out="$1" d n
+  [ -d "$out/apex" ] || return 0
+  {
+    echo '<apex-info-list>'
+    for d in "$out"/apex/*/; do
+      [ -d "$d" ] || continue
+      n="$(basename "$d")"
+      printf '  <apex-info moduleName="%s" modulePath="/apex/%s" preinstalledModulePath="/apex/%s" versionCode="1" versionName="" isActive="true" />\n' "$n" "$n" "$n"
+    done
+    echo '</apex-info-list>'
+  } > "$out/apex/apex-info-list.xml"
+  echo "  + apex/apex-info-list.xml"
+}
+
+# The `/data` tree, as Android's `init.rc` declares it. Nothing in the framework
+# creates the parent directories -- it opens `/data/system_ce/<user>`, `/data/anr`,
+# `/data/tombstones` and the rest as if they were already there, the way they are
+# after a device's first boot -- so a bundle without them has the framework
+# reporting "No such file or directory" for paths that are supposed to be empty.
+#
+# The modes are init.rc's. Ownership is *reported* through `MOSAIC_UID` rather than
+# changed with `chown`: the harness runs as the namespace's root and the framework
+# reads `Process.myUid()`, so the directory does not need to be owned by a id the
+# build cannot create.
+# B14: a boot image, or the decision not to have one.
+#
+# `dex2oat64` from the bundle is what would build `framework/boot.art`, and it needs a
+# working ART on the host for the *host* path it is being asked to compile for. It
+# does not produce a usable image, and ART says so itself on every boot:
+#
+#   dalvikvm64: Could not create image space with image file '.../boot.art!...':
+#   ... Attempting to fall back to imageless running.
+#
+# The fallback works -- that is what the boot has been doing all along, at the cost of
+# interpreting the boot class path instead of mapping a prebuilt image. This records
+# the decision where the gate can see it, rather than leaving "there is no boot.art"
+# to be rediscovered as a bug each time.
+do_bootimage() { # <bundle>
+  local out="$1" image="$out/framework/boot.art" note="$out/data/mosaic-imageless.txt"
+  if [ -f "$image" ]; then
+    echo "  + framework/boot.art (prebuilt image present)"
+    return 0
+  fi
+  [ -d "$out/data" ] || return 0
+  {
+    echo "imageless start accepted for this bundle."
+    echo
+    echo "framework/boot.art is absent and is not built by this step: the bundle's"
+    echo "dex2oat64 does not produce a usable image for it. ART falls back itself --"
+    echo "'Attempting to fall back to imageless running' -- and the boot proceeds by"
+    echo "interpreting the boot class path, which is slower to start and correct."
+    echo
+    echo "The alternative is building the image on the machine that installs the"
+    echo "bundle, which is what docs/remaining-work.md B14 describes."
+  } > "$note"
+  echo "  + data/mosaic-imageless.txt (no boot image; the fallback is recorded)"
+}
+
+do_data() { # <bundle>
+  local out="$1" d
+  [ -d "$out/data" ] || return 0
+  for d in \
+      system:771 \
+      system_ce:771 \
+      system_de:771 \
+      misc:771 \
+      user:771 \
+      user_de:771 \
+      app:771 \
+      app-asec:700 \
+      app-lib:771 \
+      app-private:770 \
+      dalvik-cache:771 \
+      dalvik-cache/x86_64:771 \
+      local:771 \
+      local/tmp:771 \
+      property:700 \
+      media:770 \
+      media/0:770 \
+      tombstones:771 \
+      anr:771 \
+      ssh:700 \
+      system/dropbox:770 \
+      system/users:771 \
+      ; do
+    mkdir -p "$out/data/${d%%:*}"
+    chmod "${d##*:}" "$out/data/${d%%:*}" 2>/dev/null || true
+  done
+  for u in 0; do
+    mkdir -p "$out/data/system_ce/$u" "$out/data/system_de/$u" "$out/data/user/$u" "$out/data/user_de/$u"
+    chmod 771 "$out/data/system_ce/$u" "$out/data/system_de/$u" \
+                "$out/data/user/$u" "$out/data/user_de/$u" 2>/dev/null || true
+  done
+  echo "  + data/ (Android's init.rc tree)"
+}
+
 do_properties() { # <image> <bundle>
   local img="$1" out="$2" gen build_prop
   gen="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/make-property-area.py"
@@ -772,8 +1129,29 @@ do_properties() { # <image> <bundle>
   fi
   # And the status is checked: a bundle whose property area is missing or stale
   # is not a bundle, and everything downstream reads identity out of it.
+  # The *host* root, decided by measurement. The device root (`ANDROID_ROOT=/system` with
+# the module roots as their apexes) was tried and retired: it scans 88 packages and dies
+# on `Missing required system package: android.ext.services`, while this one scans 102,
+# reaches past `ConnectivityService` into `ContentService` and `AccountManagerService`,
+# and has none of the ext-services or keystore failures. What the device root was for --
+# `ConnectivityResources` comparing a package's `sourceDir` against
+# `/apex/com.android.tethering/` -- is handled in the shim instead, by translating the
+# *answer* `realpath` gives for apex paths back into the device spelling.
+#
+# `ro.vndk.version` is not in the image's build.prop and has to be: Bionic's
+  # ashmem is a memfd wrapper that refuses to create a region without it
+  # ("memfd: ro.vndk.version not defined or invalid, this is mandated since P"),
+  # and the first caller is the settings provider's generation tracker, so the
+  # failure lands as `IOException: ashmem creation failed` in a Java stack far
+  # from the cause. It is the image's SDK level by definition, so it is derived
+  # rather than guessed.
+  sdk=""
   if [ -n "$build_prop" ]; then
-    python3 "$gen" "$out/properties" --build-prop "$build_prop" >/dev/null || return 1
+    sdk="$(sed -n 's/^ro\.build\.version\.sdk=//p' "$build_prop" | head -1)"
+  fi
+  rm -f "$out/etc/vndk.prop"
+  if [ -n "$build_prop" ]; then
+    python3 "$gen" "$out/properties" --build-prop "$build_prop" ${sdk:+--set "ro.vndk.version=$sdk"} >/dev/null || return 1
   else
     python3 "$gen" "$out/properties" >/dev/null || return 1
   fi
@@ -848,6 +1226,9 @@ do_compile() { # <bundle> <apk> [compiler-filter]
     return 1
   fi
   [ -f "$out/env.sh" ] || do_env "$out"
+  do_apex_info "$out"
+  do_data "$out"
+  do_bootimage "$out"
 
   local work
   work=$(mktemp -d "${TMPDIR:-/tmp}/mosaic-compile.XXXXXX")
@@ -918,7 +1299,7 @@ do_run() { # <bundle> <binary> [args...]
 case "$cmd" in
   index)   do_index "${2:?image}" "${3:?bundle}" ;;
   apps)    do_apps "${2:?image}" "${3:?bundle}" ;;
-  vintf)   do_vintf "${2:?bundle}" ;;
+  vintf)   do_vintf "${2:?image}" "${3:?bundle}" ;;
   closure) do_closure "${2:?image}" "${3:?bundle}" ;;
   stage)   do_stage "${2:?image}" "${3:?bundle}" "${4:?inode}" "${5:?name}" "${@:6}" ;;
   jars)    do_jars "${2:?image}" "${3:?bundle}" ;;

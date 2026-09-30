@@ -75,7 +75,22 @@ INDEX_FILE = "index.tsv"
 # Enough for app_process and ART to start. ART reads dalvik.vm.* and the SDK
 # level, app_process reads the ABI list and ro.zygote, and framework code reads
 # the product identity.
+#
+# `hwservicemanager.ready` is declared here and set at run time, which is what a
+# property like this needs: a *reader* finds a name through the property_info trie
+# or not at all, so a name a process sets that the trie does not carry is written
+# into an area nobody can look up. "false" rather than "" is deliberate: a name
+# declared with an empty value is not resolvable at all -- measured with a reader
+# that has no shim in its path, `__system_property_find("hwservicemanager.ready")`
+# returns null for it while `ro.build.version.sdk` resolves -- and an entry libc
+# cannot find is one no writer can make visible. The HIDL service manager -- the
+# image's `hwservicemanager`, which the harness starts beside the framework --
+# sets it to "true" once it is. A Bionic client waits on it before it will build a
+# HIDL service manager at all, one second at a time and forever:
+#
+#   HidlServiceManagement: Waited for hwservicemanager.ready for a second, waiting another...
 DEFAULT_PROPERTIES = {
+    "hwservicemanager.ready": "false",
     "ro.build.version.sdk": "33",
     "ro.build.version.release": "13",
     "ro.build.version.codename": "REL",

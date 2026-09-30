@@ -1,5 +1,588 @@
 # Remaining work
 
+## Session state (latest)
+
+`ro.vndk.version` was missing from the property area, and Bionic's ashmem is a memfd
+wrapper that refuses without it (`memfd: ro.vndk.version not defined or invalid, this
+is mandated since P`). The first caller is the settings provider's generation tracker,
+so it surfaced as `java.io.IOException: ashmem creation failed` in a Java stack far
+from the cause. `bundle.sh` now derives it from the image's `ro.build.version.sdk` and
+passes it with `--set`; the generator's own list is closed, so `--set` is the way in.
+With it, the boot reaches the same 78 stages the host path reaches.
+
+Two things this session settled by measurement rather than by reasoning:
+
+- The `chroot` route is a dead end and is not needed. With the root at `/` the same
+  files appear under two path forms (`/framework/...` and `/system/framework/...`), and
+  the package manager scans `framework-res.apk` twice, takes the second for a duplicate,
+  skips the frameworks package, and SystemServer dies with `Failed to load frameworks
+  package`. The host path, which rewrites paths through the shim, already scans
+  `<bundle>/apex/com.android.tethering` and starts `ConnectivityService` — the thing the
+  chroot was built for. It also needed `ANDROID_ROOT=/` plus the other `ANDROID_*` roots
+  rewritten, `dir.system` pointing at a real directory, `--rbind` for `/proc` and `/dev`,
+  and `LD_PRELOAD` instead of `MOSAIC_PRELOAD`.
+- Two lines that look like walls are warnings the host path also prints and boots
+  through: ART's `is in boot class path but is not in a known location` (34 times) and
+  `CompatConfig` listing the bundle root while reporting `/etc/compatconfig/<name>`
+  (which the shim maps correctly — the listing never goes through the shim's `opendir`,
+  so that directory is never the one being read). Both cost runs before the normal
+  path's own log settled them.
+
+## Fixed this session, each with the run that proved it
+
+Four walls, all named by a log line rather than by reasoning:
+
+1. **`ro.vndk.version` was missing from the property area.** Bionic's ashmem is a memfd
+   wrapper that refuses without it, and the failure surfaces as
+   `java.io.IOException: ashmem creation failed` in the settings provider. `bundle.sh`
+   derives it from the image's `ro.build.version.sdk` and passes it with `--set`; the
+   generator's own name list is closed, so `--set` is the way in.
+2. **`/dev/ashmem` was answered with an eventfd**, the same placeholder the binder device
+   gets. Ashmem exists to be mapped and an eventfd cannot be, so the caller's `mmap`
+   failed and the region was never usable. It is a memfd per region now -- per region,
+   because regions must not share memory -- and `ashmem creation failed` went from 215
+   occurrences to zero.
+3. **`CompatConfig.initConfigFromLib` walks every apex's `etc/compatconfig`** and calls
+   `listFiles()` on each; a directory that is not there gives a *null* array and the
+   framework dereferences it (`NullPointerException: Attempt to get length of null array`
+   in `startBootstrapServices`, one stage into the boot). The shim resolves all of those
+   paths to the bundle's own compat config directory, narrowly, the way it already
+   resolves `/etc/compatconfig` and `public.libraries.txt`.
+4. **Two build warnings that are real defects**, both now fixed: `redirected_count` was
+   read and written in one unsequenced expression in the shim's path report, and the
+   shim's `android_get_exported_namespace` check tested a function address (always true)
+   instead of a weak symbol.
+
+`tools/verify-a.sh <bundle>` is the gate that found 4, and it treats a shim or launcher
+warning as a failure -- correctly, because one of the two was undefined behaviour.
+
+## The Scudo corruption: what the instrument says
+
+`MOSAIC_ALLOC_TRACE=1` (the trace shim is inert without it) plus the corrupt address from the
+crash line, correlated exactly as that shim's own header describes:
+
+```
+free 514319 32570 0x714ea4405ed0 from 0x714bee961f8a     <- one match, a free, no alloc
+```
+
+The address was never allocated by the traced allocator, and it sits in a different region
+(`0x714e...`) than every allocation around it (`0x714c...`). So something freed a pointer that
+was never `malloc`ed. The stack, from ART's own crash dump, says who:
+
+```
+#5  art::DlOpenOatFile::Dlopen(std::string const&, art::MemMap*)
+#6  art::OatFile::Open(int, std::string const&)
+#7  art::OatFileAssistant::OatFileInfo::GetFile()
+#9  art::OatFileAssistant::GetBestInfo()
+#10 art::OatFileAssistant::GetOptimizationStatus(...)
+#11 art::OatFileManager::OpenDexFilesFromOat(char const*, _jobject*)
+```
+
+ART is dlopening an **existing** oat to read its optimisation status -- a missing one never
+reaches `Dlopen` -- from the JNI path `OpenDexFilesFromOat`, which is one JNI call away from a
+registrar. Eliminated against it: `alloc-trace` in the preload list, the preload list's
+`pretend-*` shims, the shim's unbounded path copies (now bounded and reporting truncation),
+`realpath` mapping beyond the apex reverse, and the bundle's staged oat files. The bundle
+carries 166 of those, staged from the image, so the next question is whether ART is being
+handed a *stale* oat: one built by a different ART than the one loading it, or one whose
+`oat` is fine but whose `vdex` is not.
+
+## `ConnectivityResources` fixed, narrowly: the apex reverse in `realpath`
+
+The plan's fallback, done the way the failures had taught: `realpath` maps nothing *in* --
+only the *answer* is translated, and only for the apex prefix. A canonical path under the
+bundle's `apex` comes back as `/apex/...`, which is the spelling `ConnectivityResources`
+compares a package's `sourceDir` against.
+
+```
+resource-not-found: 0                     (was 2, fatal)
+ConnectivityServiceInitializer failure: 0 (was 2)
+dropbox-rename failures: 0                (was 20+; rename* handed the kernel one string twice)
+packageCount: 102
+last stages: TelephonyRegistry, EntropyMixer, AccountManagerService, ContentService
+```
+
+The boot is **past `ConnectivityService`** and the next wall is a new one, and a later one:
+`android.os.ZygoteStartFailedEx: Error connecting to zygote` -- the point where an app process
+is wanted, which nothing hosts yet.
+
+## Decided: the host root, and the shim does not hook realpath
+
+The device-root layout is retired. Measured side by side, same shim, same bundle:
+
+```
+layout                        packageCount  stages  ext-services-fail  keystore-NPE
+host root (ANDROID_ROOT=...)  102           78      0                  0
+device root (ANDROID_ROOT=/system)  88       18      3 (fatal)          13
+```
+
+The host root scans every apex package (102) and reaches `ConnectivityService`; the device
+root loses fourteen packages and dies on `Missing required system package: android.ext.services`.
+
+One thing this session got wrong and reverted: hooking `realpath`. It looked like the answer
+because `PackagePartitions$SystemPartition` holds `DeferredCanonicalFile`s, but mapping there
+cost the host layout 14 packages (102 to 88) -- canonicalising a path the framework built and
+getting a bundle path back is worse than not touching it. The hooks, the `//`-collapse, and
+every temporary diagnostic are removed; the shim is back to `redirect` plus the mappings that
+earned their place. The lesson is recorded rather than the code: **a hook that rewrites what a
+path *is* costs more than one that rewrites what a path *opens*.**
+
+Baseline to beat from here: **packageCount 102, stages 78, ext-services-fail 0, keystore-NPE 0**,
+with `resource-not-found: 2` and the last stages `NetworkScore`/`NetworkStats`/`NetworkPolicy`/
+`PacProxy`/`ConnectivityService`.
+
+## Double-slash device paths were silently unmapped (fixed), and the scan still never asks
+
+A traced boot carries 84 redirect lines whose source begins `//` -- the framework builds some
+paths by joining a root with an already-absolute component, and every rule in the shim matched
+on a single leading slash. Such a path passed through to a host that has no `/system`, which
+reads as "the directory is not there" and gets skipped without a word (the shim only logs
+redirects a rule matched).
+
+`redirect` now collapses a leading `//`, which is a correctness fix on its own. It is **not**
+this wall: after it, a traced boot still shows **zero** redirects mentioning `priv-app` or an
+`app` directory in any form -- no `/system/priv-app`, no `//system/priv-app`, no apex one --
+while `/system/fonts` (187), `/system/framework` (55) and `/system/etc` (4) are all asked for
+normally. So the scan is not reaching those directories at all, by any path or spelling.
+
+The next thing to read is `scanDir` itself and the loop that calls it, since every input to it
+-- the partition list, the flags, the folders, the listing, the info list -- has now been
+measured or disassembled.
+
+## The partitions are static, and `system` does have priv-app
+
+Read out of `framework.jar`'s `PackagePartitions$SystemPartition`:
+
+```
+SystemPartition(File folder, int type, String name, boolean b1, boolean b2) {
+    mFolder        = DeferredCanonicalFile(folder);
+    mAppFolder     = DeferredCanonicalFile(folder, "app");
+    if (b1) mPrivAppFolder = DeferredCanonicalFile(folder, "priv-app");
+    if (b2) mOverlayFolder = DeferredCanonicalFile(folder, "overlay");
+}
+```
+
+and the static list, with the two flags in brackets:
+
+```
+SystemPartition(Environment.getRootDirectory(),   0, "system",  [1,0])
+SystemPartition(Environment.getVendorDirectory(), 1, "vendor",  [1,1])
+SystemPartition(Environment.getOdmDirectory(),    2, "odm",     [1,1])
+SystemPartition(Environment.getOemDirectory(),    3, "oem",     [0,..])
+SystemPartition(Environment.getProductDirectory(),4, "product", [1,..])
+```
+
+`system` carries `priv-app` (b1) and no `overlay` (b2) -- which is right for a device, where
+`/system/overlay` does not exist. So `getPrivAppFolder()` is **not** null for the system
+partition, the null-check in the loop cannot be what skips it, and the folders are
+`DeferredCanonicalFile`s -- objects that canonicalise lazily, through `realpath`, which the
+shim does **not** hook (verified: `grep realpath probe.c` is empty).
+
+That is where the next measurement goes: what the scan does with a `DeferredCanonicalFile`
+whose path does not exist on the host.
+
+## The second loop, in full
+
+```
+0059: mDirsToScanAsSystem
+0060: if (i >= size) goto 0099
+0064: get(i) -> ScanPartition
+006b: getPrivAppFolder() -> File
+006f: if (v0 == null) goto 0084     <- priv-app is skipped when the folder is null
+0084: getAppFolder() -> scanDir    <- app is scanned unconditionally
+```
+
+`getPrivAppFolder()` can be null and then `priv-app` is skipped; `getAppFolder()` is scanned
+either way. Since `Failed to load frameworks: 0` in the current layout, the check at 0x0056
+passed and this loop did run -- so both accessors were called, and a traced boot shows *no*
+`priv-app` request and no `/app` request either. That means both folders are null for every
+partition object in the list, which is a property of how the partitions are built rather than
+of the loop.
+
+The next measurement is the loop's own view: log every directory the shim is asked to open
+during the scan and read which of them the loop actually hands to `scanDir`, instead of
+inferring it from the absence of requests for particular names.
+
+## The frameworks package loads; the wall is `android.ext.services` alone
+
+Measured in the current device-root layout: `Failed to load frameworks: 0`,
+`Missing required system package: 4`, `Required services extension package: 2`. The
+`scanSystemDirs` check does **not** throw here -- that throw was from older runs, and reading
+18 stages as "stopped at the check" was wrong. The apex partitions are scanned (50 `/overlay`
+directories, one per apex) and the frameworks package registers.
+
+So the surviving problem is exactly the setting's one package: `config_servicesExtensionPackage`
+is `android.ext.services`, it lives in `com.android.extservices/priv-app/ExtServices@…`, and
+nothing enumerates the *package* directories of any apex partition -- while nothing about the
+apex machinery, the info list (three variants tried), or the `@` naming explains it.
+
+A second, unrelated wall appeared in the same run and is worth its own look when this is
+settled: 13 x `NullPointerException: Attempt to invoke interface method
+'void android.security.maintenance.IKeystoreMaintenance.clearNamespace(int, long)' on a null
+object reference`.
+
+## The `@`-named apex directory is refuted, three ways
+
+`ApexManagerFlattenedApex.getActiveApexInfos` does require `@` in the directory name, but
+supplying it three different ways changes nothing:
+
+| arrangement | result |
+| --- | --- |
+| `@1` symlinks *beside* every plain module | 53 entries in the listing, `packageCount: 88`, check fails |
+| real directories renamed to `@1` | boot dies at stage 0 -- the classpath and env use the plain names |
+| real `@1` directories with the plain names as symlinks to them | `packageCount: 88`, check fails |
+
+So the active-apex list does not come from that method in this build -- the listing it performs
+is real (the shim counts 28, then 51 with the symlinks) and the filter is not what empties it.
+One earlier reading of mine was wrong and is worth not repeating: the rename run showed
+`ext-services-fail=0` only because it died before reaching the check.
+
+The remaining candidate is the other input: `apex-info-list.xml` is opened during the boot, and
+its parse is now the thing to read out of the bytecode (`ApexInfoList.readFromXml` /
+`ApexInfo.readFromXml`), since the attribute names alone were not enough to make it work.
+
+## The frameworks package: one line present in one layout and absent in the other
+
+The check that gates the rest of the scan is read straight off the bytecode:
+
+```
+004c: iget-object mPm ; "android" -> containsKey
+0056: if-eqz v0, 009a          <- jump to the throw
+```
+
+So `priv-app`/`app` are scanned only after the frameworks package registered, which is why a
+traced device-root boot opens **no `priv-app` path at all**. Both layouts do open the
+frameworks apk -- `/system/framework/framework-res.apk` maps correctly to
+`<bundle>/framework/framework-res.apk` in both -- and the working host-root layout prints one
+extra line the broken one does not:
+
+```
+PackageManager: Unrecognized code path /system/framework/framework-res.apk - using /home/.../bundle/framework/framework-res.apk
+```
+
+That is the package manager *correcting* the code path when it does not match the partition it
+is scanning, and with the device root it has nothing to correct: the path it builds and the
+partition agree, and the scan still ends in the throw. So the next measurement is the few lines
+between opening that apk and the throw in the device-root log, which is where the parse or the
+code-path handling goes differently.
+
+## What `scanSystemDirs` does, from the bytecode
+
+```
+for (ScanPartition p : mDirsToScanAsSystem)  p.getOverlayFolder() -> scanDir
+for (ScanPartition p : mDirsToScanAsSystem)  p.getPrivAppFolder() -> scanDir
+                                             p.getAppFolder()     -> scanDir
+if (!mPm.mPackages.containsKey("android"))
+    throw new IllegalStateException("Failed to load frameworks package; check log for warnings");
+```
+
+`ScanPartition` carries `getFolder`, `getPrivAppFolder`, `getAppFolder`, `getOverlayFolder`,
+`containsPrivApp`, `containsFile` and a `scanFlag`. The overlay loop runs for *every*
+partition, which is why `apex/<module>/overlay` is opened for all 25 apexes; the `priv-app`
+and `app` scans run in the second loop, and in the device-root layout a traced boot opens
+**no `priv-app` path at all** -- not even `<root>/priv-app`, while the host-root layout opens
+`<bundle>/apex/com.android.extservices/priv-app/ExtServices@TQ3A.230901.001`. The same loop
+therefore gets different partitions in the two layouts.
+
+## The apex partitions *are* in the scan list -- their overlays are scanned
+
+Traced, with tracing that actually logs (mapping lines need `MOSAIC_BINDER_DEBUG=1`; several
+of my earlier counts of "0 asks" came from untraced runs and meant nothing):
+
+```
+50 x  /overlay
+android-paths: /apex/com.android.adbd/overlay       -> <bundle>/apex/com.android.adbd/overlay
+android-paths: /apex/com.android.adservices/overlay -> <bundle>/apex/com.android.adservices/overlay
+```
+
+Fifty overlay directories, including one per apex. So the apex partitions *are* in
+`mDirsToScanAsSystem`, and `CompatConfig` (which iterates `getActiveApexInfos` successfully)
+was right all along. What is missing is the *package* directories of those partitions:
+`apex/<module>/priv-app` and `apex/<module>/app` are never opened, while
+`apex/<module>/overlay` is. The next measurement is which directories `ScanPartition` carries
+and which of them the scan iterates, since the same partition object supplies both.
+
+The versioned-name experiments are undone: a `@1` symlink beside each module changed nothing
+(53 entries in the listing, `packageCount: 88`), and renaming the real directories to `@1`
+broke the boot at stage 0 because the plain names are used by the classpath and the env.
+
+## `getActiveApexInfos` returns nothing, and that is now the whole wall
+
+Everything around it is proven working, each by its own measurement: `/apex` maps to the
+bundle's apex directory and lists 28 entries; `apex-info-list.xml` exists, is opened, and its
+content now matches the attribute set the framework's own bytecode names (`moduleName`,
+`modulePath`, `preinstalledModulePath`, `versionCode`, `versionName`, `isActive` -- `isFactory`
+was in the generated file and is not among them); the apexes' `etc/permissions` and
+`etc/compatconfig` are read throughout the boot.
+
+And yet nothing asks for `apex/<module>/priv-app`, nothing asks for `ExtServices.apk`, and
+`Scan apex failed, not a coreApp` -- the rejection `ApexManagerImpl` logs -- appears **zero**
+times in both the broken and the working run. A rejected package would log; an unvisited one
+cannot. So nothing enumerates the packages inside the apexes.
+
+**Corrected by disassembly** (the bundle's own `dexdump`, through the bundle's
+`linker64` -- it is a Bionic binary and will not run on the host directly):
+
+```
+InitAppsHelper.initSystemApps:
+    mApexManager.scanApexPackagesTraced(parser, executor)
+    scanSystemDirs(parser, executor)
+    new ArrayMap
+    mApexManager.getActiveApexInfos() -> iterator
+```
+
+`getActiveApexInfos` *is* called, and it is **not** empty: `CompatConfig` iterates the same
+call and reads the real XML out of every apex all through the boot.
+
+`scanSystemDirs` reads a field, `mDirsToScanAsSystem`, and that field is assigned once, in
+`InitAppsHelper`'s constructor, from a *parameter* -- the whole dex contains exactly two
+`new-instance ScanPartition` sites and neither is built from an apex. So the list arrives
+from the package manager's constructor, and which apexes are in it is decided there.
+
+**The comparison is done, and it localises the difference to the apex paths themselves.**
+
+```
+layout   packages  apex priv-app asks  ExtServices.apk asks  stages
+HOST     102       0                   0                     78
+DEVICE   88        0                   0                     18
+```
+
+My first count was wrong in one direction: it looked for `/apex/...`, and the host layout
+scans **host** paths. The line that matters is the host layout's:
+
+```
+PackageManager: <bundle>/apex/com.android.extservices/priv-app/ExtServices@TQ3A.230901.001 changed; collecting certs
+```
+
+So the host layout's scan list *contains* the apex packages as `<root>/apex/<module>`, finds
+14 more packages, and the ext-services check passes. The device layout never asks for an apex
+path in *any* form -- not `/apex/...`, not `/system/apex/...` -- so its list has none, and the
+check is fatal. Making `/system/apex` exist as a symlink changes nothing, which rules out the
+shim's mapping as the cause: the list is built without the apexes at all.
+
+The next measurement is the active-apex list as the scan sees it -- the paths it hands over,
+not the listing that feeds it (that one is proven: 28 entries, from the bundle's own apex
+directory).
+
+One guess is already refuted: a *versioned* apex name (`com.android.extservices@1`, the form
+a flattened apex build normally uses) was added as a symlink beside every module and the boot
+did not change at all -- 25 pairs, regenerated `apex-info-list.xml`, `packageCount: 88`,
+`ext-services-fail: 3`, `extservices in cache: 0`. So the filter is not the `@` form.
+
+The next measurement is the implementation rather than its inputs: read
+`ApexManagerFlattenedApex.getActiveApexInfos` out of the bytecode with the bundle's own
+`dexdump` -- the tool that settled the registrar list and the `CompatConfig` attribute names --
+and see the filter it applies to the 28 entries it is handed, since that filter is the only
+thing left between a working listing and an empty list.
+
+## The apex listing works; the packages inside them are still never read
+
+The enumeration is not the wall. Instrumenting the one listing that decides it:
+
+```
+android-paths: APEXDIR <bundle>/apex [.]
+android-paths: APEXDIR <bundle>/apex [..]
+android-paths: APEXDIR <bundle>/apex [com.android.adbd]
+android-paths: APEXCOUNT 28
+```
+
+`/apex` maps to the bundle's apex directory and yields 28 entries -- the 25 modules, `.`,
+`..` and the `apex-info-list.xml` -- so whatever asks for that listing gets a full answer.
+A traced boot nevertheless never asks for `apex/<module>/priv-app` or for
+`ExtServices.apk`, and the package cache holds 89 apks of which one is apex-sourced.
+
+So the wall moved into the framework: something between that listing and the per-apex
+`priv-app` scan drops the list. A traced boot with the file present narrows it once more --
+the file is *opened*, and nothing else about apexes is mentioned:
+
+```
+android-paths: /apex/apex-info-list.xml -> <bundle>/apex/apex-info-list.xml
+apex priv-app asks: 0        packageCount: 88
+```
+
+`ApexManagerFlattenedApex` reads that XML to get its active apexes, so it is being *read* and
+producing an empty list: either the parse rejects the generated file or a filter drops every
+entry. `Slog.e` on a parse failure would appear in this log and does not, which points at the
+filter. The generated file uses the attribute names `moduleName`, `modulePath`,
+`preinstalledModulePath`, `versionCode`, `versionName`, `isFactory`, `isActive`; the next
+measurement is to make the file match a device's byte for byte and see the list come back.
+
+## The apex packages are never scanned under the device root
+
+`Missing required system package: android.ext.services` is fatal there, and the numbers say
+why: the device layout scans **88** packages where the host layout scans **102**, only **one**
+apex-sourced apk is in the package cache, and a traced run shows `/apex/...` asked **92**
+times but `apex/<module>/priv-app` and `ExtServices.apk` asked **zero** times.
+
+So the apex directories are known -- `/apex/<module>/etc/permissions` and
+`/apex/<module>/etc/compatconfig` are read, and `CompatConfig` now reads the real XMLs from
+them -- and the packages *inside* them are never enumerated. `ExtServices.apk` is on disk at
+`<bundle>/apex/com.android.extservices/priv-app/ExtServices@TQ3A.230901.001/ExtServices.apk`.
+The next step is the system-directory list the package manager builds from the active apexes,
+and the partition cache that lets it skip rebuilding that list ("cached: 88").
+
+## The `CompatConfig` listing, with the shim's log now truthful
+
+Every mapping around it is correct: `/system/etc/compatconfig ==> <bundle>/etc/compatconfig`,
+and the files inside it likewise. `<bundle>/etc/compatconfig` holds the seven XMLs, and
+nothing maps to the bare bundle root. Yet the names `CompatConfig` iterates are `bin`,
+`lib64`, `data`, `tmp`, `index`, `linker64`, `ld.config.txt`, `seed.txt`, `run.sh`,
+`bundle.sh`, `properties`, `i18n`, `system_ext` -- the bundle root's entries -- under a log
+prefix that says `/system/etc/compatconfig/`. The next measurement is the one that settles
+it. That measurement is done, and it is decisive about *where* the problem is not:
+
+```
+android-paths: LISTED <bundle>/etc/compatconfig | . | .. | bin      <- the shim's fd
+mosaic: ns view ls=<bundle>/etc/compatconfig: . .. calendar-provider-compat-config.xml ...
+mosaic: mounts under the bundle: (none)
+```
+
+The same directory, in the same namespace, one second apart: the harness sees the seven
+XMLs and there is nothing mounted over anything, while the descriptor the shim opened for
+that exact path yields `. .. bin` -- the first entries of the *bundle root*. The trace also
+shows nothing mapping to the bare bundle root, `bundle.sh env` does not touch the
+directory, only `probe.so` wraps `opendir`, and it is the last thing printed before the
+framework's own listing fails.
+
+The inode measurement is in, and it is not ambiguous about the outcome:
+
+```
+DIRINODE <bundle>/etc/compatconfig            fd=58 ino=12669876   <- the bundle root's inode
+DIRINODE <bundle>/system_ext/etc/compatconfig fd=58 ino=13383723   <- the compatconfig dir's inode
+```
+
+`<bundle>` is 12669876 and `<bundle>/etc/compatconfig` is 13383723, so the descriptor opened
+for the path logged as `<bundle>/etc/compatconfig` belongs to the *bundle root*, and the
+other line is correct. Which line is the framework's is settled by what it iterates: `bin`,
+`lib64`, `data` -- the bundle root's entries -- so its descriptor is the bundle root, and the
+path on that line is the string it used. Both calls come from the same thread-local buffer
+and the syscall reads it immediately, so this is not a race: `redirect` returned the bundle
+root for that path and returned the right directory when it was called again to log it.
+
+The one-line measurement is in, and it removes the last ambiguity:
+
+```
+ONE in=/apex/com.android.adbd/etc/compatconfig mapped=<bundle>/etc/compatconfig 12669876|.|..|bin
+mosaic: ns view ino=13383723 (bundle=12669876) ls=. .. calendar-provider-compat-config.xml
+```
+
+Same namespace, same instant in the boot: the harness's own `stat` of that directory says
+13383723 (the compat config directory, with the XMLs), and the framework's `opendir` of the
+same path returns a descriptor whose inode is 12669876 -- the bundle root. Nothing is
+mounted, no other preloaded object defines `opendir`, and both calls come from the same
+thread-local buffer.
+
+So the descriptor does not belong to the path the shim asked for, and the next thing to look
+at is what `real` actually resolves to in `opendir` -- `dlsym(RTLD_NEXT, "opendir")` from a
+preloaded object resolves to the *next* object in the search order, and four others are
+preloaded ahead of `probe.so`, including `alloc-trace.so`. The measurement that separates
+"wrong target" from "changed filesystem" is a fresh `open(mapped, O_DIRECTORY)` plus
+`fdopendir` inside the same call, comparing its first entry with the one `opendir` returned.
+
+**And that measurement is done too**, which settles where the fault is not:
+
+```
+ONE in=/apex/com.android.adbd/etc/compatconfig mapped=<bundle>/etc/compatconfig 12669876|.|..|bin fresh=13383723|.|..|TeleService-platform-compat-config.xml
+```
+
+One call, one mapped path, two routes to it: `opendir()` returns a descriptor for the bundle
+root, and `open()`+`fdopendir()` on the *same string* returns the compat config directory
+with its XMLs. The filesystem is not in question and neither is the mapping -- so what
+`real` points at in `opendir` is not libc's `opendir`. The next line logs the three
+addresses (`real`, `dlsym(RTLD_DEFAULT, "opendir")`, a fresh `dlsym(RTLD_NEXT, "opendir")`),
+which says which object it actually resolved to.
+
+**Fixed.** The mapping is evaluated once, into a call-local copy, and that copy is what
+the syscall receives:
+
+```
+ONE … mapped=<bundle>/etc/compatconfig  13383723 | . | .. | TeleService-…xml
+```
+
+The same call that always returned the bundle root returns the compat config directory now,
+and it agrees with a fresh `open()`+`fdopendir()` of the same string. `CompatConfig` reads
+the real XMLs from every apex `etc/compatconfig`, which is what the log shows:
+
+```
+CompatConfig: Found a config file: /apex/com.android.extservices/etc/compatconfig/TeleService-platform-compat-config.xml
+```
+
+The older note, kept because it is the shape of the next measurement:
+
+That leaves exactly two candidates, and the next measurement separates them: log `dirfd()`
+plus `fstat`'s inode *in the shim* and compare against `<bundle>/etc/compatconfig`
+(inode 13383723) and `<bundle>` (12669876). If the descriptor is the config directory, then
+`readdir` is what is wrong and the other preloads (`alloc-trace.so`, `android-binder.so`,
+`android-properties.so`, `launcher.so`, all of them in `LD_PRELOAD` before it) are the
+suspects. If it is the bundle root, then the string the kernel received was not the string
+the log printed.
+
+## The wall at the end of the session, and what the bundle already knew about it
+
+`ConnectivityService.<init>` throws `No connectivity resource package found` from
+`ConnectivityResources.getResourcesContext` (its `ConnectivityResources.java:87`), which
+is the filter the apex item was opened for: it compares a package's `sourceDir` against
+`startsWith("/apex/com.android.tethering/")`, and the path the package manager records is
+`<bundle>/apex/com.android.tethering` -- a *host* path -- because the framework builds
+every path from `ANDROID_ROOT`, and `env.sh` sets that to the bundle.
+
+`bundle.sh`'s own comment on `env.sh` already records the measurement that settles it:
+setting `ANDROID_ROOT=/` **makes that exception disappear**. It was not adopted because
+the run that proved it stopped at three stages instead of 157, and the comment names the
+reason -- `CompatConfig.create` failing with `NullPointerException: Attempt to get length
+of null array` out of its XML parser. That is the NPE fixed above (every apex's
+`etc/compatconfig` unresolved), so the blocker for adopting `ANDROID_ROOT=/` is gone and
+it should be re-measured rather than argued about.
+
+The device forms are now adopted in `bundle.sh` (`ANDROID_ROOT=/`, `ANDROID_DATA=/data`,
+and the rest), with the old comment corrected to say why the reason for rejecting them no
+longer applies. The *mapping* is unaffected -- the shim finds the real tree through
+`MOSAIC_ANDROID_ROOT`, which the harness sets to the bundle -- so these variables now only
+decide which *strings* the framework builds, which is the whole point.
+
+Two things measured while doing it, both worth keeping:
+
+- Something rewrites `<bundle>/env.sh` **during a run**: within one boot the file went back
+  to the host root. It is not `mosaic` (the binary has no `env.sh` string), not `run.sh`
+  (it only sources it), and not the shim (nothing sets or exports it there).
+- Adopting the device forms in `bundle.sh` and regenerating with `bundle.sh env <bundle>`
+  put them in the file correctly, and the run after it still reported
+  `ANDROID_ROOT=<bundle>` *inside the framework process* -- the launcher prints the value
+  it really has, so the value is being set after `env.sh`.
+
+**Found: `run.sh` regenerates `env.sh` on every launch**, through the copy of `bundle.sh`
+that lives *inside* the bundle. That copy predated the fix, so every launch rewrote the
+file back to the host root and every measurement of the device forms was measuring the old
+ones. The bundle's copy is part of the artifact and has to be refreshed with it.
+
+With the device root actually in force (`ANDROID_ROOT=/`, and the three module roots as
+their apexes -- `ANDROID_I18N_ROOT=/apex/com.android.i18n` was the one that mattered first,
+because ICU could not open `/i18n/etc/icu/icudt70l.dat`), the run goes from 0 to 17 stages.
+Two walls remain in that layout:
+
+- `Failed to load frameworks package` -- the same duplicate-path problem as before, now
+  with the package database in the other layout. It has to be measured with the package
+  state cleared, which `do_apps` does as part of a bundle build.
+Superseded below: the layout that works is `ANDROID_ROOT=/system` with the three module
+roots as their apexes, because the framework's own convention is `<root>/framework` and
+`<root>/etc` -- with `/` those become `/framework` and `/etc`, which are *different places*
+than `/system/framework` and `/system/etc`, and the package manager scans both spellings of
+the same files. Fixed on the way there: the redirect buffer was `static`, shared between the
+threads the framework opens paths from, so one thread's mapped path could be handed to
+another thread's syscall -- `EISDIR` went from 6 to 0 and the `CompatConfig` listing stopped
+being inexplicable once it was `__thread`. Also: ART checks that `ANDROID_ROOT` *is a
+directory* (`file_utils.cc:153] Failed to find ANDROID_ROOT directory /system`), and the
+shim's `/system/` rule needs a trailing slash, so the bare `/system` needed its own rule --
+the same shape as the bare `/data` and `/apex` rules.
+
+- `CompatConfig` again, and this time with a reproducer: it lists a directory whose entries
+  are `bin`, `lib64`, `data`, `index`, `linker64`, `ld.config.txt`, `seed.txt`, `run.sh`,
+  `bundle.sh`, `properties`, `i18n`, `system_ext` -- the *bundle root* -- while reporting
+  the paths as `/etc/compatconfig/<name>`, which is why every read is `EISDIR` or ENOENT.
+  The listing does not go through the shim's `opendir` (instrumenting it proved that), so
+  the directory being read is not the one the shim would hand back, and the path it does
+  open is what to find next.
+
 What is left before Mosaic runs an arbitrary Android app, in dependency order.
 It is a working list: the near-term items each have a gate that can be checked by
 running something, because that is how every phase so far has been settled.
@@ -773,6 +1356,23 @@ live with the archive's digest matching the local file, the repository is public
 both `runtime fetch` and `runtime install <url>` were run against it from a fresh work
 directory with no token at all.
 
+### B9's layout question, measured both ways
+
+`ConnectivityResources` compares a package's `sourceDir` against
+`/apex/com.android.tethering/`. That string is built by the package manager from its own
+root, so which layout the framework runs in decides whether the comparison can ever pass:
+
+| layout | packages scanned | stages | the connectivity filter | what stops it |
+| --- | --- | --- | --- | --- |
+| `ANDROID_ROOT=<bundle>` (current) | **102** | **78** | fails | `sourceDir` is a bundle-absolute string; no shim can rewrite a string the package manager keeps |
+| `ANDROID_ROOT=/` with the bundle as root | 2 | 18 | **passes** | the daemon and the framework are in different roots: paths crossing binder are unreachable (`Failed to collect certificates`, 101 of them). A chrooted `hwservicemanager` runs by hand with the same environment but exits silently under the harness |
+
+Both are one defect from the next stage, and neither defect is a shim's to fix: the first needs
+the framework's expectation or a real `/apex` (and `/` is not writable -- `mkdir /apex`:
+permission denied), the second needs its daemon inside the same root. `docs/todo-b.md` carries
+the measurements, including the `realpath` ownership bug that *was* the Scudo corruption and the
+two false zeros that made an unreached check look passed.
+
 ### More than one user
 
 The package is per machine: one `sudo make install`, and every user gets the command,
@@ -859,7 +1459,7 @@ Two more, from the apex work:
   directory for anything that is not a `javalib` or `lib64` path. It mapped only
   those two before, so the extension package's apk was unreachable.
 
-**The wall now**, and what is done about it: the **apex service** is implemented —
+**The wall then**, and what is done about it: the **apex service** is implemented —
 `src/device/apex.rs`, hosted as `apexservice`, answering `getActivePackages` and
 `getAllPackages` from the apexes in the bundle's `apex/` directory, with
 `getActivePackage`, `markBootCompleted` and the session calls answered and the rest
@@ -955,12 +1555,594 @@ of the mapping is a bus error in the process that made it.
 11. `installd` ✅ (the boot path: app data directories, sizes, dex and profile
     removal, native library directories, with everything else refused by name) and
     the `vold` equivalent ✗ — storage, mounting and encryption, which nothing on
-    the boot path calls yet.
-12. `/data` laid out as Android expects, with the right ownership.
-13. A property store that persists (`persist.*`).
-14. A boot image, or accept the slower imageless start.
-15. What `init` does that nothing else does: device permissions, `/dev/ashmem`
-    if apps use it.
+    the boot path calls yet. It is only reachable after the services that stop
+    before it, so it is still open.
+12. `/data` laid out as Android expects ✅ — `do_data` in `tools/bundle/bundle.sh`
+    builds the init.rc tree with its modes and is wired into the build; the gate
+    checks all thirteen directories.
+13. A property store that persists (`persist.*`) ✅ — the service writes
+    `data/property/persistent_properties` (temporary, then renamed) and restores it
+    at startup for names the area declares; `tools/verify-persist.sh` exercises the
+    round trip through the service's own functions.
+14. A boot image, or accept the slower imageless start ✅ as the second: the bundle's
+    `dex2oat64` does not produce a usable image here, ART says so itself
+    ("Attempting to fall back to imageless running"), and `do_bootimage` records the
+    decision in `data/mosaic-imageless.txt` where the gate can read it.
+15. What `init` does that nothing else does: device permissions, `/dev/ashmem` ✅
+    (a memfd per region) and the four device names ✅ — `null`, `zero`, `random` and
+    `urandom` are answered by the shim, because a user namespace can neither `mknod`
+    a real device nor open one bind-mounted from the host. `ReadRandomBytes: cannot
+    read /dev/urandom` went from one per boot to none.
+
+### `startHidlServices`, and the HIDL service manager
+
+`startOtherServices` registers a HIDL service before it does anything else, and a
+failure to do so is fatal by construction:
+
+```
+Cannot register android.frameworks.sensorservice@1.0::ISensorManager: -38
+runtime.cc:675] Aborting thread: "system-server-init-thread6"
+```
+
+`ISensorManager::registerAsService()` reaches
+`android::hardware::defaultServiceManager1_2()`, and five defects sat between the
+framework and that call. Four are fixed, and each was a wall of its own:
+
+| What the log said | What it was |
+| --- | --- |
+| `Looper: Error adding epoll events for fd 3: Operation not permitted` → `hwservicemanager: Failed to add binder FD to Looper` → SIGABRT | the shim's binder placeholder was a `memfd`, and `epoll_ctl` refuses one (EPERM), so the image's own `hwservicemanager` aborted before it served anything. The placeholder is an `eventfd` now and the driver's mapping is served from a memfd of its own in `mmap`, which is the one place that reaches it. |
+| `getFrameworkHalManifest: VINTF parse error: Cannot add a framework manifest to a device manifest` and `getTransport: Cannot find entry android.hidl.manager@1.2::IServiceManager/default` | `do_vintf` overwrote `/system/etc/vintf/manifest.xml` — the *framework* manifest — with a device manifest, and left a device fragment in the framework fragment directory. The image's framework manifest and fragments are staged from the image now, and the device manifest (the health AIDL HAL) is written under `vendor/etc/vintf/` only. With both readable, the daemon starts and says `hwservicemanager is ready now`. |
+| `HidlServiceManagement: getService: defaultServiceManager() is null`, and `access` never opening the device | `defaultServiceManager1_2` begins with `access("/dev/hwbinder", R_OK\|W_OK)` — not `open`. `/dev` here is a tmpfs the harness makes, with no binder node in it, so the check failed and every HIDL registration was refused before a transaction was attempted. `access`/`faccessat` answer for binder device names now, which the `open` redirection already made true. |
+| SIGSEGV in `tinyxml2::XMLNode::FirstChildElement`, on the main thread, in `PowerStatsService` | `isHostHalAllowed` loads `/system/etc/hosthals.xml` with tinyxml and dereferences the result unchecked, so a *missing* file is a null dereference rather than a HAL looked for in the wrong place. The bundle writes `/system/etc/hosthals.xml` with an empty list, which is the truth here: the file names the HALs that live in ARC's *host* container, and this runtime has no second Android environment. |
+| HIDL transactions never answered, `Cannot register ... : -38` with no transaction in the shim's log | libhwbinder does not write `BC_TRANSACTION`; it writes `BC_TRANSACTION_SG`/`BC_REPLY_SG`, whose operand is a `binder_transaction_data_sg` (72 bytes). The shim's walker compared whole command words, so every HIDL call was skipped as an unknown command. Both are handled now. |
+
+**The wall then** is the HIDL service manager itself. With the device reachable,
+the framework blocks on it, one second at a time:
+
+```
+HidlServiceManagement: Waited for hwservicemanager.ready for a second, waiting another...
+```
+
+`hwservicemanager.ready` is declared in the property area (a reader finds a name
+through the `property_info` trie or not at all, so a name only a process sets is
+invisible), the harness starts the daemon beside the framework in the same
+namespace, and the daemon sets the property — `property-service: set
+hwservicemanager.ready='true' -> applied` — before the framework starts. The
+framework still waits, so the *read* is not seeing a write that the area holds;
+that is the next thing to settle, and the instrument for it is the property
+service's own log beside the framework's read. Setting the value in the bundle's
+area before the run (an experiment, reverted) does remove the wait, which is what
+says the name and the value are right and the runtime write is what is not
+observed.
+
+**Settled, and fixed.** The write was landing 128 bytes before the entry, and that
+is the whole of it. `index.tsv` records offsets into the area's *data*, which is
+what the generator's writer works in, and a file offset is that plus the area
+header — 128 bytes. So the service wrote its serial and value into whatever
+precedes the entry, which is a `prop_bt` node holding a *name*, and a reader that
+walks the area and compares the name it finds there stopped resolving the property:
+measured with a reader that has no shim in its path, `-> false` before the write and
+empty with `find -> NOT FOUND` after it, while `ro.build.version.sdk` read fine from
+the same area throughout. Three other things were wrong behind that one:
+
+- the serial was written as the length byte alone, so a reader polling for the change
+  never saw one; it is libc's own three-step dance now (dirty, value, publish
+  `(length << 24) | (dirty + 1)`),
+- a name declared with an *empty* value is not resolvable at all — `"false"` rather
+  than `""` is what makes the entry findable — and
+- `apply_write` refuses now when the entry at the recorded offset does not carry the
+  property's own name, so a wrong offset cannot corrupt an area again.
+
+Verified end to end: `property-service: set hwservicemanager.ready='true' -> applied`,
+the entry at `128 + 1572` holds `serial=0x04000002 dirty=0 value=b'true'`, a clean
+Bionic reader prints `-> true`, and the framework's wait is **gone** — `waits=0`,
+with the boot back to `StartAccessibilityManagerService`.
+
+The gate's step 5 was **not** the run that waited: the failing check was
+`tools/verify-priority-limit.sh`'s own framework smoke, which booted the framework
+*by hand* — `with-logd.sh run.sh dalvikvm64 …`, with no HIDL service manager and so
+no `hwservicemanager.ready` — and a framework started that way now stops in
+`StartPowerStatsService`, before `StartActivityManager`, which is the same wall the
+harness run hits and gets past. It goes through
+`tools/boot-with-hwservicemanager.sh` now, the same launcher A's system-server smoke
+uses, and it passes: `ok reached StartActivityManager with no priority stand-ins`.
+With that, `tools/verify-a.sh` is **green** again: steps 1–4 pass, the smoke reaches
+every milestone including `published display`, and the boot stops later in B
+(`exit 134`) at the wall below.
+
+One note for whoever reads a failed smoke next: the runtime markers are emitted by
+the framework on the main thread while `startHidlServices` aborts the process from
+an init-thread-pool thread, so a marker can be lost to the abort even though the
+feature works — seen once, with `published display` present in two direct boots and
+absent in a gate run that then died in the same place.
+
+As for what the boot does with the wait gone: the transactions arrive and the shim
+has no answer for them: handle 0 on `/dev/hwbinder` carries the
+HIDL `IServiceManager`, which is a *different* interface from `/dev/binder`'s
+`android.os.IServiceManager` that the shim answers in-process — an interface token
+of its own, HIDL's method codes, and HIDL's scatter-gather buffers
+(`BINDER_TYPE_PTR` objects describing each buffer, which the kernel translates
+between address spaces and nothing here does yet).
+
+Two ways, and the second is the one `docs/binder.md` already chose: answer the
+eight HIDL `IServiceManager` methods in the shim, the way the AIDL ones are
+answered; or route handle 0 on `/dev/hwbinder` to the image's `hwservicemanager`
+through the broker, which also needs the reply direction (`BC_REPLY_SG` captured
+and carried back) and the scatter-gather translation. The daemon **runs** now —
+it starts, parses both VINTF manifests, says `hwservicemanager is ready now` and
+sets the property the framework waits on, so the harness starts it alongside the
+framework — but nothing routes a call to it yet, so the framework's HIDL calls are
+still answered by the shim's AIDL service manager and the registration still
+fails.
+
+What a handle-0 call on `/dev/hwbinder` actually carries, decoded from the wire
+(the shim prints it for the first three, which is the instrument this was learned
+with):
+
+```
+hidl parcel code=3 bytes=204 objects=8
+  inline [android.hidl.manager@1.0::IServiceManager.....*tp..............]
+  object 0 type=0x70742a85 buffer=0x00007ffc321fc320 length=16  [.....v..........]
+  object 2 type=0x70742a85 buffer=0x000076fe0f05ed90 length=46
+                           [android.hardware.power.stats@1.0::IPowerStats.]
+  object 6 type=0x70742a85 buffer=0x000076fdef01c930 length=8  [default.]
+```
+
+- the first string in the inline data is the interface token,
+  `android.hidl.manager@1.0::IServiceManager`;
+- the code is the *one-based method number* of `android.hidl.manager`, and the
+  three the boot uses are 3, 6 and 12. Which method each one is was settled the
+  hard way, below: 3 is `getTransport(descriptor, instance)` — the call that
+  decides whether a service may be registered at all — and 12 is
+  `addWithChain(instance, service, chain)`, the registration itself. The
+  descriptors in that boot were `power.stats`/`default`,
+  `frameworks.stats`/`default`, `memtrack`/`default`;
+- `0x70742a85` is `BINDER_TYPE_PTR`: a `binder_buffer_object`, 40 bytes —
+  `{type, flags, buffer(8), length(8), parent(8), parent_offset(8)}` — naming a
+  buffer by *address and length*, and the inline data holds a 16-byte pointer
+  buffer that the kernel fixes up when it copies the child across. Those addresses
+  are this process's own, which is why the shim can read the arguments directly
+  and why a *daemon* cannot: that fix-up is the translation the move would need.
+- code 6 is the other call the boot makes, the `add` of `startHidlServices`.
+
+**Settled, and fixed.** The shim answers handle 0 on hwbinder, and
+`SystemServer.startHidlServices` registers all three of the services it needs
+(`ISensorManager`, `ISchedulingPolicyService`, `IStats`) instead of aborting the
+process on the first one. Four things were wrong, and each of them failed in a way
+that looked like the others:
+
+- **The transport word is wrong; `HWBINDER` is 1.** `Transport` is a HIDL enum —
+  0 `EMPTY`, 1 `HWBINDER`, 2 `PASSTHROUGH` — and not the kernel's 3 for an
+  hwbinder object. The first answer here was 3, and `registerAsServiceInternal`
+  refuses that exactly as it refuses 0:
+  `if (transport != Transport::HWBINDER) … return UNKNOWN_ERROR;` with
+  `-2147483648` printed by the Java side and the process aborted. Because *both*
+  wrong values are refused identically, every experiment that changed the
+  *presence* of the transport changed nothing, and the value looked like it was
+  not being read at all.
+- **The registration is code 12, not 6.** `addWithChain` returns `Return<bool>`
+  and the reply is a status word and that bool; answered as a lookup its bool read
+  zero, which is `Cannot register HIDL …: -2147483648` with no error message
+  anywhere — the registration had happened and been reported as not happening.
+- **The reply is a status word and then one byte**, as the stub writes it:
+  `writeToParcel(Status)` then `writeUint8`. The reader is
+  `readFromParcel(Status)` — one int32, and a `String16` description only for
+  `EX_SERVICE_SPECIFIC` — followed by `readUint8`.
+- **The declaration is the service manager's to answer.** `registerAsService`
+  asks `sm->getTransport(descriptor, instance)` *before* it registers anything,
+  and a transport of `EMPTY` is the refusal. The shim answers it from the
+  manifests the bundle carries — `vendor/etc/vintf/manifest.xml`,
+  `etc/vintf/manifest.xml`, and ARC's `etc/hosthals.xml` — which is what
+  hwservicemanager does on a device. The host list's schema is `<name>` holding the
+  *instance-qualified* name (`…::ISensorManager/default`) and a
+  `<priority>true</priority>` child, both measured. `hidl_name_of`'s decoder had to
+  grow its twin: the descriptor is the string carrying `@` and `::`, which the name
+  decoder deliberately skips, and reading it needs `offsets[i] + 8` and `+16` for
+  the buffer and its length — not `offsets[i] + 16` and `+24`, which is the same
+  read shifted by one field and yields a length where the address should be.
+
+With the registrations in place the boot runs past `startHidlServices` into the
+services after it — `StartWindowManagerService`, `StartInputManager`,
+`StartInputMethodManagerLifecycle`, `StartAmbientContextService`,
+`StartSmartspaceService` and the rest — and no longer dies of the assert in
+`android_server_SystemServer_startHidlServices`.
+
+A note on reading this from a log: the transport check happens *before* any
+transaction, so the shim's own log says nothing about it. What says everything is
+the framework's `HidlServiceManagement` and `dalvikvm64` lines — the VINTF
+message when the transport was the wrong *value*, and silence when the failure
+came from the reply's bool.
+
+**Settled.** The services after `startHidlServices` are the ones that talk to the
+device's *native daemons*, and the three the boot waits on are hosted by the broker
+now, the same way `installd` is (`src/device/netd.rs`, `storaged.rs`, `vold.rs`):
+the name resolves, the calls are logged so their method numbers can be read out of
+a boot's log, and each answers what this side can answer truthfully. Measured:
+`NetdService: WARNING: returning null INetd instance.` and
+`StorageManagerService: storaged not found; trying again` are **gone** from the
+boot, `StartNetworkManagementService` — the stage that never completed — takes
+`5ms`, and the boot runs to 151 stage lines.
+
+**Settled.** The apex class loader is allowed now, and the services the framework
+loads from apex jars are created. Three things were behind it, each measured:
+
+- **The list is `STANDALONE_SYSTEMSERVER_JARS`, and nothing runs `ZygoteInit`.**
+  `SystemServerClassLoaderFactory.allowClassLoaderCreation` refuses every `/apex/`
+  jar that was not prefetched, and the prefetch is
+  `ZygoteInit.prefetchStandaloneSystemServerJars` — called *through JNI by the
+  zygote* in the process it forks for the system server. Mosaic starts
+  `SystemServer` in a fresh JVM, so nothing called it. The launcher does now, at
+  the point `run_class` is about to start the class, and it is the same call a
+  zygote makes. The list itself comes from the bundle:
+  `tools/bundle/classpath-exports.py` reads each apex's
+  `etc/classpaths/systemserverclasspath.pb` and writes
+  `data/system/environ/classpath` — the file `init` produces on a device by
+  running `derive_classpath` and loading its exports — and the harness loads it.
+  Two details cost a run each: the values are **colon** separated (`ZygoteInit`
+  does `envStr.split(":")`), and the lines must be `export NAME="value"`, because
+  `export NAME value` is two arguments to bash's `export`, which rejects the
+  value as an identifier and exports nothing — the prefetch then runs, finds
+  nothing, and logs the same "prefetched" line.
+- **A class loader is an object, not a class path.** With the prefetch in place
+  the refusal went, and the *next* failure was identity:
+
+  ```text
+  java.lang.RuntimeException: Failed to create
+  com.android.server.NetworkStatsServiceInitializer: service must extend
+  com.android.server.SystemService
+  ```
+
+  `ZygoteInit.getOrCreateSystemServerClassLoader` builds a loader from
+  `SYSTEMSERVERCLASSPATH`, and a zygote runs `SystemServer.main` *through it* —
+  so the framework's own classes and the apex jars it loads later share one
+  `SystemService`. Handing the JVM the same string as `-cp` is not enough: that is
+  a second loader, hence a second `SystemService`, hence the refusal. The launcher
+  now does what the zygote does, with `RuntimeInit.findStaticMain(...)` (this
+  image has no `ZygoteInit.invokeStaticMain`) and the `Runnable` it returns.
+  Signatures came from the bundle's own `dexdump`, not from a guess, and both
+  methods are `hiddenapi: BLOCKED` — which is the policy for Java reflection, not
+  for JNI, which is how they are reached.
+
+**The wall then** is the apex jar's *native* library, which the same service asks
+for next:
+
+```text
+java.lang.UnsatisfiedLinkError: dlopen failed: library "libservice-connectivity.so" not found
+    at com.android.server.NetworkStatsServiceInitializer.<init>
+```
+
+**Settled, and fixed.** The apex libraries load, the service from
+`service-connectivity.jar` constructs, and `StartConnectivityService` completes.
+Two things were behind it:
+
+- **A bare name has to be resolved by this side.** `System.loadLibrary` sends the
+  linker a name with no path, and the linker searches only the namespaces it was
+  configured with: ART builds a class-loader namespace with `librarySearchPath =
+  null`, so an apex's `lib64` is not a permitted directory there and no search path
+  reaches it. The shim resolves the name in `android_dlopen_ext` now — the same
+  directories the linker configuration lists — and makes the load in the
+  *exported* namespace, the one the bundle's own `ld.config.txt` describes. A name
+  it does not carry is passed through unchanged, so the linker's error still
+  surfaces. Measured in order: `library "libservice-connectivity.so" not found` →
+  `… not permitted` (the permission list, not the path) → loaded.
+- **The library symlinks were dangling, and that is what "not permitted" meant.**
+  An Android image stages an apex's libraries as symlinks into the system copy by
+  absolute device paths (`/apex/com.android.adbd/lib64/libbase.so ->
+  /system/lib64/libbase.so`). A bundle stages the *targets* and keeps the *links*,
+  so all 288 of them were broken on the host, and the linker's realpath check then
+  rejects a file that is right there:
+  `dlopen failed: library "libnetworkstats.so" not permitted`.
+  `tools/bundle/fix-library-links.py` rewrites each link relative to the bundle
+  (96 of them; the other 48 name libraries the bundle does not carry and are
+  reported rather than hidden), and `bundle.sh` runs it after the closure.
+
+**Settled.** The null was a lookup after all, of a service nothing hosted: the
+framework's `SystemServiceRegistry` logs it plainly —
+
+```text
+SystemServiceRegistry: No service published for: dnsresolver
+SystemServiceRegistry: Manager wrapper not available: dnsresolver
+```
+
+— and `dnsresolver` is hosted now (`src/device/dnsresolver.rs`, the same shape as
+the other daemons), after which `ConnectivityService` constructs and starts.
+
+One thing to keep in mind when a hosted service "does not work": the harness runs
+`target/debug/mosaic`, and `make check` builds *test* binaries rather than that
+one. The first run after adding the service still answered "no service published",
+and the service was not in the running broker at all. `cargo build` before a boot
+is what makes a new service real.
+
+**The wall now** is the connectivity module's *resource package*. The apex carries
+it (`apex/com.android.tethering/priv-app/ServiceConnectivityResources@TQ3A.230901.001/
+ServiceConnectivityResources.apk`) and the framework cannot find it:
+
+```text
+java.lang.IllegalStateException: No connectivity resource package found
+    at android.net.ConnectivityResources.getResourcesContext(ConnectivityResources.java:87)
+    at android.net.ConnectivityResources.get(ConnectivityResources.java:106)
+    at com.android.server.ConnectivityService.<init>(ConnectivityService.java:1842)
+```
+
+So the apk is in the bundle and the *package scan* does not have it. The shim's
+path log answers which directories it does walk — with the redirect cap back at a
+size that holds a boot, tracing one run shows 65 distinct `/apex/...` paths asked
+for, including
+
+```text
+/apex/com.android.tethering/app
+/apex/com.android.tethering/etc/compatconfig/priv-app
+```
+
+and **not** `/apex/com.android.tethering/priv-app`, which is where the resource apk
+is. That is not the path layer: the run asks for 19 other modules' `priv-app`
+directories, so the walk works and this module is the exception. Staging the package where the **system** scan reads it looked like it worked, and
+did not: one run with `ServiceConnectivityResources.apk` copied into
+`<bundle>/priv-app/ServiceConnectivityResources/` reported no "No connectivity
+resource package found" — and that run had stopped *earlier*, in `CompatConfig`,
+so the lookup never happened at all. Three further runs with the copy in place
+report the package missing exactly as before. A *symlink* to the apex copy does not
+work either — the scan does not follow it. `do_apps` still copies every apex's
+`app`/`priv-app` package directories into the bundle's own, because that is the only
+route the system scan has to a package inside an apex, but it is **not verified to
+fix this** and should not be read as if it were.
+
+That change is not yet a complete fix, and the reason is worth stating: with the
+package installed the boot sometimes stops *earlier* instead, in the framework's own
+compat-config initialisation —
+
+```text
+java.lang.NullPointerException: Attempt to invoke virtual method
+'java.util.List com.android.server.compat.config.Config.getCompatChange()'
+on a null object reference
+    at com.android.server.compat.CompatConfig.readConfig(CompatConfig.java:612)
+    at com.android.server.compat.CompatConfig.initConfigFromLib(CompatConfig.java:605)
+```
+
+— and that one occurred in the single run that also reported the package found, so
+the two are not established as related.
+
+**What the package manager says, which corrects the reading above.** It *does*
+find the package, from the apex tree itself, and it names what it installed:
+
+```text
+PackageManager: Failed to scan /…/bundle/apex/com.android.tethering/priv-app/
+ServiceConnectivityResources@TQ3A.230901.001:
+Application package com.android.connectivity.resources already installed.
+```
+
+(the duplicate being whichever copy came second), so the apk is installed and the
+"missing" report is a *lookup* that fails, not a scan that did not happen.
+
+**Root cause, from the module's own source.** `ConnectivityResources` resolves its
+resources through `PackageManager` by an intent and then filters the result by
+where the package *is*:
+
+```java
+final List<ResolveInfo> pkgs = mContext.getPackageManager()
+        .queryIntentActivities(new Intent(RESOURCES_APK_INTENT), MATCH_SYSTEM_ONLY);
+pkgs.removeIf(pkg -> !pkg.activityInfo.applicationInfo.sourceDir
+        .startsWith("/apex/com.android.tethering/"));
+if (pkgs.isEmpty()) throw new IllegalStateException("No connectivity resource package found");
+```
+
+So the package has to be installed *from the apex path*. The package manager builds
+every partition path from `android.os.Environment.getRootDirectory()`, which is
+`System.getenv("ANDROID_ROOT")` with a `/system` fallback — and the bundle's `env.sh`
+sets `ANDROID_ROOT` to the *bundle's* directory, a host path. Every package
+therefore has a `sourceDir` under that path, and no package in an apex can ever
+satisfy the filter. (That also explains why copying the apk around changed nothing:
+whichever copy installs, its `sourceDir` is not the apex one.)
+
+That is the tempting reading and it is **wrong**, which the dex settles:
+`android.os.Environment.DIR_APEX_ROOT` is `getDirectory("APEX_ROOT", "/apex")` — the
+variable is `ANDROID_APEX_ROOT`, which this bundle never sets — so the apex scan
+*already* uses `/apex/<module>/...` and a package installed from an apex already has
+the `sourceDir` the filter wants. Put `ANDROID_ROOT=/system` and the difference is
+that `/system/apex` is the directory then, which is the *worse* path for that filter.
+
+That was still not the whole of it, and the dex settles it again: the host path is
+**`ActiveApexInfo.preinstalledApexPath`**, which
+`ApexManagerFlattenedApex.getActiveApexInfos` builds from
+`Environment.getRootDirectory()` — not from the apex root — and *that* is what the
+package manager's partition list uses and what each apex package's `sourceDir` is
+built from. So with the root at the bundle every apex is scanned as
+`<bundle>/apex/<module>`, and the module's `startsWith("/apex/…")` can never match.
+The apk itself is fine (it declares an activity for the required action, enabled and
+exported) and the package is installed as `com.android.connectivity.resources`; it is
+the path that is wrong.
+
+Setting the root to `/` has been measured three times and is **not settled**. The
+first two attempts changed nothing because the *bundle's own* copy of `bundle.sh`
+regenerates `env.sh` on every run (`run.sh` calls it), so editing `env.sh` in place
+was overwritten before the framework was started — and one attempt edited the
+repository's generator while the bundle kept running its own stale copy. With the
+generator actually in place, the root takes effect and the run gets one step further:
+`libnativeloader` then fails on `//etc/public.libraries.txt`, because with the root
+at `/` the framework's own `<root>/etc/...` paths are the *host's* `/etc`. The shim
+now maps the two such paths the framework builds — `public.libraries.txt` and
+`compatconfig` — to the bundle's, and that error is gone in the next run; whether the
+root change works end to end is still open, and the state it was left in is the
+recorded-good one (`ANDROID_ROOT` = the bundle) with the rules in place for when it
+is picked up again.
+
+With the root actually in place the run goes further still, and stops in a
+`SIGSEGV` whose backtrace runs `base::ReadFileToString` → the shim's `__openat` →
+its `redirect` → `strcmp`. The two strings that `strcmp` is given there are *both*
+constants in the shim's own `.rodata` (`/data` and `/apex`, the existing rules), so
+the frame as printed cannot be the whole truth — and the core said exactly what it
+was:
+
+```
+coredumpctl list                      # newest SEGV entry
+zstd -dc <the Storage path> > /tmp/core
+gdb -batch -ex 'frame 1' -ex 'info registers rdi rsi' -ex 'x/s $rdi' \
+    <bundle>/bin/dalvikvm64 /tmp/core
+#  rdi  0x0    →  strcmp(NULL, "/system/"+1)
+```
+
+`strcmp(NULL, …)` in `redirect` was a *stale pointer* bug — it stored the caller's
+`const char *` and the caller is a transient `std::string` — and that is fixed: the
+shim keeps its own copy of every reported path. It is *not*, however, the crash that
+the device-root runs still hit. The fresh core (with the fix in) says the same thing
+in the same place, and the registers name the call exactly:
+
+```
+#1  redirect+0x1b8:
+      30f8: lea  0x13f0,%edi          # "/system/" as a literal
+      3105: mov  %r15,%rdi            # ← the variable, and r15 is 0
+      3108: call strcmp
+r15 = 0,  rsi = (the "/system/" literal)
+```
+
+so `strncmp(path, "/system/", 8)` — the *first* rule in `redirect` — ran with a null
+`path`, which its own guard at the top (`!path` → return) is supposed to prevent. The
+next step is to disassemble `redirect` from the core and read what the guard actually
+compiles to and where the null gets in — one `gdb` command, not another theory. One real bug in that neighbourhood was found and
+fixed on the way — `redirect`'s dedup compared the *caller's* path pointers, which
+are transient strings by the time the next redirect looks at them. That is where this stands: the root moves
+the apexes to the path the module wants and costs, so far, three failures on the way
+— the public-library list and the framework's own config paths (shim rules now, and
+those work), the boot image falling back to imageless running (which it already did),
+and this one. The rules that work stay in the shim and the root stays at the bundle.
+
+The lesson worth keeping is about *how* to test this: the bundle runs its **own** copy
+of `bundle.sh` (`run.sh` calls it), so editing `env.sh` is a no-op and editing the
+repository's generator is not enough — both, or neither takes effect.
+
+Two self-inflicted breaks also cost runs: backticks in comments inside `env.sh`'s
+unquoted heredoc are command substitutions, and one of them swallowed the heredoc's
+terminator and the rest of the script (32 of them are now plain quotes); and the
+shim's new `/etc` rule first mapped `//etc/x` to `<bundle>/x`, dropping the `etc/`.
+
+**Settled: the root cannot be moved, and the reason says what the fix is.** With
+`ANDROID_ROOT` at `/`, the framework's *system partition* is `/` too, not just its
+apex root — so the package scan looks in the host's `/app`, `/priv-app`, `/framework`
+and finds nothing, and `SystemServer.startBootstrapServices` dies on
+
+```text
+java.lang.IllegalStateException: Failed to load frameworks package; check log for warnings
+```
+
+after 36 stages instead of 157. Five separate failures now stand between that root and
+a boot, and each one is the same mistake: the *bundle* is the system partition, so
+every path the framework builds from its root has to land on the bundle, and a root of
+`/` lands them on the host instead.
+
+The fix is therefore to make the bundle *be* the root, which is a chroot — and inside
+a user namespace that is possible even without real root, because the namespace's root
+holds `CAP_SYS_CHROOT`:
+
+```text
+unshare -rm  +  chroot <bundle>   →  /framework, /etc, /apex, /app, /priv-app …
+```
+
+which is exactly the layout `ANDROID_ROOT=/` wants, with `/` being the bundle rather
+than the host. The mount-namespace option this document describes for the product is
+the same idea with a privileged mount instead of a chroot.
+
+That attempt is under way: `MOSAIC_CHROOT=1` on the harness starts the framework with
+`chroot <bundle> /linker64 /bin/dalvikvm64`, the preloads copied into `<bundle>/shim/`
+(seven libraries, where a shipped runtime wants them anyway), and the linker
+configuration rewritten to the in-chroot form. Three things were learned by running
+it, each one edit: there is no shell inside the bundle, so `run.sh` cannot be the
+entry point and the *linker* is invoked directly; the configuration has to be rewritten
+**paths first, then the bare root** (`<bundle>/lib64` → `/lib64`, and `<bundle>` → `/`),
+because the other order makes `//lib64` and a section whose `dir.` is `//` matches no
+executable; and with that done the linker reads the configuration and still cannot find
+`liblog.so` for the main executable, with `dir.system = /` and
+`search.paths = /lib64:/lib64/bionic:/apex/...` both present and `/lib64/liblog.so`
+right there. That last one was answered by trying the other thing rather than reading more:
+`LD_LIBRARY_PATH` in the chroot's environment resolves the executable's own
+dependencies, and the linker's search paths are then not the lever at all.
+
+With that, the chroot boots the runtime up to its own initialisation, and each run
+from there named one thing:
+
+- `/proc` was not there — and the reason the bind silently failed is that a plain
+  `mount --bind` of the host's `/proc` and `/dev` is **refused** inside the user
+  namespace ("wrong fs type, bad option, bad superblock on /proc") while
+  `mount --rbind` is allowed.
+- The preloads were not loaded at all: `run.sh` is what turns `MOSAIC_PRELOAD` into
+  `LD_PRELOAD`, and the chroot bypasses `run.sh` because there is no shell inside the
+  bundle. Passing `LD_PRELOAD` directly fixes that.
+- The shim's redirect *was* reaching those opens, to `<bundle>/framework/core-oj.jar`
+  — the *host* path — because the `chroot` was never running: a `#` comment inside the
+  `env -i` continuation ends the command, so the rest of the environment and the
+  `chroot` itself were silently dropped. Comments do not go inside a continued
+  command; that is the second time in this section that a shell detail cost runs (the
+  first was backticks in a heredoc).
+- With the chroot actually running, the boot classpath loads (the image falls back to
+  imageless running, as it already did) and the next failure was ART's native bridge
+  (`Failed to get system namespace for loading libandroid.so`). That one had a nameable
+  cause: `dir.system = /` in the rewritten configuration **parses as an empty value**
+  — the linker says so ("warning: property value is empty") — so the section matched no
+  executable and the namespace it describes was never created. Pointing `dir.system` at
+  `/bin`, which is a real directory the executable is under, removes the warning and the
+  native bridge finds its namespace.
+**The apex path is done, and the goal was met by running it.** With the bundle as the
+root — `chroot` into it, `ANDROID_ROOT=/`, and every other `ANDROID_*` root from
+`env.sh` with the bundle prefix turned into `/` — the framework resolves
+`/apex/com.android.tethering/...` to a real file, and the recorded stages prove the
+resource package is found:
+
+```
+scanned as system partitions: [...] /apex/com.android.tethering:8388608 ...
+resource: 0            # was: No connectivity resource package found
+StartPackageManagerService took to complete: 105ms
+stages: 37             # was 0 before the roots were right
+```
+
+The variables that mattered were not the paths but the roots: the chroot *is* the
+bundle, so a host path in `ANDROID_ART_ROOT`, `ANDROID_I18N_ROOT` or
+`ANDROID_TZDATA_ROOT` is a path that does not exist, and `ANDROID_TZDATA_ROOT` unset is
+what aborted the previous attempt. A `#` inside a continued command had silently dropped
+both the environment and the `chroot` itself in an earlier attempt, which is why the
+first "chroot" run was not one.
+
+**Corrected**: the `DexFile ... is in boot class path but is not in a known location`
+line is a *warning* — the normal host path prints 34 of them and boots to 157 stages —
+so it was never the wall, and the bind mounts of `/system/framework` and `/system/lib64`
+exist for the paths, not for that message.
+
+**Where the chroot stops now** (37 stages, then `decWeak called on ... too many times`
+and an abort): `CompatConfig` lists a directory whose entries are `bin` and `lib64` —
+i.e. the *bundle root* — while it reports them as `/etc/compatconfig/bin` and fails to
+open them. `<bundle>/etc/compatconfig` holds the real config files and `<bundle>/etc` is
+the bundle's layout, so the `/etc` mapping inside the shim is what to look at next: the
+device path and the bundle's own layout disagree by one component.
+
+**Not yet working, and honest about where it stops**: those two symlinks are written by
+the chroot branch of the harness and are *not present* after a run, while the rest of
+that same branch demonstrably runs (the rewritten `ld.config.chroot.txt` is what removed
+the linker's warning). Running the two `ln` commands by hand inside the namespace creates
+them without complaint (`system/framework -> ../framework` appears), so the commands are
+right and something about *when* they run is not. The next step is one `echo` in the
+branch, not another theory: this wall has now cost more runs to reasoning than to
+running, and the runs have settled every one of its eight steps so far. Everything else the
+chroot needed is in place and was each found by running it: no shell inside the bundle
+so the linker is the entry point, `--rbind` rather than `--bind` for `/proc` and `/dev`,
+`LD_PRELOAD` directly because `run.sh` is bypassed, `LD_LIBRARY_PATH` for the
+executable's own dependencies, `dir.system` pointing at a real directory (`/` parses as
+an empty value), and no comments inside a continued command.
+
+One diagnostic came out of this and stays: the shim reports every directory that
+fails to `opendir`, whether or not tracing is on, with the path it was rewritten to.
+It answered its first question immediately — every apex's `app`/`priv-app` directory
+that does not exist is opened and fails, harmlessly, once per boot — and it is the
+only thing that names a failed directory, because the reader that gets the null
+reports it in another place and other words.
+
+The intent, for the record, and how the rest of the lookup reads:
+
+```text
+RESOURCES_APK_INTENT = "com.android.server.connectivity.intent.action.SERVICE_CONNECTIVITY_RESOURCES_APK"
+RES_PKG_DIR          = "/apex/com.android.tethering/"
+```
+
+with a "Resolved package not found" beside it in the same method. The apk declares
+that action, the package manager installs the package as
+`com.android.connectivity.resources`, and the filter above is what rejects it.
 
 ## C. Running an app process
 

@@ -1,6 +1,10 @@
 PREFIX ?= /usr
 SYSCONFDIR ?= /etc
 
+# The runtime bundle the gates run against: the user's own if there is one, the
+# machine's otherwise, which is the same order `mosaic runtime` looks in.
+BUNDLE ?= $(HOME)/.local/share/mosaic/bundle
+
 BIN_DIR := $(PREFIX)/bin
 APPS_DIR := $(PREFIX)/share/applications
 APPS_DIRECTORY_DIR := $(PREFIX)/share/desktop-directories
@@ -36,6 +40,11 @@ check:
 
 verify-a:
 	tools/verify-a.sh "$(BUNDLE)"
+
+# Section B: system_server to completion. Expected to fail while B is open; the
+# first line it prints names the gate that is not met.
+verify-b:
+	tools/verify-b.sh "$(BUNDLE)"
 
 # The broker is a systemd user service with socket activation, so there is no
 # daemon, no D-Bus service and no kernel module. Two things do land system side,

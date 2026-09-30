@@ -46,6 +46,13 @@ preload="$preload $shim/android-binder.so $shim/android-properties.so $shim/allo
 # again by absolute path creates a second copy with a separate MessageQueue
 # field-ID cache.
 preload="$preload $bundle/lib64/libandroid_runtime.so"
+# The same list as the paths they have *inside* a chroot of the bundle, which is
+# where a shipped runtime keeps them: the shim and the launcher live in the bundle's
+# `shim/` and the runtime in its `lib64/`.
+preload_inside="/shim/launcher.so /shim/probe.so /shim/pretend-nice.so /shim/pretend-cgroups.so"
+preload_inside="$preload_inside /shim/android-binder.so /shim/android-properties.so /shim/alloc-trace.so"
+preload_inside="$preload_inside /lib64/libandroid_runtime.so"
+export MOSAIC_PRELOAD_INSIDE="$preload_inside"
 
 pkill -f "mosaic.*daemon" 2>/dev/null
 rm -f "$socket" "$broker_log"
@@ -83,14 +90,29 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 
+# The classpath environment, which on a device init produces by running
+# `derive_classpath` and loads before anything starts. Two of the names in it are
+# what the framework reads to decide which jars its class loaders may be built
+# from -- `SystemServerClassLoaderFactory` refuses any /apex/ jar that was not
+# prefetched, and the prefetch list is this one:
+#
+#   Creating a ClassLoader from /apex/com.android.tethering/javalib/
+#   service-connectivity.jar is not allowed.
+#
+# The bundle carries the file (`data/system/environ/classpath`, from
+# tools/bundle/classpath-exports.py) and the harness loads it here.
+if [ -f "$PWD/data/system/environ/classpath" ]; then
+  # shellcheck disable=SC1091
+  . "$PWD/data/system/environ/classpath"
+fi
+
 MOSAIC_BINDER_BROKER=1 MOSAIC_BINDER_SOCKET="$socket" \
 MOSAIC_ANDROID_ROOT=$PWD MOSAIC_PROPERTY_DIR=$PWD/properties \
 MOSAIC_TIMEOUT=${MOSAIC_TIMEOUT:-180} MOSAIC_MAX_OUTPUT=${MOSAIC_MAX_OUTPUT:-6000000} \
 MOSAIC_PRELOAD="$preload" \
 MOSAIC_LAUNCH_CLASS=com.android.server.SystemServer \
 MOSAIC_LAUNCH_RUNTIME=$PWD/lib64/libandroid_runtime.so \
-"$root/tools/bundle/with-logd.sh" "$PWD/run.sh" dalvikvm64 \
-  -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)" \
+"$root/tools/bundle/with-logd.sh" "$root/tools/boot-with-hwservicemanager.sh" "$PWD" \
   > "$log" 2>&1
 status=$?
 # The same cleanup on every way out. A run that is killed by its own timeout does not

@@ -87,8 +87,14 @@ static void check_property_reads(void) {
     if (!real_get || reads_logged) return;
     reads_logged = 1;
     static const char *names[] = {"pm.dexopt.first-boot", "pm.dexopt.bg-dexopt", "ro.build.version.sdk",
-                                  "fw.free_cache_v2", "persist.sys.preloads.file_cache_expired"};
-    for (unsigned long i = 0; i < 5; i++) {
+                                  "fw.free_cache_v2", "persist.sys.preloads.file_cache_expired",
+                                  /* The one another process sets and this one waits on:
+                                   * `hwservicemanager.ready`, which `hwservicemanager` writes
+                                   * and `HidlServiceManagement` polls. If the three readers
+                                   * below disagree about it, the disagreement is the wait. */
+                                  "hwservicemanager.ready"};
+    const unsigned long count = sizeof(names) / sizeof(names[0]);
+    for (unsigned long i = 0; i < count; i++) {
         char value[128];
         for (int j = 0; j < 128; j++) value[j] = 0;
         int got = real_get(names[i], value);
@@ -105,7 +111,7 @@ static void check_property_reads(void) {
     static void *(*find)(const char *);
     if (!find) find = (void *(*)(const char *))dlsym((void *)-1L, "__system_property_find");
     if (find) {
-        for (unsigned long i = 0; i < 5; i++) {
+        for (unsigned long i = 0; i < count; i++) {
             void *found = find(names[i]);
             say("android-properties: find ");
             say(names[i]);
@@ -118,7 +124,7 @@ static void check_property_reads(void) {
     static void (*read_cb)(const void *, void (*)(void *, const char *, const char *, unsigned int), void *);
     if (!read_cb) read_cb = (void (*)(const void *, void (*)(void *, const char *, const char *, unsigned int), void *))dlsym((void *)-1L, "__system_property_read_callback");
     if (read_cb && find) {
-        for (unsigned long i = 0; i < 5; i++) {
+        for (unsigned long i = 0; i < count; i++) {
             void *found = find(names[i]);
             if (!found) continue;
             read_cb(found, property_callback, 0);

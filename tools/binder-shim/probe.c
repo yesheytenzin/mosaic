@@ -15,6 +15,7 @@
  */
 
 typedef unsigned long size_t;
+typedef unsigned long ulong;
 /* Keep clang from treating this headerless shim's interposed libc declaration as
  * an incompatible redeclaration of the compiler built-in. */
 void *fopen(const char *, const char *) __attribute__((nothrow));
@@ -28,6 +29,7 @@ extern void free(void *);
 #define SYS_read 0
 #define SYS_write 1
 #define SYS_close 3
+#define SYS_dup 32
 #define SYS_poll 7
 #define SYS_mmap 9
 #define SYS_nanosleep 35
@@ -35,10 +37,15 @@ extern void free(void *);
 #define SYS_ioctl 16
 #define SYS_ftruncate 77
 #define SYS_epoll_ctl 233
-#define SYS_openat 257
 #define SYS_memfd_create 319
+#define SYS_newfstatat 262
+#define SYS_getrandom 318
+#define SYS_write 1
+#define SYS_lseek 8
+#define SYS_openat 257
 #define SYS_getuid 102
 #define SYS_geteuid 107
+#define SYS_eventfd2 290
 
 #define AT_FDCWD -100
 #define O_RDONLY 0
@@ -89,17 +96,39 @@ extern void *dlsym(void *, const char *);
 #define RTLD_NEXT ((void *)-1L)
 extern char *strstr(const char *, const char *);
 
-/* Report each rewritten path once, so a run stays readable. */
-#define MAX_REDIRECTIONS 24
+/* Report each rewritten path once, so a run stays readable. The cap is high
+ * enough for a whole boot: at 24 the paths a framework process asks for early --
+ * the VINTF manifests, the apex trees -- were dropped from the log by the ones
+ * before them, which is exactly the question the log was being read to answer. */
+#define MAX_REDIRECTIONS 1024
 static const char *redirected[MAX_REDIRECTIONS];
 static int redirected_count = 0;
+
+/* One stored copy of each path already reported. The copies are the shim's own:
+ * `from` belongs to the caller, and a redirect's caller is usually a transient
+ * `std::string` -- the string is gone by the time the next redirect compares
+ * against it, and `strcmp` on it faults at address 0. That is exactly how this
+ * broke: a new rule made new paths appear, the dedup reached a stale pointer, and
+ * the fault came back through `libbase`'s `ReadFileToString`. */
+static char reported_paths[MAX_REDIRECTIONS][256];
 
 static void report(const char *from, const char *to) {
     if (redirected_count >= MAX_REDIRECTIONS) return;
     for (int i = 0; i < redirected_count; i++) {
-        if (redirected[i] && strcmp(redirected[i], from) == 0) return;
+        if (strcmp(reported_paths[i], from) == 0) return;
     }
-    redirected[redirected_count++] = from;
+    ulong n = 0;
+    while (from[n] && n < sizeof(reported_paths[0]) - 1) {
+        reported_paths[redirected_count][n] = from[n];
+        n++;
+    }
+    reported_paths[redirected_count][n] = 0;
+    /* Two statements, not one: `redirected[redirected_count++]` next to
+     * `reported_paths[redirected_count - 1]` reads and writes the same object
+     * without a sequence point between them, which is undefined and which the
+     * shim build reports. */
+    redirected[redirected_count] = reported_paths[redirected_count];
+    redirected_count++;
     if (!tracing_on()) return;
     emit("android-paths: ");
     emit(from);
@@ -109,8 +138,12 @@ static void report(const char *from, const char *to) {
     flush_log();
 }
 static void flush_log(void);
-static char log_buffer[16384];
-static long log_length = 0;
+/* Thread-local, like the redirect buffer and for the same reason: the framework
+ * opens paths and lists directories from many threads, and one shared buffer means
+ * one thread's line is built from another thread's bytes. That is how two DIRINODE
+ * lines for two different paths came to share an fd and carry each other's inode. */
+static __thread char log_buffer[16384];
+static __thread long log_length = 0;
 
 /* Binder command words.
  *
@@ -165,6 +198,23 @@ static long log_length = 0;
  * at both sizes because it also handles the security-context variant; this build
  * reads the smaller one, which is the one the header describes as the default. */
 #define BR_TRANSACTION BR(2, 64)
+/* libhwbinder -- the hwbinder side, the one HIDL speaks -- does not write
+ * `BC_TRANSACTION`. It writes `BC_TRANSACTION_SG` and `BC_REPLY_SG`, which
+ * carry a `binder_transaction_data_sg`: the same 64-byte transaction followed by
+ * a 4-byte buffer count that the ABI aligns out to 8, so the whole operand is 72
+ * bytes. They are numbers 17 and 18 in the same 'c' space, so `BC(17, 72)` and
+ * `BC(18, 72)`.
+ *
+ * The walker below compares whole command words, so a stream written that way
+ * matched nothing at all: every HIDL transaction was skipped as an unknown
+ * command, no answer was ever produced, and the visible ends of that are
+ *
+ *   HidlServiceManagement: getService: defaultServiceManager() is null
+ *   Cannot register android.frameworks.sensorservice@1.0::ISensorManager: -38
+ *
+ * which is how `SystemServer.startHidlServices` kills the boot. */
+#define BC_TRANSACTION_SG BC(17, 72)
+#define BC_REPLY_SG BC(18, 72)
 /* `_IO('r', 6)`: direction NONE, not READ. `BR(nr, size)` builds with the READ
  * direction, which is right for commands that carry a payload and wrong for the
  * ones that do not -- `_IO` has no direction at all, and the reader compares the
@@ -206,6 +256,27 @@ extern int mosaic_binder_reply(unsigned int handle, unsigned int code, const uns
                                unsigned long *out_size, unsigned long **out_objects,
                                unsigned long *out_objects_count);
 
+/* The HIDL service manager, for handle 0 on an *hwbinder* device.
+ *
+ * Handle 0 on `/dev/binder` is `android.os.IServiceManager` and this shim answers
+ * it in-process; handle 0 on `/dev/hwbinder` is a different interface,
+ * `android.hidl.manager@1.0::IServiceManager`, with HIDL's marshalling, and it is
+ * the one `SystemServer.startHidlServices` needs: its first registration is fatal
+ * by construction (`LOG_ALWAYS_FATAL_IF(err != OK, "Cannot register %s: %d", ...)`).
+ *
+ * Answering that transaction with the AIDL service manager's reply -- which this
+ * did, because both doors reached `mosaic_binder_reply` -- produced no answer at
+ * all: the AIDL handler rejected the request (its interface token is not there)
+ * and the HIDL client read its status out of an empty parcel.
+ *
+ * Defined in android-binder.c, where the registry and the broker are. */
+extern int mosaic_hidl_service_manager(unsigned int code, const unsigned char *request,
+                                       unsigned long request_size,
+                                       const unsigned long *argument_offsets,
+                                       unsigned long argument_count, unsigned char **out_data,
+                                       unsigned long *out_size);
+
+
 /* One reply, per thread. A transaction is answered on the thread that made it. */
 typedef struct {
     int have;
@@ -218,6 +289,11 @@ typedef struct {
 } pending_reply_t;
 
 static __thread pending_reply_t pending;
+
+/* Whether the transaction being answered arrived on /dev/hwbinder, which is what
+ * decides who owns handle 0. Set per thread around the write stream, because
+ * the answer is produced while the stream is walked. */
+static __thread int transaction_on_hwbinder = 0;
 
 /* A reply's buffers belong to the framework once it has them, and it returns
  * them with BC_FREE_BUFFER. Until then they must stay alive, and the pointer it
@@ -278,11 +354,23 @@ static void answer(struct binder_transaction_data *tr) {
     /* The objects among the arguments: libbinder fills `offsets` for an outgoing
      * transaction from the sending Parcel's own object table, which is the only
      * place that knows where they are -- the bytes alone cannot say. */
-    int produced = mosaic_binder_reply(tr->target_handle, tr->code,
+    int produced;
+    if (transaction_on_hwbinder && tr->target_handle == 0) {
+        /* Handle 0 on hwbinder is the HIDL service manager, and its reply is a HIDL
+         * parcel: no AIDL interface token, HIDL's method codes, and the status in
+         * the reply's own first word. Nothing else here answers that interface, so
+         * a call that reaches this point goes there or is not answered at all. */
+        produced = mosaic_hidl_service_manager(tr->code, (const unsigned char *)tr->data_buffer,
+                                              tr->data_size, (const unsigned long *)tr->data_offsets,
+                                              tr->offsets_size / sizeof(unsigned long), &data,
+                                              &data_size);
+    } else {
+        produced = mosaic_binder_reply(tr->target_handle, tr->code,
                                        (const unsigned char *)tr->data_buffer, tr->data_size,
                                        (const unsigned long *)tr->data_offsets,
                                        tr->offsets_size / sizeof(unsigned long), &data,
                                        &data_size, &objects, &objects_count);
+    }
     emit("binder-shim: transaction handle ");
     emit_dec((long)tr->target_handle);
     emit(" code ");
@@ -309,6 +397,7 @@ static void answer(struct binder_transaction_data *tr) {
  * looper commands are consumed and forgotten, which is what a driver does with
  * them for a process that has no remote objects yet. */
 static int dumps = 0;
+static int hidl_decodes = 0;
 
 static void dump_stream(const char *what, unsigned char *bytes, unsigned long size) {
     if (dumps >= 4) return;
@@ -566,10 +655,14 @@ static void run_commands(unsigned char *buffer, unsigned long size) {
             flush_log();
             break;
         }
-        if (command == BC_TRANSACTION) {
+        if (command == BC_TRANSACTION || command == BC_TRANSACTION_SG) {
+            /* Both carry the 64-byte transaction at the head of their operand --
+             * the SG variant only appends a buffer count after it -- so the same
+             * struct is read either way. */
             struct binder_transaction_data *tr =
                 (struct binder_transaction_data *)(buffer + offset);
-            emit("binder-shim: tr handle=");
+            emit(command == BC_TRANSACTION_SG ? "binder-shim: hwbinder tr handle="
+                                              : "binder-shim: tr handle=");
             emit_dec((long)tr->target_handle);
             emit(" code=");
             emit_dec((long)tr->code);
@@ -580,6 +673,74 @@ static void run_commands(unsigned char *buffer, unsigned long size) {
             emit(" offsets=");
             emit_dec((long)tr->offsets_size);
             emit("\n");
+            /* The HIDL service manager's own parcel, decoded: what the kernel would
+             * translate for the receiver, read here because the pointers are this
+             * process's own. The interface token is the first string; each argument
+             * is a `binder_buffer_object` (type BINDER_TYPE_PTR) in the object
+             * table naming a buffer and its length, and *those* hold the strings.
+             *
+             * This is how the HIDL `IServiceManager`'s method codes were learned
+             * rather than guessed: the strings say which call it is
+             * (`android.hardware.power.stats@1.0::IPowerStats` is a `get`,
+             * `default` beside a service is an `add`) and the code bytes say how it
+             * is numbered. */
+            if (command == BC_TRANSACTION_SG && tr->target_handle == 0
+                && hidl_decodes < 3 && tr->data_buffer) {
+                hidl_decodes++;
+                const unsigned char *data = (const unsigned char *)tr->data_buffer;
+                const unsigned int *offsets = (const unsigned int *)tr->data_offsets;
+                unsigned long count = tr->offsets_size / 4;
+                emit("binder-shim: hidl parcel code=");
+                emit_dec((long)tr->code);
+                emit(" bytes=");
+                emit_dec((long)tr->data_size);
+                emit(" objects=");
+                emit_dec((long)count);
+                emit("\n");
+                /* The token and the inline part, as text. */
+                emit("binder-shim:   inline [");
+                for (unsigned long i = 0; i < tr->data_size && i < 96; i++) {
+                    unsigned char c = data[i];
+                    if (c >= 0x20 && c < 0x7f) {
+                        emit((char[]){c, 0});
+                    } else {
+                        emit(".");
+                    }
+                }
+                emit("]\n");
+                for (unsigned long i = 0; i < count && i < 12; i++) {
+                    unsigned long at = offsets[i];
+                    if (at + 40 > tr->data_size) continue;
+                    unsigned int type = 0;
+                    __builtin_memcpy(&type, data + at, 4);
+                    unsigned long long buffer = 0;
+                    unsigned long long length = 0;
+                    __builtin_memcpy(&buffer, data + at + 8, 8);
+                    __builtin_memcpy(&length, data + at + 16, 8);
+                    emit("binder-shim:   object ");
+                    emit_dec((long)i);
+                    emit(" type=0x");
+                    emit_hex(type, 8);
+                    emit(" buffer=0x");
+                    emit_hex((unsigned long)buffer, 16);
+                    emit(" length=");
+                    emit_dec((long)length);
+                    if ((type & 0xffffff) == 0x742a85 && buffer && length && length < 512) {
+                        emit(" [");
+                        const unsigned char *child = (const unsigned char *)buffer;
+                        for (unsigned long k = 0; k < length; k++) {
+                            unsigned char c = child[k];
+                            if (c >= 0x20 && c < 0x7f) {
+                                emit((char[]){c, 0});
+                            } else {
+                                emit(".");
+                            }
+                        }
+                        emit("]");
+                    }
+                    emit("\n");
+                }
+            }
             flush_log();
             if (dumps < 2) dump_stream("stream", buffer, size);
             answer(tr);
@@ -591,9 +752,10 @@ static void run_commands(unsigned char *buffer, unsigned long size) {
             } else {
                 shim_weak_reference_released(handle);
             }
-        } else if (command == BC_REPLY) {
+        } else if (command == BC_REPLY || command == BC_REPLY_SG) {
             /* The call has been answered: the target's hold goes, which is what the
-             * driver does when the transaction completes. */
+             * driver does when the transaction completes. The SG variant is
+             * hwbinder's way of saying the same thing. */
             shim_release_target();
         } else if (command == BC_ACQUIRE || command == BC_RELEASE) {
             /* A reference to an object another process owns. The count belongs to
@@ -696,7 +858,21 @@ static void wait_for_work(void) {
  * `is_hwbinder` is what the routing needs next: handle 0 on that device is the HIDL
  * service manager, which is a daemon of its own (`hwservicemanager`), not the
  * registry this shim keeps for /dev/binder. */
-#define MAX_BINDER_DEVICES 4
+/* Four was one per device name and no room to spare: /dev/binder, /dev/hwbinder,
+ * /dev/host_hwbinder and /dev/vndbinder fill it, and a process that opens one of
+ * them twice -- which is what `defaultServiceManager1_2(getStub)` does when a
+ * HAL lookup falls through to the *host* hwbinder -- gets a placeholder fd that
+ * was never remembered. Its ioctls then go to the raw eventfd and come back
+ * ENOTTY, and libhidlbase's ProcessState, which asserts on the driver's version,
+ * takes the whole process down:
+ *
+ *   hw-ProcessState: Binder ioctl to obtain version failed: Inappropriate ioctl for device
+ *   hw-ProcessState: Binder driver protocol(0) does not match user space protocol(8)!
+ *
+ * The table is a small array rather than a list for the same reason it was four:
+ * a lookup happens on every ioctl. Room for the four names and their repeats is
+ * what it needs. */
+#define MAX_BINDER_DEVICES 16
 static struct binder_device {
     int fd;
     int is_hwbinder;
@@ -717,6 +893,11 @@ static int remember_device(int fd, int is_hwbinder) {
         binder_devices[binder_device_count].fd = fd;
         binder_devices[binder_device_count].is_hwbinder = is_hwbinder;
         binder_device_count++;
+    } else {
+        /* Said out loud: a device the table does not know is a device whose ioctls
+         * reach the placeholder fd instead of this shim. */
+        emit("binder-shim: the device table is full; a binder fd is unhandled\n");
+        flush_log();
     }
     return fd;
 }
@@ -818,18 +999,46 @@ static void emit_prefixed(const char *prefix, const char *value) {
 
 /* Returns the rewritten path, or the original. */
 static const char *redirect(const char *path) {
-    static char buffer[4096];
+    static __thread char buffer[4096];
+/* Thread-local, not static: the framework opens paths from many threads at once, and
+ * one shared buffer means one thread's mapped path can be handed to another thread's
+ * syscall -- which is how `CompatConfig` came to list a directory whose entries were
+ * the bundle root while the shim's own log said it had opened
+ * `<bundle>/etc/compatconfig`, a directory with seven files in it. */
+
     const char *root = getenv("MOSAIC_ANDROID_ROOT");
     if (!root || !*root || !path || path[0] != '/') return path;
 
     const char *rest = 0;
+    /* A path that begins with `//` is the same path: the framework builds some of
+     * them by joining its root with an already absolute component, and every rule
+     * below matches on a single leading slash. Left alone, `//system/priv-app` is
+     * not a device path as far as these rules are concerned and passes through to a
+     * host that has no `/system` -- which reads as "the directory is not there" and
+     * gets silently skipped. Collapsing the prefix is what makes those paths
+     * answerable. */
+
     const char *prefix = 0;
-    if (strncmp(path, "/system/", 8) == 0) {
+    if (strcmp(path, "/system") == 0) {
+        /* The bare root itself, which is what `ANDROID_ROOT` holds: ART checks that
+         * the directory exists -- `file_utils.cc:153] Failed to find ANDROID_ROOT
+         * directory /system` -- and the rule below needs a trailing slash. Exactly
+         * the shape of the bare `/data` and `/apex` rules. */
+        prefix = "";
+        rest = "";
+    } else if (strncmp(path, "/system/", 8) == 0) {
         prefix = "/system";
         rest = path + 8;
     } else if (strncmp(path, "/data/", 6) == 0) {
         prefix = "/data";
-        rest = path + 6;
+        /* `data/...`, not `...`: the bundle's own `data` directory stands in for
+         * the device's `/data`, exactly as the bundle root stands in for `/system`.
+         * Dropping the component sent `/data/system/dropbox/x` to
+         * `<bundle>/system/dropbox/x` -- which is why the dropbox writer's temp file
+         * and its rename target ended up in a directory the framework then could not
+         * find again (`Can't rename /data/system/dropbox/drop13.tmp`), and why
+         * `/data/misc/zoneinfo/current/icu` was reported as `//misc/...`. */
+        rest = path + 1;
     } else if (strncmp(path, "/vendor/", 8) == 0 ||
                strncmp(path, "/product/", 9) == 0 ||
                strncmp(path, "/system_ext/", 12) == 0 ||
@@ -853,6 +1062,50 @@ static const char *redirect(const char *path) {
          * with no trailing slash, so the rule below does not match it. */
         prefix = "/apex";
         rest = "apex";
+    } else if ((strncmp(path, "/framework/", 11) == 0 || strncmp(path, "//framework/", 12) == 0)) {
+        /* The ART boot image, which is `<root>/framework/boot.art`: with the root
+         * at `/` the framework asks for `//framework/x86_64/boot.art` and gets
+         * nothing. Same reason as the `/etc` rule below, same narrowness. */
+        prefix = "/framework";
+        rest = path + (path[1] == '/' ? 2 : 1);
+    } else if ((strncmp(path, "/etc/", 5) == 0 || strncmp(path, "//etc/", 6) == 0) &&
+               ((strncmp(path, "/etc/", 5) == 0
+                     ? strncmp(path + 5, "public.libraries.txt", 20) == 0 ||
+                       strncmp(path + 5, "compatconfig", 12) == 0
+                     : strncmp(path + 6, "public.libraries.txt", 20) == 0 ||
+                       strncmp(path + 6, "compatconfig", 12) == 0))) {
+        /* Two paths the *framework* builds from its root rather than from a
+         * constant. `ANDROID_ROOT` is `/system` on a device, so `<root>/etc/...`
+         * is `/system/etc/...` there; with this runtime's root at `/` it is the
+         * host's `/etc`, which has neither file and must not be read as if it
+         * did. Named one by one rather than by mapping all of `/etc`, because the
+         * host's `/etc` is a real place that Bionic itself reads -- `getpwuid`
+         * and friends -- and the framework's own configuration happens to be the
+         * only thing here that wants the bundle's. */
+        /* The `rest` is `etc/...` and not `...`, because the shared tail below
+         * appends it to the bundle root: `Environment.getRootDirectory()` with the
+         * root at `/` builds `//etc/public.libraries.txt`, and this has to land on
+         * `<bundle>/etc/public.libraries.txt`. The double slash is what the
+         * framework builds and what its own error prints. */
+        rest = path + (path[1] == '/' ? 2 : 1);
+        prefix = "/etc";
+    } else if (strstr(path, "/etc/compatconfig") != 0) {
+        /* `CompatConfig.initConfigFromLib` walks `/apex/<module>/etc/compatconfig`
+         * for every apex the package manager registered, and calls `listFiles()` on
+         * each. A directory that is not there gives a *null* array, and the
+         * framework dereferences it: `NullPointerException: Attempt to get length of
+         * null array` in `startBootstrapServices`, which is one stage into the boot.
+         * The compat configs themselves are one directory -- the bundle's, staged
+         * from the image -- so every one of those paths resolves to it. Named rather
+         * than by rewriting every apex `etc`, because an apex's own `etc` is a real
+         * place that other callers read. */
+        /* Keep the *tail*: every file inside those directories has to resolve to
+         * the file of the same name, not to the directory -- mapping the whole
+         * path to `<bundle>/etc/compatconfig` makes every open of a config file
+         * inside it an `EISDIR`, 175 of them in one boot. */
+        const char *tail = strstr(path, "/etc/compatconfig");
+        rest = tail + 1;
+        prefix = "/etc";
     } else if (strncmp(path, "/apex/", 6) == 0) {
         /* /apex/<module>/javalib/<file> and .../lib64/<file> both live in the
          * bundle's flat framework and lib64 directories. */
@@ -878,19 +1131,40 @@ static const char *redirect(const char *path) {
         return path;
     }
 
-    if (strcmp(prefix, "/apex-javalib") == 0) {
-        strcpy(buffer, root);
-        strcat(buffer, "/framework/");
-    } else if (strcmp(prefix, "/apex-lib64") == 0) {
-        strcpy(buffer, root);
-        strcat(buffer, "/lib64/");
-    } else {
-        /* The bundle root stands in for /system, so those paths lose the prefix
-         * rather than gaining it. */
-        strcpy(buffer, root);
-        strcat(buffer, "/");
+    /* Bounded, because `strcpy`/`strcat` into a fixed buffer with a path of unknown
+     * length is how a shim damages the heap -- and the framework's paths grow long
+     * (oat and dex paths are the worst of them). Truncating is a wrong answer, which
+     * shows up in a log; overrunning is a wrong answer that hides until an allocator
+     * notices, usually somewhere else entirely. */
+    {
+        const char *parts[2];
+        unsigned long n = 0;
+        if (strcmp(prefix, "/apex-javalib") == 0) {
+            parts[0] = root;
+            parts[1] = "/framework/";
+        } else if (strcmp(prefix, "/apex-lib64") == 0) {
+            parts[0] = root;
+            parts[1] = "/lib64/";
+        } else {
+            /* The bundle root stands in for /system, so those paths lose the prefix
+             * rather than gaining it. */
+            parts[0] = root;
+            parts[1] = "/";
+        }
+        for (int i = 0; i < 2; i++)
+            for (const char *q = parts[i]; *q && n < sizeof(buffer) - 1; q++) buffer[n++] = *q;
+        for (const char *q = rest; q && *q && n < sizeof(buffer) - 1; q++) buffer[n++] = *q;
+        buffer[n] = 0;
+        if (n >= sizeof(buffer) - 1) {
+            /* The cap was reached, so the answer is a truncated path -- a different
+             * file than the caller asked for. Reported rather than silent, because
+             * that is a wrong answer that would otherwise look like a missing file. */
+            emit("android-paths: TRUNCATED ");
+            emit(path);
+            emit("\n");
+            flush_log();
+        }
     }
-    strcat(buffer, rest);
     report(path, buffer);
     return buffer;
 }
@@ -956,12 +1230,35 @@ static int name_is_binder(const char *path) {
     return 1;
 }
 
+/* The placeholder for a binder device.
+ *
+ * It has to be two things at once, and a memfd is only one of them. `mmap` is
+ * the obvious requirement -- libbinder maps the driver, and `hwservicemanager`
+ * maps it too -- but a memfd cannot be registered with an epoll set:
+ * `epoll_ctl` on a regular file returns EPERM, and regular files are what a
+ * memfd is. `hwservicemanager` registers its driver fd with a Looper before it
+ * does anything else, and that call is fatal:
+ *
+ *   Looper: Error adding epoll events for fd 3: Operation not permitted
+ *   hwservicemanager: Failed to add binder FD to Looper
+ *
+ * so with a memfd the HIDL service manager cannot start at all, and every HIDL
+ * call the framework makes afterwards finds `defaultServiceManager() is null`.
+ *
+ * What is needed instead is a descriptor that is both pollable and mappable.
+ * A `memfd` gives the mapping and an `eventfd` gives the poll, and the two are
+ * not the same descriptor -- so the mapping is served from a memfd of its own
+ * and the descriptor handed back is the eventfd. `mmap` below is the only path
+ * that reaches the mapping, and it substitutes it there. */
+static int mapping_fd = -1;
+
 static int make_placeholder_fd(void) {
-    /* libbinder expects to mmap the driver. A memfd stands in so those calls
-     * succeed and the interesting ones, the ioctls, reach us. */
-    int fd = (int)syscall(SYS_memfd_create, "mosaic-binder", 0);
+    int fd = (int)syscall(SYS_eventfd2, 0, 0);
     if (fd < 0) return fd;
-    syscall(SYS_ftruncate, fd, 1024 * 1024);
+    if (mapping_fd < 0) {
+        mapping_fd = (int)syscall(SYS_memfd_create, "mosaic-binder-map", 0);
+        if (mapping_fd >= 0) syscall(SYS_ftruncate, mapping_fd, 16 * 1024 * 1024);
+    }
     return fd;
 }
 
@@ -994,7 +1291,13 @@ static int make_placeholder_fd(void) {
 #define ASHMEM_GET_PIN_STATUS (__ASHMEMIOC << 8 | 9)
 #define ASHMEM_PURGE_ALL_CACHES (__ASHMEMIOC << 8 | 10)
 
-#define MAX_ASHMEM 8
+/* How many ashmem regions a process may hold. Android's own limit is
+ * `/proc/sys/vm/max_map_count`-ish and effectively unbounded; the framework alone
+ * opens more than eight before `ConnectivityService` starts, and the ninth was
+ * silently dropped -- its `ASHMEM_SET_SIZE` then failed and libcore reported
+ * "ashmem creation failed" far away from the table that was full. The overflow is
+ * reported now rather than being silent. */
+#define MAX_ASHMEM 1024
 static int ashmem_fds[MAX_ASHMEM];
 static long ashmem_sizes[MAX_ASHMEM];
 static int ashmem_count = 0;
@@ -1004,6 +1307,11 @@ static void remember_ashmem(int fd) {
         ashmem_fds[ashmem_count] = fd;
         ashmem_sizes[ashmem_count] = 0;
         ashmem_count++;
+    } else {
+        emit("android-ashmem: table full at ");
+        emit_dec(MAX_ASHMEM);
+        emit(" regions\n");
+        flush_log();
     }
 }
 
@@ -1014,6 +1322,16 @@ static int ashmem_index(int fd) {
     return -1;
 }
 
+/* Does `path` end with `tail`? The framework builds some device paths relative to a
+ * current directory, so the name is what matters rather than the prefix. */
+static int suffix_is(const char *path, const char *tail) {
+    unsigned long pl = 0, tl = 0;
+    while (path[pl]) pl++;
+    while (tail[tl]) tl++;
+    if (tl > pl) return 0;
+    return strcmp(path + (pl - tl), tail) == 0;
+}
+
 static int is_ashmem(int fd) { return ashmem_index(fd) >= 0; }
 
 /* Bionic's <fcntl.h> defines open() as an inline wrapper around __openat, so a
@@ -1022,8 +1340,69 @@ int __openat(int dirfd, const char *path, int flags, int mode) {
     /* The framework hardcodes paths that cannot be configured, so they are
      * rewritten first; then the binder device is intercepted. */
     path = redirect(path);
+    /* Every open whose path mentions an app directory, mapped or not: a host path
+     * matches no rule and is reported nowhere else, so a scan working in host paths
+     * is invisible without this. */
+    /* The four device nodes the framework opens by name. The private /dev is a tmpfs
+     * that starts empty, and neither route into it works inside a user namespace:
+     * `mknod` for a real device is refused, and a node bind-mounted from the host
+     * stays owned by the *init* namespace, so opening it here is `EPERM` -- measured,
+     * with the boot stopping on `/dev/null: Permission denied` in the shell's own
+     * redirects. What is left is to answer the name, which is also what this shim
+     * does for `/dev/ashmem` and the binder devices.
+     *
+     * `null` and `zero` read as zeros; `random` and `urandom` are filled from
+     * `getrandom` when the file is made. A memfd is readable and mappable, which is
+     * what every caller here wants, and it is what the entropy callers read from:
+     * `hwservicemanager: ReadRandomBytes: cannot read /dev/urandom` on every start
+     * is what this replaces. */
+    /* Anything that *ends* in one of these names, not just the absolute path:
+     * `std::random_device` opens `dev/urandom` relative to the current directory,
+     * which is why it kept reporting EOF even after these names were answered --
+     * the hook matched `/dev/urandom` and never saw the call. */
+    if (suffix_is(path, "/dev/null") || suffix_is(path, "/dev/zero") ||
+        suffix_is(path, "/dev/random") || suffix_is(path, "/dev/urandom")) {
+        int fd = (int)syscall(SYS_memfd_create, "mosaic-dev", 0);
+        if (fd < 0) return fd;
+        if (suffix_is(path, "/dev/random") || suffix_is(path, "/dev/urandom")) {
+            /* Filled once and shared: `libc++`'s `random_device` reads in small blocks
+             * and treats EOF as fatal ("random_device got EOF: No data available"),
+             * which is what a 256-byte buffer produced. One 64 MiB region, created on
+             * first use and handed out with `dup`, outlasts any caller here -- and the
+             * offset being shared between readers is harmless for random bytes. */
+            /* Per open, and filled generously. Sharing one filled region looked
+             * tidier and cost the boot 30 stages: `dup` shares the file offset, so one
+             * reader's position is every reader's, and a caller that reads a lot
+             * leaves the next one at EOF. A megabyte per open is what keeps
+             * `random_device` from seeing the end of the file, which it treats as
+             * fatal. */
+            unsigned char block[4096];
+            long written = 0;
+            while (written < 16L * 1024 * 1024) {
+                long got = syscall(SYS_getrandom, block, sizeof(block), 0);
+                if (got <= 0) break;
+                syscall(SYS_write, fd, block, got);
+                written += got;
+            }
+            /* Then the file is extended, not filled: reads past the written part
+             * return zeros rather than the end of the file, so no caller can see EOF
+             * however much it asks for. Sixteen megabytes of real bytes is more than
+             * anything reads in a boot, and the rest costs nothing until touched --
+             * a sparse memfd is pages that do not exist yet. */
+            syscall(SYS_ftruncate, fd, 1024L * 1024 * 1024);
+            syscall(SYS_lseek, fd, 0, 0);
+        }
+        return fd;
+    }
     if (strncmp(path, "/dev/ashmem", 11) == 0) {
-        int fd = make_placeholder_fd();
+        /* A *memfd* of its own, not the placeholder eventfd the binder device gets:
+         * ashmem exists to be mapped, and an eventfd cannot be -- `mmap` on one is
+         * ENODEV, so the caller's map fails and the failure surfaces as "ashmem
+         * creation failed" in a Java stack that never mentions the descriptor. One
+         * memfd per region, because the regions must not share memory. The ioctls
+         * that follow are answered below, so what the caller ends up with is
+         * exactly what ashmem is: a fd it can size, map and share. */
+        int fd = (int)syscall(SYS_memfd_create, "mosaic-ashmem", 0);
         if (fd < 0) return fd;
         remember_ashmem(fd);
         emit_prefixed("open ", path);
@@ -1172,25 +1551,50 @@ int mkdirat(int dirfd, const char *path, unsigned int mode) {
     return real ? real(dirfd, redirect(path), mode) : -1;
 }
 
+/* Two paths, one buffer. `redirect` returns a single thread-local buffer, so
+ * `real(redirect(from), redirect(to))` hands the same string in both arguments --
+ * the rename then resolves a name to itself and fails with ENOENT, which is what
+ * every dropbox write did: `Can't rename /data/system/dropbox/drop13.tmp to ...
+ * /system_server_strictmode@<ts>.txt`. The first mapping is copied out before the
+ * second is evaluated, the same discipline `opendir` needed. */
+static void redirect_into(const char *path, char *out, int cap) {
+    const char *mapped = redirect(path);
+    int n = 0;
+    for (const char *q = mapped; q && *q && n < cap - 1; q++) out[n++] = *q;
+    out[n] = 0;
+}
+
 int rename(const char *from, const char *to) {
     typedef int (*real_fn)(const char *, const char *);
     static real_fn real;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "rename");
-    return real ? real(redirect(from), redirect(to)) : -1;
+    if (!real) return -1;
+    char a[4096], b[4096];
+    redirect_into(from, a, sizeof(a));
+    redirect_into(to, b, sizeof(b));
+    return real(a, b);
 }
 
 int renameat(int fromfd, const char *from, int tofd, const char *to) {
     typedef int (*real_fn)(int, const char *, int, const char *);
     static real_fn real;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "renameat");
-    return real ? real(fromfd, redirect(from), tofd, redirect(to)) : -1;
+    if (!real) return -1;
+    char a[4096], b[4096];
+    redirect_into(from, a, sizeof(a));
+    redirect_into(to, b, sizeof(b));
+    return real(fromfd, a, tofd, b);
 }
 
 int renameat2(int fromfd, const char *from, int tofd, const char *to, unsigned int flags) {
     typedef int (*real_fn)(int, const char *, int, const char *, unsigned int);
     static real_fn real;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "renameat2");
-    return real ? real(fromfd, redirect(from), tofd, redirect(to), flags) : -1;
+    if (!real) return -1;
+    char a[4096], b[4096];
+    redirect_into(from, a, sizeof(a));
+    redirect_into(to, b, sizeof(b));
+    return real(fromfd, a, tofd, b, flags);
 }
 
 int unlink(const char *path) {
@@ -1224,8 +1628,14 @@ int statvfs64(const char *path, void *buf) {
 int statfs(const char *path, void *buf) {
     typedef int (*real_fn)(const char *, void *);
     static real_fn real;
+    int result;
+    char mapped[4096];
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "statfs");
-    return real ? real(redirect(path), buf) : -1;
+    if (!real) return -1;
+    redirect_into(path, mapped, sizeof(mapped));
+    result = real(mapped, buf);
+    (void)result;
+    return result;
 }
 
 int statfs64(const char *path, void *buf) {
@@ -1302,16 +1712,153 @@ void *fopen64(const char *path, const char *mode) {
  * `ApexManagerFlattenedApex` -- the implementation a *flattened* apex build uses,
  * which never asks the apex service -- lists `/apex` itself, found nothing, and the
  * package manager went on to abort on a package sitting in the bundle. */
+/* `realpath`, which the framework reaches through `getCanonicalFile()`:
+ * `PackagePartitions$SystemPartition` holds `DeferredCanonicalFile`s, so the scan
+ * canonicalises `<root>/priv-app` before it lists it, and an unmapped
+ * `/system/priv-app` does not exist on the host at all. Mapping here is what keeps
+ * a device path canonicalisable.
+ *
+ * The mapping is copied out of the thread-local buffer before the call, the way
+ * `opendir` does: one call, one string, no second evaluation to race with. */
+static char *realpath_impl(const char *path, char *out) {
+    typedef char *(*real_fn)(const char *, char *);
+    static real_fn real;
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "realpath");
+    if (!real) return 0;
+    return real(path, out);
+}
+
+/* `realpath`, which the framework reaches through `getCanonicalFile()`. Nothing is
+ * mapped *in* -- mapping in cost the host layout fourteen packages, because
+ * canonicalising a path the framework built and answering with a bundle path is
+ * worse than leaving it alone. Only the other direction, and only one prefix: a
+ * canonical answer under the bundle's `apex` comes back as `/apex/...`, which is the
+ * spelling `ConnectivityResources` compares a package's `sourceDir` against.
+ */
+static void apex_reverse(const char *real, char *out, unsigned long cap) {
+    const char *root = getenv("MOSAIC_ANDROID_ROOT");
+    unsigned long rl = 0;
+    const char *rest;
+    unsigned long n = 1;
+    if (!root || !*root) return;
+    while (root[rl]) rl++;
+    if (strncmp(real, root, rl) != 0) return;
+    rest = real + rl;
+    while (rest[0] == '/' && rest[1] == '/') rest++;
+    if (strncmp(rest, "apex/", 5) != 0) return;
+    out[0] = '/';
+    for (const char *q = rest; *q && n < cap - 1; q++) out[n++] = *q;
+    out[n] = 0;
+}
+
+static char *realpath_common(const char *path, char *resolved, unsigned long cap) {
+    char host[4096];
+    char *out;
+    unsigned long n = 0;
+    if (!realpath_impl(path, host)) return 0;
+    /* With a NULL `resolved` the caller owns the result and frees it, so it has to be
+     * a fresh allocation. Returning a static buffer here -- which is what this did --
+     * makes the caller free memory it does not own: ART's
+     * `DexFileLoader::GetDexCanonicalLocation` and `DlOpenOatFile::Dlopen` both take
+     * that path, and the allocator reports the same chunk freed twice, which is the
+     * corruption that stopped the boot at InstallSystemProviders. */
+    if (resolved == 0) {
+        extern void *malloc(unsigned long);
+        out = (char *)malloc(cap < 256 ? 256 : cap);
+        if (!out) return 0;
+    } else {
+        out = resolved;
+    }
+    while (host[n] && n < cap - 1) { out[n] = host[n]; n++; }
+    out[n] = 0;
+    {
+        /* Temporary: whether the apex reverse fires at all, and for which path. */
+        char before[4096];
+        unsigned long k = 0;
+        while (out[k] && k < sizeof(before) - 1) { before[k] = out[k]; k++; }
+        before[k] = 0;
+        apex_reverse(host, out, cap);
+        if (strcmp(before, out) != 0 && tracing_on()) {
+            emit("android-paths: REVERSED ");
+            emit(before);
+            emit(" -> ");
+            emit(out);
+            emit("\n");
+            flush_log();
+        }
+    }
+    return out;
+}
+
+/* The plain symbol and the `_FORTIFY_SOURCE` one both land here; a caller built with
+ * the checked call never reaches `realpath` itself. */
+char *realpath(const char *path, char *resolved) {
+    return realpath_common(path, resolved, 4096);
+}
+
+char *__realpath_chk(const char *path, char *resolved, unsigned long len) {
+    return realpath_common(path, resolved, len);
+}
+
 void *opendir(const char *path) {
     typedef void *(*real_fn)(const char *);
     static real_fn real;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "opendir");
-    return real ? real(redirect(path)) : 0;
+    if (!real) return 0;
+    /* The mapping is evaluated *once*, into a copy, and the copy is what the syscall
+     * gets. `redirect` returns the thread-local buffer, and calling it again for the
+     * log used to hand `real` a pointer whose contents a later call would rewrite. */
+    const char *mapped = redirect(path);
+    char mapped_copy[4096];
+    int mc = 0;
+    for (const char *q = mapped; q && *q && mc < 4000; q++) mapped_copy[mc++] = *q;
+    mapped_copy[mc] = 0;
+    void *result = real(mapped_copy);
+    /* Every directory open, mapped or not. A path that no rule matches is not
+     * reported anywhere else, so a scan that works entirely in host paths would
+     * otherwise be invisible -- and absence of evidence would read as absence of the
+     * call. */
+    if (tracing_on()) {
+        emit("android-paths: OPDIR ");
+        emit(path);
+        emit(" -> ");
+        emit(mapped_copy);
+        emit(result ? " ok\n" : " failed\n");
+        flush_log();
+    }
+    /* A directory that will not open is reported whether or not tracing is on. A
+     * reader that gets null here reports it far away and in other words -- the
+     * framework's `CompatConfig` fails with a null list, not with this path -- and
+     * the one thing that names it is this line. Rewrites are only listed when
+     * tracing is on (see `report`); failures always are. */
+    if (!result) {
+        emit("android-paths: cannot open directory ");
+        emit(path);
+        emit(" (as ");
+        emit(redirect(path));
+        emit(")\n");
+        flush_log();
+    }
+    return result;
 }
 
+/* A binder device is answered as present.
+ *
+ * This is where libhidlbase decides whether to build a HIDL service manager at
+ * all, before any open: `defaultServiceManager1_2` starts with
+ *
+ *     access("/dev/hwbinder", R_OK | W_OK)
+ *
+ * and returns null when it fails. On a device the node is there; in this
+ * namespace `/dev` is a tmpfs the harness makes and no node was made in it, so
+ * the call failed and every HIDL registration the framework attempted was
+ * refused -- `Cannot register ... : -38` -- with no transaction ever reaching the
+ * driver. The open itself is redirected below, so answering "yes, it is there"
+ * is the truth about this side. */
 int access(const char *path, int mode) {
     typedef int (*real_fn)(const char *, int);
     static real_fn real;
+    if (name_is_binder(path)) return 0;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "access");
     return real ? real(redirect(path), mode) : -1;
 }
@@ -1319,6 +1866,7 @@ int access(const char *path, int mode) {
 int faccessat(int dirfd, const char *path, int mode, int flags) {
     typedef int (*real_fn)(int, const char *, int, int);
     static real_fn real;
+    if (name_is_binder(path)) return 0;
     if (!real) real = (real_fn)dlsym(RTLD_NEXT, "faccessat");
     return real ? real(dirfd, redirect(path), mode, flags) : -1;
 }
@@ -1351,6 +1899,13 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         emit("binder-shim: mmap of the binder fd, length ");
         emit_dec((long)length);
         emit("\n");
+        /* A binder device's placeholder is an eventfd, which cannot be mapped,
+         * and the mapping is what libbinder uses for the driver's command and
+         * data buffers. Every ioctl that would read or write them is answered
+         * in `ioctl` below, so what the caller needs from the mapping is that
+         * it is addressable and big enough; the memfd kept for that purpose
+         * alone is what backs it. */
+        return (void *)syscall(SYS_mmap, addr, length, prot, flags, mapping_fd, offset);
     }
     return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
 }
@@ -1427,7 +1982,10 @@ int ioctl(int fd, unsigned long request, ...) {
                 emit_dec(bwr->read_size);
                 emit("\n");
             }
+            struct binder_device *device = device_for(fd);
+            transaction_on_hwbinder = device && device->is_hwbinder;
             run_commands((unsigned char *)bwr->write_buffer, (unsigned long)bwr->write_size);
+            transaction_on_hwbinder = 0;
             bwr->write_consumed = bwr->write_size;
         } else {
             bwr->write_consumed = 0;
@@ -1534,4 +2092,148 @@ const void *__system_property_find(const char *name) {
     }
     if (next) return next(name);
     return 0;
+}
+
+/* A bare library name, which is how `System.loadLibrary` asks the linker for
+ * anything: `System.loadLibrary("service-connectivity")` reaches
+ * `android_dlopen_ext` as a name with no path at all, and the linker searches
+ * only the namespaces it was configured with. ART builds a namespace per class
+ * loader with `librarySearchPath = null` -- `SystemServerClassLoaderFactory`
+ * passes exactly that, and the apex jar's libraries are found through its parent
+ * on a device, where the linker configuration is generated by the build and by
+ * init rather than here.
+ *
+ * So a bare name is resolved here first, against the directories this bundle
+ * keeps its libraries in, and the linker is handed a path that exists. That is
+ * the path layer's job (ADR-0009), and nothing is invented: a name that is in
+ * none of these directories is passed through unchanged, so the linker's own
+ * error is still the one that surfaces.
+ *
+ * The directories are the bundle's own and every apex's -- `<root>/lib64` and
+ * `<root>/apex/<module>/lib64` -- which is where an Android image keeps them. */
+#define MOSAIC_SYS_getdents64 217
+
+struct mosaic_dirent64 {
+    unsigned long long inode;
+    long long offset;
+    unsigned short record_length;
+    unsigned char type;
+    char name[];
+};
+
+/* `<root><relative><name>`, written into `out` and opened to see it is there. */
+static int library_at(const char *root, const char *relative, const char *name, char *out,
+                      unsigned long capacity) {
+    unsigned long n = 0;
+    for (const char *r = root; *r && n < capacity - 1; r++) out[n++] = *r;
+    for (const char *r = relative; *r && n < capacity - 1; r++) out[n++] = *r;
+    for (const char *r = name; *r && n < capacity - 1; r++) out[n++] = *r;
+    out[n] = 0;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, out, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    syscall(SYS_close, fd);
+    return 1;
+}
+
+/* The whole path of a library this bundle carries, or null. */
+static const char *library_path(const char *root, const char *name, char *out, unsigned long capacity) {
+    if (library_at(root, "/lib64/", name, out, capacity)) return out;
+
+    char apexes[4096];
+    unsigned long n = 0;
+    for (const char *r = root; *r && n < sizeof(apexes) - 8; r++) apexes[n++] = *r;
+    for (const char *r = "/apex"; *r && n < sizeof(apexes) - 1; r++) apexes[n++] = *r;
+    apexes[n] = 0;
+
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, apexes, 0x10000 /* O_DIRECTORY */, 0);
+    if (fd < 0) return 0;
+    static char listing[8192];
+    long got = syscall(MOSAIC_SYS_getdents64, fd, listing, sizeof(listing));
+    syscall(SYS_close, fd);
+    if (got <= 0) return 0;
+
+    const char *const dirs[] = { "/lib64/", "/lib/" };
+    for (long at = 0; at < got;) {
+        struct mosaic_dirent64 *entry = (struct mosaic_dirent64 *)(listing + at);
+        if (entry->record_length == 0) break;
+        for (unsigned long d = 0; d < 2; d++) {
+            char relative[4400];
+            unsigned long r = 0;
+            for (const char *s = "/apex/"; *s && r < sizeof(relative) - 1; s++) relative[r++] = *s;
+            for (const char *s = entry->name; *s && r < sizeof(relative) - 300; s++) {
+                relative[r++] = *s;
+            }
+            for (const char *s = dirs[d]; *s && r < sizeof(relative) - 1; s++) relative[r++] = *s;
+            relative[r] = 0;
+            if (library_at(root, relative, name, out, capacity)) return out;
+        }
+        at += entry->record_length;
+    }
+    return 0;
+}
+
+/* `android_dlextinfo`, whose layout is the linker's published ABI
+ * (`android/dlext.h`): the namespace a load is made in is its last field. It is
+ * spelled out rather than included because this shim is built without headers. */
+typedef struct {
+    unsigned long long flags;
+    void *reserved_addr;
+    unsigned long reserved_size;
+    int relro_fd;
+    int library_fd;
+    long long library_fd_offset;
+    void *library_namespace;
+} mosaic_dlextinfo_t;
+
+/* The namespace a bare name has to be loaded in. ART gives each class loader a
+ * namespace whose permitted paths are the class path's own directories --
+ * `SystemServerClassLoaderFactory` passes `librarySearchPath = null` -- so a path
+ * into an apex's lib64 is refused there with `not permitted`. The *default*
+ * namespace is the one this bundle's linker configuration describes, apex
+ * directories and all, and it is exported (`namespace.default.visible = true`) for
+ * exactly this kind of use. */
+/* Weak: the symbol lives in the Android linker, and whether this build's linker
+ * has it is what the call site is asking. Without the attribute the address of a
+ * function is always non-null, so the check is a constant and the build says so. */
+extern void *android_get_exported_namespace(const char *name) __attribute__((weak));
+
+void *android_dlopen_ext(const char *name, int flags, const void *info) {
+    typedef void *(*real_fn)(const char *, int, const void *);
+    static real_fn real;
+    static int announced;
+    char resolved[4600];
+    if (!real) real = (real_fn)dlsym(RTLD_NEXT, "android_dlopen_ext");
+    if (!real) return 0;
+    if (name && name[0] != '/') {
+        const char *root = getenv("MOSAIC_ANDROID_ROOT");
+        if (root && *root && library_path(root, name, resolved, sizeof(resolved))) {
+            mosaic_dlextinfo_t adjusted;
+            const void *use = info;
+            void *namespace = 0;
+            if (android_get_exported_namespace) {
+                /* The exported name is the section's -- the linker creates the
+                 * namespace from `[system]` and calls it `system`; `default` is the
+                 * name it is *asked* about in some places. Both are tried, and the
+                 * one that answered is logged. */
+                namespace = android_get_exported_namespace("system");
+                if (!namespace) namespace = android_get_exported_namespace("default");
+            }
+            if (info && namespace) {
+                __builtin_memcpy(&adjusted, info, sizeof(adjusted));
+                adjusted.library_namespace = namespace;
+                use = &adjusted;
+            }
+            if (tracing_on() && !announced) {
+                announced = 1;
+                emit("android-paths: bare library ");
+                emit(name);
+                emit(" -> ");
+                emit(resolved);
+                emit(namespace ? " in the exported namespace\n" : " with no namespace\n");
+                flush_log();
+            }
+            return real(resolved, flags, use);
+        }
+    }
+    return real(name, flags, info);
 }

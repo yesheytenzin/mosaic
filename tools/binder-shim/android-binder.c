@@ -72,6 +72,11 @@ extern void free(void *);
 #define SYM_SET_REFERENCE "_ZN7android6Parcel19ipcSetDataReferenceEPKhmPKymPFvPS0_S2_mS4_mE"
 #define SYM_BINDER_TRANSACT "_ZN7android7BBinder8transactEjRKNS_6ParcelEPS1_j"
 extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
+extern char *getenv(const char *);
+extern long syscall(long, ...);
+#define SYS_read 0
+#define SYS_close 3
+#define SYS_openat 257
 
 /* A Parcel is a few hundred bytes and its layout is libbinder's business, so it
  * is allocated with room to spare and initialised by its own constructor. */
@@ -133,6 +138,10 @@ extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void
  * service failing to boot. */
 #define BINDER_TYPE_WEAK_BINDER 0x77622a85u
 #define BINDER_TYPE_FD 0x66642a85u
+/* hwbinder's scatter-gather buffer: `binder_buffer_object`, 40 bytes, naming a
+ * buffer by address and length. `'p','t','*'` -- this is the type HIDL parcels put
+ * in the object table for every string and every embedded buffer. */
+#define BINDER_TYPE_PTR 0x70742a85u
 #define BINDER_TYPE_HANDLE 0x73682a85u
 
 #define MAX_SERVICES 128
@@ -2002,7 +2011,9 @@ typedef void *(*get_jni_env_fn)(void);
 static __thread void *cached_jni_env;
 static get_jni_env_fn real_get_jni_env;
 
+static void attach_to_jvm(void);
 void *_ZN7android14AndroidRuntime9getJNIEnvEv(void) {
+    attach_to_jvm();
     if (cached_jni_env) return cached_jni_env;
     if (!real_get_jni_env) {
         real_get_jni_env = (get_jni_env_fn)dlsym(
@@ -2011,6 +2022,16 @@ void *_ZN7android14AndroidRuntime9getJNIEnvEv(void) {
     void *env = real_get_jni_env ? real_get_jni_env() : 0;
     if (env) cached_jni_env = env;
     return env;
+}
+static int thread_attach_armed;
+/* `com_android_server_input_InputManagerService.cpp` calls the free
+ * `android::getJniEnv()` symbol, not `AndroidRuntime::getJNIEnv()`. The input
+ * reader thread is created by libutils' Thread::run, so it is not one of the
+ * Java-created threads wrapped below. Without this interposition the native
+ * input manager dereferences the null returned by the unpatched lookup. */
+void *_ZN7android9getJniEnvEv(void) {
+    attach_to_jvm();
+    return cached_jni_env;
 }
 static int thread_attach_armed = 0;
 
@@ -2022,7 +2043,11 @@ struct shim_thread_start {
 static void attach_to_jvm(void) {
     if (!thread_attach_armed || thread_attached || attach_attempted) return;
     attach_attempted = 1;
-    if (!android_runtime_handle) return;
+    if (!android_runtime_handle) {
+        say("android-binder: input attach skipped; libandroid_runtime is not loaded\n");
+        say_once();
+        return;
+    }
     JavaVM *(*get_vm)(void) = (JavaVM *(*)(void))dlsym(
         android_runtime_handle, "_ZN7android14AndroidRuntime9getJavaVMEv");
     if (!get_vm) return;
@@ -3079,4 +3104,309 @@ int mosaic_binder_reply(uint32 handle, uint32 code, const unsigned char *request
     parcel_dtor(reply);
     free(reply);
     return copied;
+}
+
+/* ---- the HIDL service manager, on handle 0 of the hwbinder device ---------- *
+ *
+ * Handle 0 is the same number on both binder devices and a different interface on
+ * each: `/dev/binder`'s is `android.os.IServiceManager`, which `service_manager`
+ * above answers, and `/dev/hwbinder`'s is
+ * `android.hidl.manager@1.0::IServiceManager`, whose eight methods are declared in
+ * that order (`get`, `add`, `getTransport`, `list`, `registerForNotifications`,
+ * `debugDump`, `listByInterface`, `registerPassthroughClient`) and whose parcels
+ * are HIDL's rather than AIDL's. The code is the method's index in that
+ * declaration, which is how `code 3` and `code 6` in the boot's log are `get` and
+ * `add`.
+ *
+ * What the boot needs from it is one call: `SystemServer.startHidlServices`
+ * registers the sensor service first and treats a failure as fatal
+ * (`LOG_ALWAYS_FATAL_IF(err != OK, "Cannot register %s: %d", ...)`). Answering
+ * that transaction with `service_manager`'s logic, which is what happened while
+ * both doors led here, produced *no* answer -- the AIDL handler refused a request
+ * whose interface token it does not know -- and the client read its status out of
+ * an empty parcel, which is the `-38` in the boot's log.
+ *
+ * The arguments are HIDL's scatter-gather form: strings live in buffers that the
+ * kernel copies between processes, each named by a `binder_buffer_object`
+ * (`BINDER_TYPE_PTR`) in the object table as an address and a length. Here the
+ * addresses are *this* process's own, so the strings are read directly. A reply is
+ * a status word followed by whatever the method returns; without one the client
+ * reads nothing, which is why every path below writes at least the status.
+ *
+ * What this does not do yet, and says so where it happens: hand a *registered*
+ * object back over a reply's object table. `get` therefore answers "no such
+ * service" for everything, which is true for every name this boot asks about (the
+ * HALs it looks for are not here) and is not yet true for the two services the
+ * framework registers itself.
+ */
+
+/* The instance name of a call, from whichever buffer holds it: the strings are
+ * printable runs in the buffers the object table names, and the first one that is
+ * not the interface token is the name this asks about. */
+/* The other half of the pair `hidl_name_of` reads: the interface descriptor,
+ * `android.frameworks.sensorservice@1.0::ISensorManager`, which is the string that
+ * carries `@` and `::` and which `hidl_name_of` deliberately skips. */
+static int hidl_descriptor_of(const unsigned char *data, ulong size, const unsigned long *offsets,
+                              ulong count, char *out, int capacity) {
+    if (!data) return 0;
+    for (ulong i = 0; i < count; i++) {
+        ulong at = offsets[i];
+        if (at + 24 > size) continue;
+        unsigned long long buffer = 0, length = 0;
+        __builtin_memcpy(&buffer, data + at + 8, 8);
+        __builtin_memcpy(&length, data + at + 16, 8);
+        /* The buffer pointer is the sender's own address -- the call is made by
+         * this process -- but not every argument is a `hidl_string`, so a word
+         * that is not one has to be rejected before it is dereferenced: a small
+         * integer that looks like a pointer reads the first byte and then faults
+         * on the next one, which is exactly what `mosaic_hidl_service_manager+527`
+         * did. */
+        if (buffer < 0x10000 || length < 2 || length > 256) continue;
+        const char *text = (const char *)(ulong)buffer;
+        int printable = 1, has_colons = 0, has_at = 0;
+        for (unsigned long long k = 0; k + 1 < length; k++) {
+            if (text[k] < 0x20 || text[k] >= 0x7f) { printable = 0; break; }
+            if (text[k] == ':' && text[k + 1] == ':') has_colons = 1;
+            if (text[k] == '@') has_at = 1;
+        }
+        if (!printable || text[length - 1] != 0) continue;
+        if (!has_colons || !has_at) continue;
+        int n = 0;
+        while (text[n] && n < capacity - 1) { out[n] = text[n]; n++; }
+        out[n] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int hidl_name_of(const unsigned char *data, ulong size, const unsigned long *offsets,
+                        ulong count, char *out, int capacity) {
+    out[0] = 0;
+    for (ulong i = 0; i < count; i++) {
+        ulong at = offsets[i];
+        if (at + 40 > size) continue;
+        uint32 type = 0;
+        __builtin_memcpy(&type, data + at, 4);
+        if (type != BINDER_TYPE_PTR) continue;
+        unsigned long long buffer = 0;
+        unsigned long long length = 0;
+        __builtin_memcpy(&buffer, data + at + 8, 8);
+        __builtin_memcpy(&length, data + at + 16, 8);
+        /* The buffer pointer is the sender's own address -- the call is made by
+         * this process -- but not every argument is a `hidl_string`, so a word
+         * that is not one has to be rejected before it is dereferenced: a small
+         * integer that looks like a pointer reads the first byte and then faults
+         * on the next one, which is exactly what `mosaic_hidl_service_manager+527`
+         * did. */
+        if (buffer < 0x10000 || length < 2 || length > 256) continue;
+        const char *text = (const char *)(ulong)buffer;
+        int printable = 1;
+        for (unsigned long long k = 0; k + 1 < length; k++) {
+            if (text[k] < 0x20 || text[k] >= 0x7f) { printable = 0; break; }
+        }
+        if (!printable || text[length - 1] != 0) continue;
+        if (strstr(text, "::") != 0 && strstr(text, "@1.") != 0) continue; /* the token/interface */
+        int n = 0;
+        while (text[n] && n < capacity - 1) { out[n] = text[n]; n++; }
+        out[n] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Whether a HIDL service is *declared*, which is the question the service manager
+ * answers and the reason a registration can be refused without a transaction
+ * being attempted. On a device hwservicemanager answers it by reading the VINTF
+ * manifests, and this reads the ones the bundle carries, because that is where
+ * the truth about what this runtime provides already lives:
+ *
+ *   <bundle>/vendor/etc/vintf/manifest.xml   the device manifest
+ *   <bundle>/etc/vintf/manifest.xml          the framework manifest, from the image
+ *   <bundle>/etc/hosthals.xml                ARC's own host-HAL list
+ *
+ * A declared service is answered with TRANSPORT_HWBINDER on `get` and
+ * `getTransport`, an undeclared one with TRANSPORT_EMPTY -- which matters beyond
+ * registration: a HAL answered as declared but missing is one
+ * `ServiceManager.waitForDeclaredService` would wait for forever.
+ *
+ * Measured: `registerAsService` reads the transport out of the *lookup* reply for
+ * the service it is about to register, so an empty transport is the refusal:
+ *
+ *   HidlServiceManagement: Service android.frameworks.stats@1.0::IStats/default
+ *                          must be in VINTF manifest in order to register/get.
+ *   Cannot register android.frameworks.stats@1.0::IStats: -2147483648
+ */
+static int text_has(const char *text, const char *needle) {
+    ulong n = 0;
+    while (needle[n]) n++;
+    if (n == 0) return 0;
+    for (const char *at = text; *at; at++) {
+        ulong i = 0;
+        while (i < n && at[i] && at[i] == needle[i]) i++;
+        if (i == n) return 1;
+    }
+    return 0;
+}
+
+/* Read one file under the bundle and look for a needle in it. */
+static int file_has(const char *root, const char *relative, const char *needle) {
+    /* Stack, not statics: the service manager answers on whichever framework
+     * thread is registering or looking a HAL up, and two of them at once would
+     * share anything static here. 8 KiB holds every manifest this bundle carries
+     * (the largest is 3078 bytes), and one that did not fit would read truncated
+     * and simply not match, which is the conservative answer. */
+    char path[512];
+    char buffer[8192];
+    ulong i = 0;
+    for (const char *r = root; *r && i < sizeof(path) - 1; r++) path[i++] = *r;
+    for (const char *r = relative; *r && i < sizeof(path) - 1; r++) path[i++] = *r;
+    path[i] = 0;
+    int fd = (int)syscall(SYS_openat, -100, path, 0, 0);
+    if (fd < 0) return 0;
+    long n = syscall(SYS_read, fd, buffer, sizeof(buffer) - 1);
+    syscall(SYS_close, fd);
+    if (n <= 0) return 0;
+    buffer[n] = 0;
+    return text_has(buffer, needle);
+}
+
+/* The three parts of `android.frameworks.sensorservice@1.0::ISensorManager`. */
+static int split_descriptor(const char *descriptor, char *package, char *version, char *interface) {
+    ulong i = 0;
+    const char *at = descriptor;
+    while (*at && *at != '@' && i < NAME_MAX - 1) package[i++] = *at++;
+    package[i] = 0;
+    i = 0;
+    if (*at == '@') at++;
+    while (*at && *at != ':' && i < NAME_MAX - 1) version[i++] = *at++;
+    version[i] = 0;
+    i = 0;
+    if (at[0] == ':' && at[1] == ':') at += 2;
+    while (*at && i < NAME_MAX - 1) interface[i++] = *at++;
+    interface[i] = 0;
+    return package[0] && version[0] && interface[0];
+}
+
+static int hidl_declared(const char *descriptor, const char *instance) {
+    char package[NAME_MAX], version[NAME_MAX], interface[NAME_MAX];
+    char needle[4 * NAME_MAX];
+    const char *root = getenv("MOSAIC_ANDROID_ROOT");
+    if (!root || !*root || !descriptor || !*descriptor) return 0;
+    if (!split_descriptor(descriptor, package, version, interface)) return 0;
+
+    /* ARC's host-HAL list names a service outright, instance and all. */
+    ulong n = 0;
+    for (const char *r = "<name>"; *r; r++) needle[n++] = *r;
+    for (const char *r = descriptor; *r; r++) needle[n++] = *r;
+    if (instance && *instance) { needle[n++] = '/'; for (const char *r = instance; *r; r++) needle[n++] = *r; }
+    for (const char *r = "</name>"; *r; r++) needle[n++] = *r;
+    needle[n] = 0;
+    if (file_has(root, "/etc/hosthals.xml", needle)) return 1;
+
+    /* A manifest names the package and, inside it, the interface and instance --
+       `<fqname>` in the framework manifest, `<interface><name>` plus
+       `<instance>` in the device manifest, both of which are checked for. */
+    ulong m = 0;
+    for (const char *r = "<name>"; *r; r++) needle[m++] = *r;
+    for (const char *r = package; *r; r++) needle[m++] = *r;
+    for (const char *r = "</name>"; *r; r++) needle[m++] = *r;
+    needle[m] = 0;
+    if (file_has(root, "/vendor/etc/vintf/manifest.xml", needle) ||
+        file_has(root, "/etc/vintf/manifest.xml", needle)) {
+        char fqname[3 * NAME_MAX];
+        ulong k = 0;
+        fqname[k++] = '<';
+        for (const char *r = interface; *r; r++) fqname[k++] = *r;
+        if (instance && *instance) { fqname[k++] = '/'; for (const char *r = instance; *r; r++) fqname[k++] = *r; }
+        fqname[k++] = '<';
+        fqname[k] = 0;
+        if (file_has(root, "/vendor/etc/vintf/manifest.xml", fqname) ||
+            file_has(root, "/etc/vintf/manifest.xml", fqname)) return 1;
+    }
+    return 0;
+}
+
+int mosaic_hidl_service_manager(uint32 code, const unsigned char *request, ulong request_size,
+                                const unsigned long *argument_offsets, ulong argument_count,
+                                unsigned char **out_data, ulong *out_size) {
+    /* The codes are the one-based method numbers of `android.hidl.manager`, read
+     * off the wire rather than assumed:
+     *
+     *   3   getTransport(descriptor, instance)   -- asked by both lookups and
+     *                                              registrations
+     *   12  addWithChain(instance, service, ...) -- the registration itself, whose
+     *                                              reply is the `Return<bool>` that
+     *                                              decides whether it worked
+     *
+     * The reply to both is a status word and one word of value.
+     *
+     * The transport word is the whole of the declaration check, and it is the
+     * reason this runtime's boot stopped here:
+     *
+     *   HidlServiceManagement: Service android.frameworks.stats@1.0::IStats/default
+     *                          must be in VINTF manifest in order to register/get.
+     *   dalvikvm64: Cannot register HIDL android.frameworks.stats@1.0::IStats: -2147483648
+     *
+     * `-2147483648` is `UNKNOWN_ERROR`, which `registerAsServiceInternal` returns
+     * when the transport it read out of this reply is not HWBINDER:
+     *
+     *   Return<Transport> transport = sm->getTransport(descriptor, name);
+     *   if (transport != Transport::HWBINDER) { LOG(ERROR) << ... "must be in VINTF
+     *       manifest in order to register/get."; return UNKNOWN_ERROR; }
+     *
+     * and `SystemServer.startHidlServices` aborts the process on that error. The
+     * transport is what `hidl_declared` answers from the manifests the bundle
+     * carries -- the same files hwservicemanager reads on a device. */
+    char name[NAME_MAX];
+    char descriptor[NAME_MAX];
+    int have_name = request
+        ? hidl_name_of(request, request_size, argument_offsets, argument_count, name, NAME_MAX)
+        : 0;
+    int have_descriptor = request
+        ? hidl_descriptor_of(request, request_size, argument_offsets, argument_count, descriptor,
+                             NAME_MAX)
+        : 0;
+    int lookup = (code == 3 || code == 9);
+    int declared = (lookup && have_descriptor)
+        ? hidl_declared(descriptor, have_name ? name : "")
+        : 0;
+    /* `Transport` is a HIDL enum: 0 EMPTY, 1 HWBINDER, 2 PASSTHROUGH. It is *not*
+     * the kernel's 3 for a hwbinder object, which is what this answered first --
+     * and `3 != HWBINDER` is refused exactly as `0` is, so the refusal read the
+     * same from the outside and looked like the word was not being read at all. */
+    int transport = declared ? 1 : 0;
+
+    /* The layout the stub writes, mirrored: a status word and then one byte
+     * (`writeToParcel(Status)` then `writeUint8`), which is what the proxy's
+     * `readFromParcel(Status)` and `readUint8` read back. For `getTransport` that
+     * byte is the transport; for `addWithChain` it is the `Return<bool>` the
+     * registration is decided on, and a zero there registers nothing and reports
+     * `Cannot register ...: -2147483648` just as loudly as a missing transport. */
+    /* Eight bytes, so the value reads the same whether the client takes it as a
+     * single byte (`writeBool`, `writeUint8`) or as a word: the first of the two
+     * is the one that lands either way, and the second is zero padding. */
+    ulong size = 8;
+    unsigned char *reply = (unsigned char *)malloc(size);
+    if (!reply) return 0;
+    for (ulong i = 0; i < size; i++) reply[i] = 0;                  /* status: OK */
+    int registration = (code == 6 || code == 12);
+    reply[4] = (unsigned char)(registration ? 1 : transport);
+
+    if (registration && have_name) {
+        say("hidl: registered ");
+        say(have_descriptor ? descriptor : name);
+        say("\n");
+        say_once();
+    } else if (lookup) {
+        say("hidl: getTransport ");
+        say(have_descriptor ? descriptor : "(unreadable)");
+        say("/");
+        say(have_name ? name : "?");
+        say(declared ? " -> hwbinder(1)\n" : " -> not present(0)\n");
+        say_once();
+    }
+
+    *out_data = reply;
+    *out_size = size;
+    return 1;
 }

@@ -188,15 +188,22 @@ if [ -n "$bundle" ]; then
     # invoking user afterwards, and as a user it is theirs already.
     log=$(mktemp /tmp/mosaic-priority-XXXXXX.log)
     run_framework() {
+      # Through the same launcher the boot harness uses, because a framework
+      # started without a HIDL service manager no longer gets as far as
+      # `StartActivityManager`: `defaultServiceManager1_2` waits for the
+      # `hwservicemanager.ready` property that the service manager sets, one second
+      # at a time (`HidlServiceManagement: Waited for hwservicemanager.ready ...`),
+      # and `StartPowerStatsService` -- inside `startBootstrapServices`, before the
+      # activity manager -- is where that wait lands. That is the same launcher A's
+      # system-server smoke uses, so this check and that one agree about what
+      # "the framework starts" means; what this one varies is the preload list.
       env "HOME=$(getent passwd "$user" | cut -d: -f6)" \
         "MOSAIC_TIMEOUT=${MOSAIC_TIMEOUT:-90}" "MOSAIC_MAX_OUTPUT=900000" \
         "MOSAIC_ANDROID_ROOT=$bundle" "MOSAIC_PROPERTY_DIR=$bundle/properties" \
         "MOSAIC_BINDER_BROKER=0" "MOSAIC_PRELOAD=$preload" \
         "MOSAIC_LAUNCH_CLASS=com.android.server.SystemServer" \
         "MOSAIC_LAUNCH_RUNTIME=$bundle/lib64/libandroid_runtime.so" \
-        sh -c 'cd "$MOSAIC_ANDROID_ROOT" && exec "$0" "$MOSAIC_ANDROID_ROOT/run.sh" dalvikvm64 \
-                 -Xbootclasspath:"$(cat bootclasspath.txt)" -cp "$(cat systemserverclasspath.txt)"' \
-        "$root/tools/bundle/with-logd.sh"
+        "$root/tools/bundle/with-logd.sh" "$root/tools/boot-with-hwservicemanager.sh" "$bundle"
     }
     if [ "$as_root" -eq 1 ]; then
       # Root raises the limit here and hands the process to the invoking user with

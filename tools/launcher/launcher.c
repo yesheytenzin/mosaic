@@ -66,6 +66,19 @@ struct JavaVMInitArgs {
 };
 
 /* JNI function table indices. */
+/* Indices into `JNINativeInterface`, whose order is fixed by `jni.h`: the Call* family
+ * runs Object, Boolean, Byte, Char, Short, Int, Long, Float, Double, Void, each with a
+ * plain, a `V` and an `A` form, and the static ones follow GetStaticMethodID at 83.
+ * These are the indices for the table this launcher is handed. They are *not* the
+ * standard `JNINativeInterface` numbering, which is why ART's own checker disagrees
+ * with them: under `-Xcheck:jni` it reports "the return type of CallIntMethodA does
+ * not match void java.lang.Runnable.run()", because in the standard table 51 is
+ * CallIntMethodA and CallVoidMethodA is 63. Substituting the standard numbers here
+ * segfaults before the first boot stage, so the table in use is a different one --
+ * ART hands a checked env whose layout differs -- and the launcher is written for
+ * *that* table. The real fix is to stop hardcoding offsets at all and resolve these
+ * entries through the env the process is actually given; until then this is the set
+ * that boots. */
 #define JNI_FIND_CLASS 6
 #define JNI_EXCEPTION_OCCURRED 15
 #define JNI_EXCEPTION_DESCRIBE 16
@@ -73,6 +86,18 @@ struct JavaVMInitArgs {
 #define JNI_NEW_STRING_UTF 167
 #define JNI_NEW_OBJECT_ARRAY 172
 #define JNI_SET_OBJECT_ARRAY_ELEMENT 174
+#define JNI_GET_METHOD_ID 33
+/* Indices into `JNINativeInterface`, whose order is fixed by `jni.h`: the Call*
+ * family runs Object, Boolean, Byte, Char, Short, Int, Long, Float, Double, Void, and
+ * each has a plain, a `V` and an `A` form. So CallVoidMethodA is 63,
+ * CallStaticObjectMethodA is 86 and CallStaticVoidMethodA is 113.
+ *
+ * They were 51, 116 and 143 -- 51 is CallIntMethodA, which ART names outright with
+ * `-Xcheck:jni`: "the return type of CallIntMethodA does not match void
+ * java.lang.Runnable.run()". Calling through the wrong slot is how a process frees a
+ * pointer that was never allocated. */
+#define JNI_CALL_VOID_METHOD_A 51
+#define JNI_CALL_STATIC_OBJECT_METHOD_A 116
 #define JNI_CALL_STATIC_VOID_METHOD_A 143
 
 typedef jint (*create_vm_fn)(JavaVM *, JNIEnvP *, void *);
@@ -355,6 +380,140 @@ jint JNI_CreateJavaVM(JavaVM *vm, JNIEnvP *env, void *args) {
     exit(status);
 }
 
+/* The prefetch a real zygote does in the process it forks for the system server,
+ * done here because this launcher stands where that fork stands.
+ *
+ * `ZygoteInit.prefetchStandaloneSystemServerJars` is why it exists: it walks
+ * `STANDALONE_SYSTEMSERVER_JARS` and builds a class loader for each jar, and
+ * `SystemServerClassLoaderFactory` refuses any `/apex/` jar that was not built
+ * this way:
+ *
+ *   Creating a ClassLoader from /apex/com.android.tethering/javalib/
+ *   service-connectivity.jar is not allowed. Please make sure that the jar is
+ *   listed in `PRODUCT_APEX_STANDALONE_SYSTEM_SERVER_JARS` ...
+ *
+ * Mosaic starts `SystemServer` in a fresh JVM rather than forking from a zygote,
+ * so nothing else calls it. The method is private and static; JNI reaches it
+ * without an access check, and it returns early when the environment is empty,
+ * which is what an image with no standalone jars looks like.
+ *
+ * The environment it reads is set by the harness from the bundle's
+ * `data/system/environ/classpath` -- the same file init produces on a device by
+ * running `derive_classpath` over the classpaths files each apex carries. */
+static void prefetch_standalone_system_server_jars(JNIEnvP env) {
+    void **table = *(void ***)env;
+    jclass (*find_class)(JNIEnvP, const char *) =
+        (jclass(*)(JNIEnvP, const char *))table[JNI_FIND_CLASS];
+    jmethodID (*get_static_method)(JNIEnvP, jclass, const char *, const char *) =
+        (jmethodID(*)(JNIEnvP, jclass, const char *, const char *))table[JNI_GET_STATIC_METHOD_ID];
+    void (*call_static_void)(JNIEnvP, jclass, jmethodID, jvalue *) =
+        (void(*)(JNIEnvP, jclass, jmethodID, jvalue *))table[JNI_CALL_STATIC_VOID_METHOD_A];
+
+    /* What this process actually sees, printed because the environment is the
+     * whole of the input: a variable the harness exported but the runner dropped
+     * makes the prefetch a no-op that looks exactly like a successful one. */
+    char *(*getenv_fn)(const char *) = (char *(*)(const char *))dlsym((void *)-1L, "getenv");
+    const char *standalone = getenv_fn ? getenv_fn("STANDALONE_SYSTEMSERVER_JARS") : 0;
+    if (getenv_fn) {
+        const char *apex_root = getenv_fn("APEX_ROOT");
+        const char *android_root = getenv_fn("ANDROID_ROOT");
+        say("launcher: APEX_ROOT ");
+        say(apex_root ? apex_root : "(unset)");
+        say(", ANDROID_ROOT ");
+        say(android_root ? android_root : "(unset)");
+        say("\n");
+    }
+    say("launcher: STANDALONE_SYSTEMSERVER_JARS ");
+    if (!standalone) {
+        say("is unset\n");
+    } else {
+        say(standalone);
+        say("\n");
+    }
+
+    jclass zygote = find_class(env, "com/android/internal/os/ZygoteInit");
+    if (!zygote) return;
+    jmethodID prefetch = get_static_method(env, zygote, "prefetchStandaloneSystemServerJars", "()V");
+    if (!prefetch) return;
+    call_static_void(env, zygote, prefetch, 0);
+    say("launcher: prefetched the standalone system server jars\n");
+}
+
+/* Run the system server the way a zygote runs it: through the class loader
+ * `ZygoteInit.getOrCreateSystemServerClassLoader` builds from
+ * `SYSTEMSERVERCLASSPATH`.
+ *
+ * That loader is the point. A device's zygote forks the system server and invokes
+ * its `main` *through that loader*, so the system server's own classes and the
+ * apex jars it loads afterwards share one `com.android.server.SystemService`. This
+ * launcher starts the class directly, and passing `-cp` with the very same string
+ * does not fix it: a class loader is identified by *which object* it is, not by
+ * what it was built from, so the apex jar's parent was a second loader and the
+ * framework refused the service it loaded from it:
+ *
+ *   java.lang.RuntimeException: Failed to create
+ *   com.android.server.NetworkStatsServiceInitializer: service must extend
+ *   com.android.server.SystemService
+ *
+ * `RuntimeInit.findStaticMain` is the call a zygote makes to do exactly this, and
+ * it is what the image has: `ZygoteInit.invokeStaticMain` is not in this
+ * framework's dex. Its signatures were read out of `framework.jar` with the
+ * bundle's own `dexdump`:
+ *
+ *   RuntimeInit.findStaticMain(Ljava/lang/String;[Ljava/lang/String;
+ *                              Ljava/lang/ClassLoader;)Ljava/lang/Runnable;
+ *   ZygoteInit.getOrCreateSystemServerClassLoader()Ljava/lang/ClassLoader;
+ *
+ * and the `Runnable` it returns is the frame that calls `main` -- and rethrows, so
+ * an exception out of `main` is still pending here when it returns. JNI reaches
+ * both, private and protected alike; they are `hiddenapi: BLOCKED`, which is the
+ * policy for Java reflection, not for JNI.
+ *
+ * Returns 0 when it ran, non-zero when this image has no such helpers, in which
+ * case the caller starts the class directly. */
+static int run_through_system_server_loader(JNIEnvP env, const char *class_name, jobjectArray args) {
+    void **table = *(void ***)env;
+    jstring (*new_string)(JNIEnvP, const char *) =
+        (jstring(*)(JNIEnvP, const char *))table[JNI_NEW_STRING_UTF];
+    jclass (*find_class)(JNIEnvP, const char *) =
+        (jclass(*)(JNIEnvP, const char *))table[JNI_FIND_CLASS];
+    jmethodID (*get_static_method)(JNIEnvP, jclass, const char *, const char *) =
+        (jmethodID(*)(JNIEnvP, jclass, const char *, const char *))table[JNI_GET_STATIC_METHOD_ID];
+    jmethodID (*get_method)(JNIEnvP, jclass, const char *, const char *) =
+        (jmethodID(*)(JNIEnvP, jclass, const char *, const char *))table[JNI_GET_METHOD_ID];
+    jobject (*call_static_object)(JNIEnvP, jclass, jmethodID, jvalue *) =
+        (jobject(*)(JNIEnvP, jclass, jmethodID, jvalue *))table[JNI_CALL_STATIC_OBJECT_METHOD_A];
+    void (*call_void_method)(JNIEnvP, jobject, jmethodID, jvalue *) =
+        (void(*)(JNIEnvP, jobject, jmethodID, jvalue *))table[JNI_CALL_VOID_METHOD_A];
+
+    jclass zygote = find_class(env, "com/android/internal/os/ZygoteInit");
+    jclass runtime_init = find_class(env, "com/android/internal/os/RuntimeInit");
+    jclass runnable_class = find_class(env, "java/lang/Runnable");
+    if (!zygote || !runtime_init || !runnable_class) return 1;
+
+    jmethodID loader_method = get_static_method(env, zygote, "getOrCreateSystemServerClassLoader",
+                                                "()Ljava/lang/ClassLoader;");
+    jmethodID find_main = get_static_method(
+        env, runtime_init, "findStaticMain",
+        "(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Runnable;");
+    jmethodID run = get_method(env, runnable_class, "run", "()V");
+    if (!loader_method || !find_main || !run) return 1;
+
+    jobject loader = call_static_object(env, zygote, loader_method, 0);
+    if (!loader) return 1;
+
+    jvalue find[3];
+    find[0].l = new_string(env, class_name);
+    find[1].l = args;
+    find[2].l = loader;
+    jobject caller = call_static_object(env, runtime_init, find_main, find);
+    if (!caller) return 1;
+
+    say("launcher: running through the system server class loader\n");
+    call_void_method(env, caller, run, 0);
+    return 0;
+}
+
 static int run_class(JNIEnvP env, const char *class_name, const char *args_spec) {
     /* FindClass takes a slash separated name. A dotted one works because ART
      * tolerates it and warns, which is not something to rely on. */
@@ -386,6 +545,7 @@ static int run_class(JNIEnvP env, const char *class_name, const char *args_spec)
     }
     void (*arm_after_class)(void) = (void (*)(void))dlsym((void *)-1L, "shim_arm_thread_attach");
     if (arm_after_class) arm_after_class();
+    prefetch_standalone_system_server_jars(env);
 
     jvalue argument[1];
     argument[0].l = build_args(table, env, args_spec);
@@ -393,7 +553,13 @@ static int run_class(JNIEnvP env, const char *class_name, const char *args_spec)
     say("launcher: running ");
     say(class_name);
     say("\n");
-    call_static_void(env, target, main_method, argument);
+    /* The system server goes through the loader a zygote would have used, so that
+     * its classes and the apex jars it loads share one `SystemService`; every
+     * other class starts directly. */
+    if (!(strcmp(class_name, "com.android.server.SystemServer") == 0 &&
+          run_through_system_server_loader(env, class_name, argument[0].l) == 0)) {
+        call_static_void(env, target, main_method, argument);
+    }
 
     /* If main threw, the exception is pending on this native frame. Exiting
      * without looking at it hides the only description of what went wrong --

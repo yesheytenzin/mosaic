@@ -16,11 +16,15 @@
 
 pub mod apex;
 pub mod display;
+pub mod dnsresolver;
 pub mod health;
 pub mod idmap;
 pub mod installd;
+pub mod netd;
+pub mod storaged;
 pub mod surfaceflinger;
 pub mod suspend;
+pub mod vold;
 
 use crate::binder::Transport;
 
@@ -47,6 +51,24 @@ pub fn host_all(binder: &Transport, root: &str) {
     // it an apex package the bundle carries is unknown to it, and the boot aborts
     // on `Required services extension package is missing`.
     binder.host(apex::NAME, Box::new(apex::ApexService::new(root)));
+    // The device daemons the services after `startHidlServices` wait for. Each
+    // announces itself once a second and the boot waits where it stands:
+    //
+    //   NetdService: WARNING: returning null INetd instance.
+    //   StorageManagerService: storaged not found; trying again
+    //   StorageManagerService: vold not found; trying again
+    //
+    // A desktop is not a device: the host's network is the network, and the
+    // storage this side manages is the bundle and an app's own home rather than
+    // volumes that can be mounted and encrypted. What each one answers is stated
+    // in its own file; what matters here is that the name resolves and the call
+    // comes back.
+    binder.host(netd::NAME, Box::new(netd::Netd::new()));
+    // `ConnectivityService`'s constructor: without it, it holds null and dies on
+    // the first call.
+    binder.host(dnsresolver::NAME, Box::new(dnsresolver::DnsResolver::new()));
+    binder.host(storaged::NAME, Box::new(storaged::Storaged::new()));
+    binder.host(vold::NAME, Box::new(vold::Vold::new()));
     // This machine's battery, which `BatteryService` asks for and refuses to start
     // without: `IHealth service instance default isn't available`.
     binder.host(health::NAME, Box::new(health::Health::new()));
